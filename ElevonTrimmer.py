@@ -166,11 +166,10 @@ class PositionReader:
     # def
 
     def position_to_degrees(self,side,raw_position):
-        # Apply potentiometer-specific conversion
         if(side=="LEFT"):
-            return (-0.0041 * raw_position) + 157.9
+            return (-0.0043 * raw_position) + 155.45
         elif(side=="RIGHT"):
-            return ( 0.0043 * raw_position) - 130.7
+            return (0.0039 * raw_position) - 115.8
         # if
     # def
 
@@ -381,7 +380,7 @@ class Calibrator:
             unit_per_deg = 1.0 / 55.0
             increment = error * unit_per_deg
             param_val -= increment
-            print("Error[%.1f] %s[%0.2f]" % (error,param_name,param_val))
+            print("Diff[%.1f] %s[%0.2f]" % (error,param_name,param_val))
             self.drone_interface.set_param_value(param_name, float, param_val)
         # while
     # def
@@ -399,8 +398,8 @@ class Calibrator:
             error = des_degs-act_degs
             pwm_per_deg = 500.0 / 55.0
             increment = error * pwm_per_deg * direction
-            min_param_val += increment
-            max_param_val += increment
+            min_param_val -= increment
+            max_param_val -= increment
             print("Error[%.1f] %s[%d] %s[%d]" % (error,min_param_name,min_param_val,max_param_name,max_param_val))
             self.drone_interface.set_param_value(min_param_name, int, min_param_val)
             self.drone_interface.set_param_value(max_param_name, int, max_param_val)
@@ -419,10 +418,32 @@ class Calibrator:
             error = des_degs-act_degs
             pwm_per_deg = 500.0 / 55.0
             increment = error * pwm_per_deg * direction
-            param_val += increment
+            param_val -= increment
             print("Error[%.1f] %s[%d]" % (error,param_name,param_val))
             self.drone_interface.set_param_value(param_name, int, param_val)
         # while
+        return(param_val)
+    # def
+
+    def tramline_params(self,max_param_val,min_param_val):
+
+        if(max_param_val < 1700):
+            print("Too low max value [%d]" % (max_param_val))
+            max_param_val = 1700
+        elif(max_param_val > 2300):
+            print("Too high max value [%d]" % (max_param_val))
+            max_param_val = 2300
+        # if
+
+        if(min_param_val < 700):
+            print("Too low min value [%d]" % (min_param_val))
+            min_param_val = 700
+        elif(min_param_val > 1300):
+            print("Too high min value [%d]" % (min_param_val))
+            min_param_val = 1300
+        # if
+
+        return(max_param_val,min_param_val)
     # def
 
     def calibrate_servo(self):
@@ -434,55 +455,81 @@ class Calibrator:
         INITIAL_SWING_PWM  =  500
         INITIAL_MIN_PWM    = INITIAL_CENTRE_PWM - INITIAL_SWING_PWM  # 1000
         INITIAL_MAX_PWM    = INITIAL_CENTRE_PWM + INITIAL_SWING_PWM  # 2000
+        INITIAL_RANGE_PWM  = INITIAL_MAX_PWM - INITIAL_MIN_PWM
         TEST_DEGS          =  30.0
         MAX_ABS_DEGS       =  55.0
 
         # Set datum config
         print("*** Clearing down to datum ***")
         self.drone_interface.set_param_value("VT_ELEV_MC_LOCK", bool, True)
-        self.drone_interface.set_param_value(self.min_param,  int,   INITIAL_MIN_PWM)
-        self.drone_interface.set_param_value(self.max_param,  int,   INITIAL_MAX_PWM)
         self.drone_interface.set_param_value(self.trim_param, float, 0.0)
         self.drone_interface.command_elevon(self.output_function, 0.0)
 
         # Select increment
         if(self.side=="LEFT"):
-            direction =  1.0
+            direction =  -1.0 # Left has range reversed
         elif(self.side=="RIGHT"):
-            direction = -1.0
+            direction =  1.0
         # if
 
-        # Pretest
+        # Initialise
+        iteration = 1
         cmd = TEST_DEGS / MAX_ABS_DEGS
-        print("*** Pre-centre testing ***")
-        fullPosDegs = self.cmd_get_deg( cmd)
-        zeroDegs    = self.cmd_get_deg( 0.0)     
-        fullNegDegs = self.cmd_get_deg(-cmd)
-        print("Pre-centre degs[%.1f, %.1f, %.1f]" % (fullPosDegs, zeroDegs, fullNegDegs))
+        min_param_val = INITIAL_MIN_PWM
+        max_param_val = INITIAL_MAX_PWM
+        diff          = TEST_DEGS
+        neg_undershoot    = TEST_DEGS
+        pos_undershoot    = TEST_DEGS
 
-        # Centre range
-        (min_pwm,max_pwm) = self.calibrate_centre(self.min_param, INITIAL_MIN_PWM, self.max_param, INITIAL_MAX_PWM, direction)
+        print("*** Balancing ***")
+        while(abs(diff)>0.3):
+            print("Iteration [%d] [%d/%d]" % (iteration,min_param_val,max_param_val))
+            self.drone_interface.set_param_value(self.min_param,  int,   min_param_val)
+            self.drone_interface.set_param_value(self.max_param,  int,   max_param_val)
+            fullPosDegs = self.cmd_get_deg( cmd)
+            fullNegDegs = self.cmd_get_deg(-cmd)
+            deg_range = fullNegDegs - fullPosDegs
+            diff       = (fullNegDegs + fullPosDegs) / 2.0
+            pwm_per_deg = (float(INITIAL_RANGE_PWM) * cmd) / deg_range
 
-        # Pretest
-        cmd = TEST_DEGS / MAX_ABS_DEGS
-        print("*** Pre-scale testing ***")
-        fullPosDegs = self.cmd_get_deg( cmd)
-        zeroDegs    = self.cmd_get_deg( 0.0)     
-        fullNegDegs = self.cmd_get_deg(-cmd)
-        print("Pre-scale degs[%.1f, %.1f, %.1f]" % (fullPosDegs, zeroDegs, fullNegDegs))
+            print("Degs[%.1f, %.1f] Range[%.1f] Diff[%.1f]" % (fullPosDegs, fullNegDegs, deg_range, diff))
 
-        # Crank to achieve target
-        print("*** Scaling min/max ***")
-        self.calibrate_min_max(-TEST_DEGS, MAX_ABS_DEGS, self.min_param, min_pwm, direction)
-        self.calibrate_min_max( TEST_DEGS, MAX_ABS_DEGS, self.max_param, max_pwm, direction)
+            # Iterate settings
+            min_param_val += (diff * pwm_per_deg * direction)
+            max_param_val += (diff * pwm_per_deg * direction)
 
-        # Post-test
-        cmd = TEST_DEGS / MAX_ABS_DEGS
-        print("*** Post-scale testing ***")
-        fullPosDegs = self.cmd_get_deg( cmd)
-        zeroDegs    = self.cmd_get_deg( 0.0)     
-        fullNegDegs = self.cmd_get_deg(-cmd)
-        print("Post-scale degs[%.1f, %.1f, %.1f]" % (fullPosDegs, zeroDegs, fullNegDegs))
+            # Tramline
+            (max_param_val,min_param_val) = self.tramline_params(max_param_val,min_param_val)
+
+            iteration += 1
+        # while
+
+        iteration = 1
+
+        print("*** Scaling ***")
+        while( (abs(diff)>0.5) or (abs(neg_undershoot)>0.5) or (abs(pos_undershoot)>0.5) ):
+            print("Iteration [%d] [%d/%d]" % (iteration,min_param_val,max_param_val))
+            self.drone_interface.set_param_value(self.min_param,  int,   min_param_val)
+            self.drone_interface.set_param_value(self.max_param,  int,   max_param_val)
+            fullPosDegs = self.cmd_get_deg( cmd)
+            fullNegDegs = self.cmd_get_deg(-cmd)
+            deg_range = fullNegDegs - fullPosDegs
+            diff       = (fullNegDegs + fullPosDegs) / 2.0
+            pos_undershoot =  fullPosDegs + TEST_DEGS 
+            neg_undershoot =  TEST_DEGS - fullNegDegs
+            pwm_per_deg = (float(INITIAL_RANGE_PWM) * cmd) / deg_range
+
+            print("Degs[%.1f, %.1f] Range[%.1f] Diff[%.1f] Under[%.1f/%.1f]" % (fullPosDegs, fullNegDegs, deg_range, diff, pos_undershoot, neg_undershoot))
+
+            # Iterate settings
+            max_param_val += (pos_undershoot * pwm_per_deg)
+            min_param_val -= (neg_undershoot * pwm_per_deg)
+
+            # Tramline
+            (max_param_val,min_param_val) = self.tramline_params(max_param_val,min_param_val)
+
+            iteration += 1
+        # while
 
         print("*** Trimming ***")
         self.calibrate_trim(self.trim_param, 10.0, direction)
