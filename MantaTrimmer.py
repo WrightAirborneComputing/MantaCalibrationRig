@@ -3,10 +3,50 @@ import threading
 import time
 import re
 import struct
+import builtins
+import queue
 from collections import deque
 from pymavlink import mavutil
 
 import serial
+
+
+class InstrumentationLog:
+    def __init__(self):
+        self._queue = queue.Queue()
+    # def
+
+    def write(self, text):
+        try:
+            self._queue.put_nowait(str(text))
+        except Exception:
+            pass
+    # def
+
+    def drain(self):
+        items = []
+        while True:
+            try:
+                items.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+        return items
+    # def
+# class
+
+
+INSTRUMENTATION_LOG = InstrumentationLog()
+_ORIGINAL_PRINT = builtins.print
+
+
+def print(*args, **kwargs):
+    sep = kwargs.get("sep", " ")
+    end = kwargs.get("end", "\n")
+    text = sep.join(str(arg) for arg in args) + end
+
+    _ORIGINAL_PRINT(*args, **kwargs)
+    INSTRUMENTATION_LOG.write(text)
+# def
 
 
 class DroneInterface:
@@ -205,7 +245,9 @@ class DroneInterface:
 
 # class
 
+
 POSITION_REGEX = re.compile(r"\[(?P<position1>-?\d+)\s*/\s*(?P<position2>-?\d+)\]")
+
 
 class PositionReader:
     def __init__(self, port):
@@ -242,11 +284,11 @@ class PositionReader:
 
         if side == "LEFT":
             self.left_offset = -(self.left_scaler * raw)
-            print("Left centred. Scaler=%.4f Offset = %.4f" % (self.left_scaler,self.left_offset))
+            print("Left centred. Scaler=%.4f Offset = %.4f" % (self.left_scaler, self.left_offset))
 
         elif side == "RIGHT":
             self.right_offset = (self.right_scaler * raw)
-            print("Right centred. Scaler=%.4f Offset = %.4f" % (self.right_scaler,self.right_offset))
+            print("Right centred. Scaler=%.4f Offset = %.4f" % (self.right_scaler, self.right_offset))
     # def
 
     def _position_reader_loop(self):
@@ -353,6 +395,7 @@ class FourSliderGUI:
         right_min_param = drone_interface.get_param(self.RIGHT_MIN_PARAM, int)
         right_max_param = drone_interface.get_param(self.RIGHT_MAX_PARAM, int)
         right_trim_param = drone_interface.get_param(self.RIGHT_TRIM_PARAM, float)
+        main_rev_param = drone_interface.get_param("PWM_MAIN_REV", int)
 
         if left_min_param is None:
             left_min_param = 1000
@@ -368,17 +411,25 @@ class FourSliderGUI:
         if right_trim_param is None:
             right_trim_param = 0.0
 
+        if main_rev_param is None:
+            main_rev_param = 0
+        self.main_rev = int(main_rev_param)
+
+        print("PWM_MAIN_REV = %d (0x%X)" % (self.main_rev, self.main_rev))
+        print("MAIN5 reversed = %s" % str(((self.main_rev >> 4) & 1) != 0))
+        print("MAIN6 reversed = %s" % str(((self.main_rev >> 5) & 1) != 0))
+
         # LEFT group
         left_group = tk.Frame(main_frame)
         left_group.pack(side=tk.LEFT, padx=20)
 
-        left_center_btn = tk.Button(
+        left_clear_btn = tk.Button(
             left_group,
-            text="Centre",
-            width=10,
-            command=self.centre_left
+            text="Reset Min/Max/Trim",
+            width=18,
+            command=self.clear_left
         )
-        left_center_btn.pack(pady=(0, 10))
+        left_clear_btn.pack(pady=(0, 10))
 
         left_params = tk.Frame(left_group)
         left_params.pack(pady=(0, 10))
@@ -418,17 +469,25 @@ class FourSliderGUI:
         )
         self.left_label.pack(pady=(0, 10))
 
+        left_center_btn = tk.Button(
+            left_group,
+            text="Zero angle",
+            width=10,
+            command=self.centre_left
+        )
+        left_center_btn.pack(pady=(0, 5))
+
         # RIGHT group
         right_group = tk.Frame(main_frame)
         right_group.pack(side=tk.LEFT, padx=20)
 
-        right_center_btn = tk.Button(
+        right_clear_btn = tk.Button(
             right_group,
-            text="Centre",
-            width=10,
-            command=self.centre_right
+            text="Reset Min/Max/Trim",
+            width=18,
+            command=self.clear_right
         )
-        right_center_btn.pack(pady=(0, 10))
+        right_clear_btn.pack(pady=(0, 10))
 
         right_params = tk.Frame(right_group)
         right_params.pack(pady=(0, 10))
@@ -468,9 +527,37 @@ class FourSliderGUI:
         )
         self.right_label.pack(pady=(0, 10))
 
+        right_center_btn = tk.Button(
+            right_group,
+            text="Zero angle",
+            width=10,
+            command=self.centre_right
+        )
+        right_center_btn.pack(pady=(0, 5))
+
+        # Instrumentation panel
+        log_group = tk.Frame(main_frame)
+        log_group.pack(side=tk.LEFT, padx=20, fill=tk.BOTH, expand=True)
+
+        log_label = tk.Label(log_group, text="Instrumentation")
+        log_label.pack(anchor="w")
+
+        self.log_text = tk.Text(
+            log_group,
+            width=70,
+            height=32,
+            wrap="word"
+        )
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        log_scroll = tk.Scrollbar(log_group, command=self.log_text.yview)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.config(yscrollcommand=log_scroll.set)
+
         self.update_labels()
         self.update_actuators()
         self.update_expected_pwm()
+        self.update_log_window()
     # def
 
     def create_param_entry(self, parent, label, text_var, apply_callback):
@@ -525,14 +612,6 @@ class FourSliderGUI:
         btn_frame = tk.Frame(container)
         btn_frame.pack(pady=(5, 0))
 
-        btn_center = tk.Button(
-            btn_frame,
-            text="0.0",
-            width=4,
-            command=lambda: self.center_slider(slider)
-        )
-        btn_center.pack(pady=1)
-
         btn_plus = tk.Button(
             btn_frame,
             text="+0.01",
@@ -540,6 +619,14 @@ class FourSliderGUI:
             command=lambda: self.nudge_slider(slider, 0.01, vmin, vmax)
         )
         btn_plus.pack(pady=1)
+
+        btn_center = tk.Button(
+            btn_frame,
+            text="0.0",
+            width=4,
+            command=lambda: self.center_slider(slider)
+        )
+        btn_center.pack(pady=1)
 
         btn_minus = tk.Button(
             btn_frame,
@@ -596,13 +683,17 @@ class FourSliderGUI:
         return value
     # def
 
+    def is_main_channel_reversed(self, channel_index_1_based):
+        bit_index = int(channel_index_1_based) - 1
+        return ((self.main_rev >> bit_index) & 0x1) != 0
+    # def
+
     def expected_pwm(self, cmd, pwm_min, pwm_max, trim, rev):
         effective_cmd = self.clamp(float(cmd) + float(trim), -1.0, 1.0)
-        if(rev):
+        if rev:
             pwm = float(pwm_max) - ((effective_cmd + 1.0) * 0.5 * (float(pwm_max) - float(pwm_min)))
         else:
             pwm = float(pwm_min) + ((effective_cmd + 1.0) * 0.5 * (float(pwm_max) - float(pwm_min)))
-        # if
         return int(round(pwm))
     # def
 
@@ -614,6 +705,54 @@ class FourSliderGUI:
     def centre_right(self):
         print("Centering RIGHT...")
         self.position_reader.set_center("RIGHT")
+    # def
+
+    def clear_left(self):
+        try:
+            left_min = 900
+            left_max = 2100
+            left_trim = 0.0
+
+            ok_min = self.drone_interface.set_param_value(self.LEFT_MIN_PARAM, int, left_min)
+            ok_max = self.drone_interface.set_param_value(self.LEFT_MAX_PARAM, int, left_max)
+            ok_trim = self.drone_interface.set_param_value(self.LEFT_TRIM_PARAM, float, left_trim)
+
+            if ok_min:
+                self.left_min_var.set(str(left_min))
+            if ok_max:
+                self.left_max_var.set(str(left_max))
+            if ok_trim:
+                self.left_trim_var.set("%.3f" % left_trim)
+
+            self.left_pos.set(0.0)
+
+            print("Left cleared")
+        except Exception as e:
+            print("Failed to clear left: %s" % str(e))
+    # def
+
+    def clear_right(self):
+        try:
+            right_min = 900
+            right_max = 2100
+            right_trim = 0.0
+
+            ok_min = self.drone_interface.set_param_value(self.RIGHT_MIN_PARAM, int, right_min)
+            ok_max = self.drone_interface.set_param_value(self.RIGHT_MAX_PARAM, int, right_max)
+            ok_trim = self.drone_interface.set_param_value(self.RIGHT_TRIM_PARAM, float, right_trim)
+
+            if ok_min:
+                self.right_min_var.set(str(right_min))
+            if ok_max:
+                self.right_max_var.set(str(right_max))
+            if ok_trim:
+                self.right_trim_var.set("%.3f" % right_trim)
+
+            self.right_pos.set(0.0)
+
+            print("Right cleared")
+        except Exception as e:
+            print("Failed to clear right: %s" % str(e))
     # def
 
     def apply_left_min(self):
@@ -727,7 +866,6 @@ class FourSliderGUI:
     # def
 
     def update_labels(self):
-
         left_val = self.get_left_value()
         right_val = self.get_right_value()
 
@@ -750,17 +888,21 @@ class FourSliderGUI:
             left_max = self.get_int_var(self.left_max_var, 2000)
             left_trim = self.get_float_var(self.left_trim_var, 0.0)
             left_cmd = float(self.left_pos.get())
-            left_rev = True
+            left_rev = self.is_main_channel_reversed(5)
             left_pwm = self.expected_pwm(left_cmd, left_min, left_max, left_trim, left_rev)
-            self.left_pwm_label.config(text="PWM exp: %d" % left_pwm)
+            self.left_pwm_label.config(
+                text="PWM exp: %d%s" % (left_pwm, " R" if left_rev else "")
+            )
 
             right_min = self.get_int_var(self.right_min_var, 1000)
             right_max = self.get_int_var(self.right_max_var, 2000)
             right_trim = self.get_float_var(self.right_trim_var, 0.0)
             right_cmd = float(self.right_pos.get())
-            right_rev = False
+            right_rev = self.is_main_channel_reversed(6)
             right_pwm = self.expected_pwm(right_cmd, right_min, right_max, right_trim, right_rev)
-            self.right_pwm_label.config(text="PWM exp: %d" % right_pwm)
+            self.right_pwm_label.config(
+                text="PWM exp: %d%s" % (right_pwm, " R" if right_rev else "")
+            )
 
         except Exception as e:
             print("Expected PWM update error: %s" % str(e))
@@ -780,6 +922,14 @@ class FourSliderGUI:
             print("Actuator update error: %s" % str(e))
 
         self.root.after(100, self.update_actuators)
+    # def
+
+    def update_log_window(self):
+        lines = INSTRUMENTATION_LOG.drain()
+        if lines:
+            self.log_text.insert(tk.END, "".join(lines))
+            self.log_text.see(tk.END)
+        self.root.after(100, self.update_log_window)
     # def
 
 
