@@ -483,7 +483,7 @@ class FourSliderGUI:
 
         left_center_btn = tk.Button(
             left_group,
-            text="Zero angle_deg",
+            text="Zero angle",
             width=10,
             command=self.centre_left
         )
@@ -549,7 +549,7 @@ class FourSliderGUI:
 
         right_center_btn = tk.Button(
             right_group,
-            text="Zero angle_deg",
+            text="Zero angle",
             width=10,
             command=self.centre_right
         )
@@ -871,7 +871,7 @@ class FourSliderGUI:
             self.set_side_param_and_refresh(side, max_param, int, 2100)
             self.set_side_param_and_refresh(side, trim_param, float, 0.0)
 
-            cmd_neg35 = self.move_elevon_to_angle(side, output_function, -35.0, -0.01)
+            cmd_neg35 = self.move_elevon_to_angle(side, output_function, -33.0, -0.01)
             pwm_neg35 = self.get_side_expected_pwm(side, cmd_neg35)
 
             cmd_pos35 = self.move_elevon_to_angle(side, output_function, 35.0, 0.01)
@@ -882,7 +882,7 @@ class FourSliderGUI:
             self.set_side_param_and_refresh(side, min_param, int, pwm_pos35)
             self.set_side_param_and_refresh(side, max_param, int, pwm_neg35)
 
-            cmd_neg10 = self.move_elevon_to_angle(side, output_function, -10.0, -0.01)
+            cmd_neg10 = self.move_elevon_to_angle(side, output_function, -5.0, -0.01)
 
             print("%s automatic calibration loading Trim[%.2f]" % (side, cmd_neg10))
             self.set_side_param_and_refresh(side, trim_param, float, cmd_neg10)
@@ -906,7 +906,7 @@ class FourSliderGUI:
             self.set_side_param_and_refresh(side, max_param, int, 2100)
             self.set_side_param_and_refresh(side, trim_param, float, 0.0)
 
-            cmd_neg35 = self.move_elevon_to_angle(side, output_function, -35.0, -0.01)
+            cmd_neg35 = self.move_elevon_to_angle(side, output_function, -33.0, -0.01)
             pwm_neg35 = self.get_side_expected_pwm(side, cmd_neg35)
 
             cmd_pos35 = self.move_elevon_to_angle(side, output_function, 35.0, 0.01)
@@ -917,7 +917,7 @@ class FourSliderGUI:
             self.set_side_param_and_refresh(side, min_param, int, pwm_neg35)
             self.set_side_param_and_refresh(side, max_param, int, pwm_pos35)
 
-            cmd_neg10 = self.move_elevon_to_angle(side, output_function, -10.0, -0.01)
+            cmd_neg10 = self.move_elevon_to_angle(side, output_function, -5.0, -0.01)
 
             print("%s automatic calibration loading Trim[%.2f]" % (side, cmd_neg10))
             self.set_side_param_and_refresh(side, trim_param, float, cmd_neg10)
@@ -1180,10 +1180,10 @@ class FourSliderGUI:
 
 
 if __name__ == "__main__":
-    drone_interface = DroneInterface("COM20")
+    drone_interface = DroneInterface("COM4")
     drone_interface.connect()
 
-    position_reader = PositionReader("COM5")
+    position_reader = PositionReader("COM9")
     position_reader.start()
 
     root = tk.Tk()
