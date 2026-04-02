@@ -292,11 +292,17 @@ class PositionReader:
 
         self.calibration_file = "settings.json"
 
+        self.drone_name = ""
+
         self.left_offset = -75.68
         self.left_scaler = 0.0042
 
         self.right_offset = +117.75
         self.right_scaler = 0.0045
+
+        self.angle_neg_degs = -33.0
+        self.angle_pos_degs = 35.0
+        self.angle_trim_degs = -5.0
 
         self.load_calibration()
     # def
@@ -310,8 +316,11 @@ class PositionReader:
             with open(self.calibration_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
+            self.drone_name = str(data.get("drone_name", ""))
+
             left = data.get("LEFT", {})
             right = data.get("RIGHT", {})
+            angles = data.get("ANGLES", {})
 
             if "scaler" in left:
                 self.left_scaler = float(left["scaler"])
@@ -323,14 +332,25 @@ class PositionReader:
             if "offset" in right:
                 self.right_offset = float(right["offset"])
 
+            if "angle_neg_degs" in angles:
+                self.angle_neg_degs = float(angles["angle_neg_degs"])
+            if "angle_pos_degs" in angles:
+                self.angle_pos_degs = float(angles["angle_pos_degs"])
+            if "angle_trim_degs" in angles:
+                self.angle_trim_degs = float(angles["angle_trim_degs"])
+
             print(
-                "Loaded calibration from %s: LEFT scaler=%.6f offset=%.6f, RIGHT scaler=%.6f offset=%.6f"
+                "Loaded calibration from %s: drone_name=%s, LEFT scaler=%.6f offset=%.6f, RIGHT scaler=%.6f offset=%.6f, angles=(%.2f, %.2f, %.2f)"
                 % (
                     self.calibration_file,
+                    self.drone_name,
                     self.left_scaler,
                     self.left_offset,
                     self.right_scaler,
                     self.right_offset,
+                    self.angle_neg_degs,
+                    self.angle_pos_degs,
+                    self.angle_trim_degs,
                 )
             )
 
@@ -340,6 +360,7 @@ class PositionReader:
 
     def save_calibration(self):
         data = {
+            "drone_name": self.drone_name,
             "LEFT": {
                 "scaler": self.left_scaler,
                 "offset": self.left_offset,
@@ -348,6 +369,11 @@ class PositionReader:
                 "scaler": self.right_scaler,
                 "offset": self.right_offset,
             },
+            "ANGLES": {
+                "angle_neg_degs": self.angle_neg_degs,
+                "angle_pos_degs": self.angle_pos_degs,
+                "angle_trim_degs": self.angle_trim_degs,
+            },
         }
 
         try:
@@ -355,18 +381,38 @@ class PositionReader:
                 json.dump(data, f, indent=4)
 
             print(
-                "Saved calibration to %s: LEFT scaler=%.6f offset=%.6f, RIGHT scaler=%.6f offset=%.6f"
+                "Saved calibration to %s: drone_name=%s, LEFT scaler=%.6f offset=%.6f, RIGHT scaler=%.6f offset=%.6f, angles=(%.2f, %.2f, %.2f)"
                 % (
                     self.calibration_file,
+                    self.drone_name,
                     self.left_scaler,
                     self.left_offset,
                     self.right_scaler,
                     self.right_offset,
+                    self.angle_neg_degs,
+                    self.angle_pos_degs,
+                    self.angle_trim_degs,
                 )
             )
 
         except Exception as e:
             print("Failed to save calibration to %s: %s" % (self.calibration_file, str(e)))
+    # def
+
+    def set_drone_name(self, drone_name):
+        self.drone_name = str(drone_name)
+        self.save_calibration()
+    # def
+
+    def set_angle_settings(self, angle_neg_degs=None, angle_pos_degs=None, angle_trim_degs=None):
+        if angle_neg_degs is not None:
+            self.angle_neg_degs = float(angle_neg_degs)
+        if angle_pos_degs is not None:
+            self.angle_pos_degs = float(angle_pos_degs)
+        if angle_trim_degs is not None:
+            self.angle_trim_degs = float(angle_trim_degs)
+
+        self.save_calibration()
     # def
 
     def position_to_degrees(self, side, raw_position):
@@ -491,6 +537,7 @@ class PositionReader:
     # def
 # class
 
+
 class FourSliderGUI:
     def __init__(self, root, position_reader, drone_interface):
         self.root = root
@@ -514,9 +561,11 @@ class FourSliderGUI:
         self.left_cal_active = False
         self.right_cal_active = False
 
-        self.angle_neg_degs = -33.0
-        self.angle_pos_degs = 35.0
-        self.angle_trim_degs = -5.0
+        self.drone_name_var = tk.StringVar(value=self.position_reader.drone_name)
+
+        self.angle_neg_degs = self.position_reader.angle_neg_degs
+        self.angle_pos_degs = self.position_reader.angle_pos_degs
+        self.angle_trim_degs = self.position_reader.angle_trim_degs
 
         self.angle_neg_var = tk.StringVar(value="%.1f" % self.angle_neg_degs)
         self.angle_pos_var = tk.StringVar(value="%.1f" % self.angle_pos_degs)
@@ -562,6 +611,19 @@ class FourSliderGUI:
         # Angle configuration panel
         angle_group = tk.LabelFrame(main_frame, text="Calibration Angles", padx=10, pady=10)
         angle_group.pack(side=tk.LEFT, padx=10, anchor="n", fill=tk.Y)
+
+        name_row = tk.Frame(angle_group, bd=1, relief="groove", padx=4, pady=4)
+        name_row.pack(anchor="w", pady=3, fill=tk.X)
+
+        name_lbl = tk.Label(name_row, text="Drone name", width=10, anchor="w")
+        name_lbl.pack(side=tk.LEFT, padx=(0, 5))
+
+        name_entry = tk.Entry(name_row, textvariable=self.drone_name_var, width=22, justify="left")
+        name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        name_entry.bind("<Return>", lambda event: self.apply_drone_name())
+
+        name_btn = tk.Button(name_row, text="Set", width=5, command=self.apply_drone_name)
+        name_btn.pack(side=tk.LEFT, padx=(5, 0))
 
         uid_row = tk.Frame(angle_group, bd=1, relief="groove", padx=4, pady=4)
         uid_row.pack(anchor="w", pady=3, fill=tk.X)
@@ -673,7 +735,7 @@ class FourSliderGUI:
 
         right_stop_btn = tk.Button(
             right_group,
-            text="Auto calibrate stop",
+            text="Auto calibrate STOP",
             width=18,
             command=self.stop_right_calibration
         )
@@ -764,9 +826,19 @@ class FourSliderGUI:
         return entry
     # def
 
+    def apply_drone_name(self):
+        try:
+            name = self.drone_name_var.get().strip()
+            self.position_reader.set_drone_name(name)
+            print("drone_name = %s" % name)
+        except Exception as e:
+            print("Invalid drone name: %s" % str(e))
+    # def
+
     def apply_angle_neg(self):
         try:
             self.angle_neg_degs = float(self.angle_neg_var.get())
+            self.position_reader.set_angle_settings(angle_neg_degs=self.angle_neg_degs)
             print("angle_neg_degs = %.2f" % self.angle_neg_degs)
         except Exception as e:
             print("Invalid angle_neg: %s" % str(e))
@@ -775,6 +847,7 @@ class FourSliderGUI:
     def apply_angle_pos(self):
         try:
             self.angle_pos_degs = float(self.angle_pos_var.get())
+            self.position_reader.set_angle_settings(angle_pos_degs=self.angle_pos_degs)
             print("angle_pos_degs = %.2f" % self.angle_pos_degs)
         except Exception as e:
             print("Invalid angle_pos: %s" % str(e))
@@ -783,6 +856,7 @@ class FourSliderGUI:
     def apply_angle_trim(self):
         try:
             self.angle_trim_degs = float(self.angle_trim_var.get())
+            self.position_reader.set_angle_settings(angle_trim_degs=self.angle_trim_degs)
             print("angle_trim_degs = %.2f" % self.angle_trim_degs)
         except Exception as e:
             print("Invalid angle_trim: %s" % str(e))
