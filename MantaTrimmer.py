@@ -75,24 +75,20 @@ class DroneInterface:
 
     def get_id(self, timeout=5.0):
 
-        # Ask for AUTOPILOT_VERSION message
-        # MAV_CMD_REQUEST_MESSAGE param1 = message ID requested
         print("Requesting AUTOPILOT_VERSION...")
         self.master.mav.command_long_send(
             self.master.target_system,
             self.master.target_component,
             mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
-            0,  # confirmation
-            mavutil.mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION,  # param1: requested msg id
+            0,
+            mavutil.mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION,
             0, 0, 0, 0, 0, 0
         )
 
-        # Wait for the response
-        timeout_s = 5
         start = time.time()
         msg = None
 
-        while time.time() - start < timeout_s:
+        while time.time() - start < timeout:
             msg = self.master.recv_match(type="AUTOPILOT_VERSION", blocking=True, timeout=1)
             if msg is not None:
                 break
@@ -102,7 +98,6 @@ class DroneInterface:
             return None
 
         print("\nAUTOPILOT_VERSION received UID[%d]" % (msg.uid))
-
         return msg.uid
     # def
 
@@ -385,20 +380,21 @@ class PositionReader:
 
         with self._lock:
             if side == "LEFT":
-                queue = self._queue_left
+                queue_ref = self._queue_left
             elif side == "RIGHT":
-                queue = self._queue_right
+                queue_ref = self._queue_right
             else:
                 return None
 
-            while queue and len(samples) < self.num_samples:
-                samples.append(queue.popleft())
+            while queue_ref and len(samples) < self.num_samples:
+                samples.append(queue_ref.popleft())
 
         if not samples:
             return None
 
         return sum(samples) / float(len(samples))
     # def
+# class
 
 
 class FourSliderGUI:
@@ -436,6 +432,7 @@ class FourSliderGUI:
         main_frame.pack(padx=20, pady=20)
 
         ident = drone_interface.get_id()
+        self.uid_var = tk.StringVar(value="--" if ident is None else str(ident))
 
         left_min_param = drone_interface.get_param(self.LEFT_MIN_PARAM, int)
         left_max_param = drone_interface.get_param(self.LEFT_MAX_PARAM, int)
@@ -471,6 +468,16 @@ class FourSliderGUI:
         # Angle configuration panel
         angle_group = tk.LabelFrame(main_frame, text="Calibration Angles", padx=10, pady=10)
         angle_group.pack(side=tk.LEFT, padx=10, anchor="n", fill=tk.Y)
+
+        uid_row = tk.Frame(angle_group, bd=1, relief="groove", padx=4, pady=4)
+        uid_row.pack(anchor="w", pady=3, fill=tk.X)
+
+        uid_lbl = tk.Label(uid_row, text="PX4 UID", width=10, anchor="w")
+        uid_lbl.pack(side=tk.LEFT, padx=(0, 5))
+
+        uid_box = tk.Entry(uid_row, textvariable=self.uid_var, width=22, justify="left")
+        uid_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        uid_box.config(state="readonly")
 
         self.create_angle_entry(angle_group, "Neg deg", self.angle_neg_var, self.apply_angle_neg)
         self.create_angle_entry(angle_group, "Pos deg", self.angle_pos_var, self.apply_angle_pos)
@@ -1352,6 +1359,7 @@ class FourSliderGUI:
             self.log_text.see(tk.END)
         self.root.after(100, self.update_log_window)
     # def
+# class
 
 
 if __name__ == "__main__":
