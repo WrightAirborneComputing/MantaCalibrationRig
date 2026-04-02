@@ -38,6 +38,7 @@ class InstrumentationLog:
 INSTRUMENTATION_LOG = InstrumentationLog()
 _ORIGINAL_PRINT = builtins.print
 
+
 def print(*args, **kwargs):
     sep = kwargs.get("sep", " ")
     end = kwargs.get("end", "\n")
@@ -70,6 +71,39 @@ class DroneInterface:
             self.master.target_system,
             self.master.target_component
         ))
+    # def
+
+    def get_id(self, timeout=5.0):
+
+        # Ask for AUTOPILOT_VERSION message
+        # MAV_CMD_REQUEST_MESSAGE param1 = message ID requested
+        print("Requesting AUTOPILOT_VERSION...")
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+            0,  # confirmation
+            mavutil.mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION,  # param1: requested msg id
+            0, 0, 0, 0, 0, 0
+        )
+
+        # Wait for the response
+        timeout_s = 5
+        start = time.time()
+        msg = None
+
+        while time.time() - start < timeout_s:
+            msg = self.master.recv_match(type="AUTOPILOT_VERSION", blocking=True, timeout=1)
+            if msg is not None:
+                break
+
+        if msg is None:
+            print("Did not receive AUTOPILOT_VERSION")
+            return None
+
+        print("\nAUTOPILOT_VERSION received UID[%d]" % (msg.uid))
+
+        return msg.uid
     # def
 
     def clean_param_id(self, raw):
@@ -113,7 +147,7 @@ class DroneInterface:
         return decoded
     # def
 
-    def _handle_incoming_msg(self, msg):
+    def _handle_incoming_param_msg(self, msg):
         if msg is None:
             return
 
@@ -141,7 +175,7 @@ class DroneInterface:
         while time.time() < deadline:
             with self._mav_lock:
                 msg = self.master.recv_match(blocking=True, timeout=0.2)
-                self._handle_incoming_msg(msg)
+                self._handle_incoming_param_msg(msg)
 
                 if param_name in self._param_cache:
                     decoded = self._param_cache[param_name]
@@ -390,12 +424,18 @@ class FourSliderGUI:
         self.left_cal_active = False
         self.right_cal_active = False
 
-        self.angle_neg_degs  =-33.0
-        self.angle_pos_degs  = 35.0
+        self.angle_neg_degs = -33.0
+        self.angle_pos_degs = 35.0
         self.angle_trim_degs = -5.0
+
+        self.angle_neg_var = tk.StringVar(value="%.1f" % self.angle_neg_degs)
+        self.angle_pos_var = tk.StringVar(value="%.1f" % self.angle_pos_degs)
+        self.angle_trim_var = tk.StringVar(value="%.1f" % self.angle_trim_degs)
 
         main_frame = tk.Frame(root)
         main_frame.pack(padx=20, pady=20)
+
+        ident = drone_interface.get_id()
 
         left_min_param = drone_interface.get_param(self.LEFT_MIN_PARAM, int)
         left_max_param = drone_interface.get_param(self.LEFT_MAX_PARAM, int)
@@ -423,13 +463,22 @@ class FourSliderGUI:
             main_rev_param = 0
         self.main_rev = int(main_rev_param)
 
+        print("PX4 UID = %s" % str(ident))
         print("PWM_MAIN_REV = %d (0x%X)" % (self.main_rev, self.main_rev))
         print("MAIN5 reversed = %s" % str(((self.main_rev >> 4) & 1) != 0))
         print("MAIN6 reversed = %s" % str(((self.main_rev >> 5) & 1) != 0))
 
+        # Angle configuration panel
+        angle_group = tk.LabelFrame(main_frame, text="Calibration Angles", padx=10, pady=10)
+        angle_group.pack(side=tk.LEFT, padx=10, anchor="n", fill=tk.Y)
+
+        self.create_angle_entry(angle_group, "Neg deg", self.angle_neg_var, self.apply_angle_neg)
+        self.create_angle_entry(angle_group, "Pos deg", self.angle_pos_var, self.apply_angle_pos)
+        self.create_angle_entry(angle_group, "Trim deg", self.angle_trim_var, self.apply_angle_trim)
+
         # LEFT group
-        left_group = tk.Frame(main_frame)
-        left_group.pack(side=tk.LEFT, padx=20)
+        left_group = tk.LabelFrame(main_frame, text="Left", padx=10, pady=10)
+        left_group.pack(side=tk.LEFT, padx=10, fill=tk.Y)
 
         left_clear_btn = tk.Button(
             left_group,
@@ -445,10 +494,18 @@ class FourSliderGUI:
             width=18,
             command=self.start_left_calibration
         )
-        left_cal_btn.pack(pady=(0, 10))
+        left_cal_btn.pack(pady=(0, 4))
 
-        left_params = tk.Frame(left_group)
-        left_params.pack(pady=(0, 10))
+        left_stop_btn = tk.Button(
+            left_group,
+            text="Auto calibrate STOP",
+            width=18,
+            command=self.stop_left_calibration
+        )
+        left_stop_btn.pack(pady=(0, 10))
+
+        left_params = tk.Frame(left_group, bd=1, relief="groove", padx=6, pady=6)
+        left_params.pack(pady=(0, 10), fill=tk.X)
 
         self.left_min_var = tk.StringVar(value=str(left_min_param))
         self.left_max_var = tk.StringVar(value=str(left_max_param))
@@ -458,7 +515,7 @@ class FourSliderGUI:
         self.create_param_entry(left_params, "Left-max", self.left_max_var, self.apply_left_max)
         self.create_param_entry(left_params, "Left-trim", self.left_trim_var, self.apply_left_trim)
 
-        left_pos_frame = tk.Frame(left_group)
+        left_pos_frame = tk.Frame(left_group, bd=1, relief="groove", padx=6, pady=6)
         left_pos_frame.pack()
 
         self.left_pos = self.create_slider(
@@ -494,8 +551,8 @@ class FourSliderGUI:
         left_center_btn.pack(pady=(0, 5))
 
         # RIGHT group
-        right_group = tk.Frame(main_frame)
-        right_group.pack(side=tk.LEFT, padx=20)
+        right_group = tk.LabelFrame(main_frame, text="Right", padx=10, pady=10)
+        right_group.pack(side=tk.LEFT, padx=10, fill=tk.Y)
 
         right_clear_btn = tk.Button(
             right_group,
@@ -511,10 +568,18 @@ class FourSliderGUI:
             width=18,
             command=self.start_right_calibration
         )
-        right_cal_btn.pack(pady=(0, 10))
+        right_cal_btn.pack(pady=(0, 4))
 
-        right_params = tk.Frame(right_group)
-        right_params.pack(pady=(0, 10))
+        right_stop_btn = tk.Button(
+            right_group,
+            text="Auto calibrate stop",
+            width=18,
+            command=self.stop_right_calibration
+        )
+        right_stop_btn.pack(pady=(0, 10))
+
+        right_params = tk.Frame(right_group, bd=1, relief="groove", padx=6, pady=6)
+        right_params.pack(pady=(0, 10), fill=tk.X)
 
         self.right_min_var = tk.StringVar(value=str(right_min_param))
         self.right_max_var = tk.StringVar(value=str(right_max_param))
@@ -524,7 +589,7 @@ class FourSliderGUI:
         self.create_param_entry(right_params, "Right-max", self.right_max_var, self.apply_right_max)
         self.create_param_entry(right_params, "Right-trim", self.right_trim_var, self.apply_right_trim)
 
-        right_pos_frame = tk.Frame(right_group)
+        right_pos_frame = tk.Frame(right_group, bd=1, relief="groove", padx=6, pady=6)
         right_pos_frame.pack()
 
         self.right_pos = self.create_slider(
@@ -560,11 +625,8 @@ class FourSliderGUI:
         right_center_btn.pack(pady=(0, 5))
 
         # Instrumentation panel
-        log_group = tk.Frame(main_frame)
-        log_group.pack(side=tk.LEFT, padx=20, fill=tk.BOTH, expand=True)
-
-        log_label = tk.Label(log_group, text="Instrumentation")
-        log_label.pack(anchor="w")
+        log_group = tk.LabelFrame(main_frame, text="Instrumentation", padx=10, pady=10)
+        log_group.pack(side=tk.LEFT, padx=10, fill=tk.BOTH, expand=True)
 
         self.log_text = tk.Text(
             log_group,
@@ -582,6 +644,47 @@ class FourSliderGUI:
         self.update_actuators()
         self.update_expected_pwm()
         self.update_log_window()
+    # def
+
+    def create_angle_entry(self, parent, label, text_var, apply_callback):
+        row = tk.Frame(parent, bd=1, relief="groove", padx=4, pady=4)
+        row.pack(anchor="w", pady=3, fill=tk.X)
+
+        lbl = tk.Label(row, text=label, width=10, anchor="w")
+        lbl.pack(side=tk.LEFT, padx=(0, 5))
+
+        entry = tk.Entry(row, textvariable=text_var, width=6)
+        entry.pack(side=tk.LEFT)
+        entry.bind("<Return>", lambda event: apply_callback())
+
+        btn = tk.Button(row, text="Set", width=5, command=apply_callback)
+        btn.pack(side=tk.LEFT, padx=(5, 0))
+
+        return entry
+    # def
+
+    def apply_angle_neg(self):
+        try:
+            self.angle_neg_degs = float(self.angle_neg_var.get())
+            print("angle_neg_degs = %.2f" % self.angle_neg_degs)
+        except Exception as e:
+            print("Invalid angle_neg: %s" % str(e))
+    # def
+
+    def apply_angle_pos(self):
+        try:
+            self.angle_pos_degs = float(self.angle_pos_var.get())
+            print("angle_pos_degs = %.2f" % self.angle_pos_degs)
+        except Exception as e:
+            print("Invalid angle_pos: %s" % str(e))
+    # def
+
+    def apply_angle_trim(self):
+        try:
+            self.angle_trim_degs = float(self.angle_trim_var.get())
+            print("angle_trim_degs = %.2f" % self.angle_trim_degs)
+        except Exception as e:
+            print("Invalid angle_trim: %s" % str(e))
     # def
 
     def _set_side_param_vars_on_gui_thread(self, side, min_val=None, max_val=None, trim_val=None):
@@ -791,6 +894,9 @@ class FourSliderGUI:
     # def
 
     def get_side_expected_pwm(self, side, cmd):
+        if cmd is None:
+            return None
+
         if side == "LEFT":
             pwm_min = self.get_int_var(self.left_min_var, 1000)
             pwm_max = self.get_int_var(self.left_max_var, 2000)
@@ -805,6 +911,14 @@ class FourSliderGUI:
         return self.expected_pwm(cmd, pwm_min, pwm_max, trim, rev)
     # def
 
+    def is_calibration_active(self, side):
+        if side == "LEFT":
+            return self.left_cal_active
+        elif side == "RIGHT":
+            return self.right_cal_active
+        return False
+    # def
+
     def move_elevon_to_angle(self, side, output_function, target_angle_deg, inc_angle_deg):
         print("%s calibration move: centering elevon to 0.0 command" % side)
         self.drone_interface.command_elevon(output_function, 0.0)
@@ -814,6 +928,11 @@ class FourSliderGUI:
         deadline = time.time() + 60.0
 
         while time.time() < deadline:
+            if not self.is_calibration_active(side):
+                print("%s calibration move: stopped by user" % side)
+                self.drone_interface.command_elevon(output_function, 0.0)
+                return None
+
             angle_deg = self.get_side_angle(side)
 
             if angle_deg is None:
@@ -830,24 +949,20 @@ class FourSliderGUI:
                 reached = True
             elif target_angle_deg == 0.0 and abs(angle_deg) <= 0.5:
                 reached = True
-            # if
 
             if reached:
                 print("%s calibration move: target reached, cmd=%.3f" % (side, cmd))
                 return cmd
-            # if
 
-            if(abs(target_angle_deg - angle_deg) > 20.0):
+            if abs(target_angle_deg - angle_deg) > 20.0:
                 cmd += (inc_angle_deg * 3.0)
             else:
                 cmd += inc_angle_deg
-            # if
 
             if cmd < -1.0:
                 cmd = -1.0
             if cmd > 1.0:
                 cmd = 1.0
-            # if
 
             self.drone_interface.command_elevon(output_function, cmd)
 
@@ -875,10 +990,20 @@ class FourSliderGUI:
             self.set_side_param_and_refresh(side, max_param, int, 2100)
             self.set_side_param_and_refresh(side, trim_param, float, 0.0)
 
+            if not self.left_cal_active:
+                print("%s automatic calibration stopped" % side)
+                return
+
             cmd_neg = self.move_elevon_to_angle(side, output_function, self.angle_neg_degs, -0.01)
+            if not self.left_cal_active or cmd_neg is None:
+                print("%s automatic calibration stopped before negative endpoint completed" % side)
+                return
             pwm_neg = self.get_side_expected_pwm(side, cmd_neg)
 
             cmd_pos = self.move_elevon_to_angle(side, output_function, self.angle_pos_degs, 0.01)
+            if not self.left_cal_active or cmd_pos is None:
+                print("%s automatic calibration stopped before positive endpoint completed" % side)
+                return
             pwm_pos = self.get_side_expected_pwm(side, cmd_pos)
 
             print("%s automatic calibration loading Min[%s] Max[%s]" %
@@ -886,7 +1011,11 @@ class FourSliderGUI:
             self.set_side_param_and_refresh(side, min_param, int, pwm_pos)
             self.set_side_param_and_refresh(side, max_param, int, pwm_neg)
 
-            cmd_trim = self.move_elevon_to_angle(side, output_function, self.angle_trim_degs, -0.01)
+            trim_step = -0.01 if self.angle_trim_degs < 0.0 else 0.01
+            cmd_trim = self.move_elevon_to_angle(side, output_function, self.angle_trim_degs, trim_step)
+            if not self.left_cal_active or cmd_trim is None:
+                print("%s automatic calibration stopped before trim completed" % side)
+                return
 
             print("%s automatic calibration loading Trim[%.2f]" % (side, cmd_trim))
             self.set_side_param_and_refresh(side, trim_param, float, cmd_trim)
@@ -894,6 +1023,7 @@ class FourSliderGUI:
             print("%s automatic calibration finished" % side)
         finally:
             self.left_cal_active = False
+            self.drone_interface.command_elevon(output_function, 0.0)
     # def
 
     def _right_calibration_worker(self):
@@ -910,10 +1040,20 @@ class FourSliderGUI:
             self.set_side_param_and_refresh(side, max_param, int, 2100)
             self.set_side_param_and_refresh(side, trim_param, float, 0.0)
 
+            if not self.right_cal_active:
+                print("%s automatic calibration stopped" % side)
+                return
+
             cmd_neg = self.move_elevon_to_angle(side, output_function, self.angle_neg_degs, -0.01)
+            if not self.right_cal_active or cmd_neg is None:
+                print("%s automatic calibration stopped before negative endpoint completed" % side)
+                return
             pwm_neg = self.get_side_expected_pwm(side, cmd_neg)
 
             cmd_pos = self.move_elevon_to_angle(side, output_function, self.angle_pos_degs, 0.01)
+            if not self.right_cal_active or cmd_pos is None:
+                print("%s automatic calibration stopped before positive endpoint completed" % side)
+                return
             pwm_pos = self.get_side_expected_pwm(side, cmd_pos)
 
             print("%s automatic calibration loading Min[%s] Max[%s]" %
@@ -921,7 +1061,11 @@ class FourSliderGUI:
             self.set_side_param_and_refresh(side, min_param, int, pwm_neg)
             self.set_side_param_and_refresh(side, max_param, int, pwm_pos)
 
-            cmd_trim = self.move_elevon_to_angle(side, output_function, self.angle_trim_degs, -0.01)
+            trim_step = -0.01 if self.angle_trim_degs < 0.0 else 0.01
+            cmd_trim = self.move_elevon_to_angle(side, output_function, self.angle_trim_degs, trim_step)
+            if not self.right_cal_active or cmd_trim is None:
+                print("%s automatic calibration stopped before trim completed" % side)
+                return
 
             print("%s automatic calibration loading Trim[%.2f]" % (side, cmd_trim))
             self.set_side_param_and_refresh(side, trim_param, float, cmd_trim)
@@ -929,6 +1073,7 @@ class FourSliderGUI:
             print("%s automatic calibration finished" % side)
         finally:
             self.right_cal_active = False
+            self.drone_interface.command_elevon(output_function, 0.0)
     # def
 
     def start_left_calibration(self):
@@ -936,6 +1081,7 @@ class FourSliderGUI:
             print("Left automatic calibration already running")
             return
 
+        self.left_cal_active = True
         self.left_cal_thread = threading.Thread(
             target=self._left_calibration_worker,
             daemon=True
@@ -948,11 +1094,36 @@ class FourSliderGUI:
             print("Right automatic calibration already running")
             return
 
+        self.right_cal_active = True
         self.right_cal_thread = threading.Thread(
             target=self._right_calibration_worker,
             daemon=True
         )
         self.right_cal_thread.start()
+    # def
+
+    def stop_left_calibration(self):
+        if self.left_cal_active:
+            print("Stopping LEFT automatic calibration...")
+        else:
+            print("LEFT automatic calibration is not running")
+        self.left_cal_active = False
+        try:
+            self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, 0.0)
+        except Exception as e:
+            print("Failed to stop LEFT actuator command: %s" % str(e))
+    # def
+
+    def stop_right_calibration(self):
+        if self.right_cal_active:
+            print("Stopping RIGHT automatic calibration...")
+        else:
+            print("RIGHT automatic calibration is not running")
+        self.right_cal_active = False
+        try:
+            self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, 0.0)
+        except Exception as e:
+            print("Failed to stop RIGHT actuator command: %s" % str(e))
     # def
 
     def clear_left(self):
@@ -1184,10 +1355,10 @@ class FourSliderGUI:
 
 
 if __name__ == "__main__":
-    drone_interface = DroneInterface("COM20") # COM4 on FS PC
+    drone_interface = DroneInterface("COM20")  # COM4 on FS PC
     drone_interface.connect()
 
-    position_reader = PositionReader("COM5") # COM9 on FS PC
+    position_reader = PositionReader("COM5")  # COM9 on FS PC
     position_reader.start()
 
     root = tk.Tk()
