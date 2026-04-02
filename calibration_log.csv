@@ -1,0 +1,2 @@
+date,time,drone_name,uid,angle_neg_degs,angle_pos_degs,angle_trim_degs,left_min,left_max,left_trim,right_min,right_max,right_trim
+2026-04-02,17:06:52,020,3689381615407478064,-33.0,35.0,-5.0,1164,1950,-0.24,1092,1842,-0.27

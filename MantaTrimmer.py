@@ -10,6 +10,8 @@ from pymavlink import mavutil
 import json
 import os
 import serial
+import csv
+from datetime import datetime
 
 
 class InstrumentationLog:
@@ -546,6 +548,8 @@ class FourSliderGUI:
         self.position_reader = position_reader
         self.drone_interface = drone_interface
 
+        self.calibration_log_file = "calibration_log.csv"
+
         self.LEFT_OUTPUT_FUNCTION = 1201
         self.LEFT_MIN_PARAM = "PWM_MAIN_MIN5"
         self.LEFT_MAX_PARAM = "PWM_MAIN_MAX5"
@@ -638,6 +642,14 @@ class FourSliderGUI:
         self.create_angle_entry(angle_group, "Neg deg", self.angle_neg_var, self.apply_angle_neg)
         self.create_angle_entry(angle_group, "Pos deg", self.angle_pos_var, self.apply_angle_pos)
         self.create_angle_entry(angle_group, "Trim deg", self.angle_trim_var, self.apply_angle_trim)
+
+        log_cal_btn = tk.Button(
+            angle_group,
+            text="Log calibration",
+            width=18,
+            command=self.log_calibration
+        )
+        log_cal_btn.pack(pady=(8, 0), anchor="w")
 
         # LEFT group
         left_group = tk.LabelFrame(main_frame, text="Left", padx=10, pady=10)
@@ -860,6 +872,72 @@ class FourSliderGUI:
             print("angle_trim_degs = %.2f" % self.angle_trim_degs)
         except Exception as e:
             print("Invalid angle_trim: %s" % str(e))
+    # def
+
+    def log_calibration(self):
+        try:
+            now = datetime.now()
+
+            date_str = now.strftime("%Y-%m-%d")
+            time_str = now.strftime("%H:%M:%S")
+
+            drone_name = self.drone_name_var.get().strip()
+            uid = self.uid_var.get().strip()
+
+            angle_neg = float(self.angle_neg_var.get().strip())
+            angle_pos = float(self.angle_pos_var.get().strip())
+            angle_trim = float(self.angle_trim_var.get().strip())
+
+            left_min = int(self.left_min_var.get().strip())
+            left_max = int(self.left_max_var.get().strip())
+            left_trim = float(self.left_trim_var.get().strip())
+
+            right_min = int(self.right_min_var.get().strip())
+            right_max = int(self.right_max_var.get().strip())
+            right_trim = float(self.right_trim_var.get().strip())
+
+            file_exists = os.path.exists(self.calibration_log_file)
+
+            with open(self.calibration_log_file, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+
+                if not file_exists:
+                    writer.writerow([
+                        "date",
+                        "time",
+                        "drone_name",
+                        "uid",
+                        "angle_neg_degs",
+                        "angle_pos_degs",
+                        "angle_trim_degs",
+                        "left_min",
+                        "left_max",
+                        "left_trim",
+                        "right_min",
+                        "right_max",
+                        "right_trim",
+                    ])
+
+                writer.writerow([
+                    date_str,
+                    time_str,
+                    drone_name,
+                    uid,
+                    angle_neg,
+                    angle_pos,
+                    angle_trim,
+                    left_min,
+                    left_max,
+                    left_trim,
+                    right_min,
+                    right_max,
+                    right_trim,
+                ])
+
+            print("Calibration logged to %s" % self.calibration_log_file)
+
+        except Exception as e:
+            print("Failed to log calibration: %s" % str(e))
     # def
 
     def _set_side_param_vars_on_gui_thread(self, side, min_val=None, max_val=None, trim_val=None):
