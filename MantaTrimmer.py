@@ -7,7 +7,8 @@ import builtins
 import queue
 from collections import deque
 from pymavlink import mavutil
-
+import json
+import os
 import serial
 
 
@@ -289,11 +290,83 @@ class PositionReader:
         self._lock = threading.Lock()
         self._thread = None
 
+        self.calibration_file = "settings.json"
+
         self.left_offset = -75.68
         self.left_scaler = 0.0042
 
         self.right_offset = +117.75
         self.right_scaler = 0.0045
+
+        self.load_calibration()
+    # def
+
+    def load_calibration(self):
+        if not os.path.exists(self.calibration_file):
+            print("Calibration file %s not found, using defaults" % self.calibration_file)
+            return
+
+        try:
+            with open(self.calibration_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            left = data.get("LEFT", {})
+            right = data.get("RIGHT", {})
+
+            if "scaler" in left:
+                self.left_scaler = float(left["scaler"])
+            if "offset" in left:
+                self.left_offset = float(left["offset"])
+
+            if "scaler" in right:
+                self.right_scaler = float(right["scaler"])
+            if "offset" in right:
+                self.right_offset = float(right["offset"])
+
+            print(
+                "Loaded calibration from %s: LEFT scaler=%.6f offset=%.6f, RIGHT scaler=%.6f offset=%.6f"
+                % (
+                    self.calibration_file,
+                    self.left_scaler,
+                    self.left_offset,
+                    self.right_scaler,
+                    self.right_offset,
+                )
+            )
+
+        except Exception as e:
+            print("Failed to load calibration from %s: %s" % (self.calibration_file, str(e)))
+    # def
+
+    def save_calibration(self):
+        data = {
+            "LEFT": {
+                "scaler": self.left_scaler,
+                "offset": self.left_offset,
+            },
+            "RIGHT": {
+                "scaler": self.right_scaler,
+                "offset": self.right_offset,
+            },
+        }
+
+        try:
+            with open(self.calibration_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+
+            print(
+                "Saved calibration to %s: LEFT scaler=%.6f offset=%.6f, RIGHT scaler=%.6f offset=%.6f"
+                % (
+                    self.calibration_file,
+                    self.left_scaler,
+                    self.left_offset,
+                    self.right_scaler,
+                    self.right_offset,
+                )
+            )
+
+        except Exception as e:
+            print("Failed to save calibration to %s: %s" % (self.calibration_file, str(e)))
     # def
 
     def position_to_degrees(self, side, raw_position):
@@ -313,10 +386,32 @@ class PositionReader:
         if side == "LEFT":
             self.left_offset = -(self.left_scaler * raw)
             print("Left centred. Scaler=%.4f Offset = %.4f" % (self.left_scaler, self.left_offset))
+            self.save_calibration()
 
         elif side == "RIGHT":
             self.right_offset = (self.right_scaler * raw)
             print("Right centred. Scaler=%.4f Offset = %.4f" % (self.right_scaler, self.right_offset))
+            self.save_calibration()
+    # def
+
+    def set_scaler_and_offset(self, side, scaler=None, offset=None):
+        if side == "LEFT":
+            if scaler is not None:
+                self.left_scaler = float(scaler)
+            if offset is not None:
+                self.left_offset = float(offset)
+
+            print("LEFT calibration set. Scaler=%.6f Offset=%.6f" % (self.left_scaler, self.left_offset))
+            self.save_calibration()
+
+        elif side == "RIGHT":
+            if scaler is not None:
+                self.right_scaler = float(scaler)
+            if offset is not None:
+                self.right_offset = float(offset)
+
+            print("RIGHT calibration set. Scaler=%.6f Offset=%.6f" % (self.right_scaler, self.right_offset))
+            self.save_calibration()
     # def
 
     def _position_reader_loop(self):
@@ -395,7 +490,6 @@ class PositionReader:
         return sum(samples) / float(len(samples))
     # def
 # class
-
 
 class FourSliderGUI:
     def __init__(self, root, position_reader, drone_interface):
