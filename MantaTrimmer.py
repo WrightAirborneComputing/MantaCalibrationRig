@@ -390,6 +390,10 @@ class FourSliderGUI:
         self.left_cal_active = False
         self.right_cal_active = False
 
+        self.angle_neg_degs  =-33.0
+        self.angle_pos_degs  = 35.0
+        self.angle_trim_degs = -5.0
+
         main_frame = tk.Frame(root)
         main_frame.pack(padx=20, pady=20)
 
@@ -871,21 +875,21 @@ class FourSliderGUI:
             self.set_side_param_and_refresh(side, max_param, int, 2100)
             self.set_side_param_and_refresh(side, trim_param, float, 0.0)
 
-            cmd_neg35 = self.move_elevon_to_angle(side, output_function, -33.0, -0.01)
-            pwm_neg35 = self.get_side_expected_pwm(side, cmd_neg35)
+            cmd_neg = self.move_elevon_to_angle(side, output_function, self.angle_neg_degs, -0.01)
+            pwm_neg = self.get_side_expected_pwm(side, cmd_neg)
 
-            cmd_pos35 = self.move_elevon_to_angle(side, output_function, 35.0, 0.01)
-            pwm_pos35 = self.get_side_expected_pwm(side, cmd_pos35)
+            cmd_pos = self.move_elevon_to_angle(side, output_function, self.angle_pos_degs, 0.01)
+            pwm_pos = self.get_side_expected_pwm(side, cmd_pos)
 
             print("%s automatic calibration loading Min[%s] Max[%s]" %
-                  (side, str(pwm_pos35), str(pwm_neg35)))
-            self.set_side_param_and_refresh(side, min_param, int, pwm_pos35)
-            self.set_side_param_and_refresh(side, max_param, int, pwm_neg35)
+                  (side, str(pwm_pos), str(pwm_neg)))
+            self.set_side_param_and_refresh(side, min_param, int, pwm_pos)
+            self.set_side_param_and_refresh(side, max_param, int, pwm_neg)
 
-            cmd_neg10 = self.move_elevon_to_angle(side, output_function, -5.0, -0.01)
+            cmd_trim = self.move_elevon_to_angle(side, output_function, self.angle_trim_degs, -0.01)
 
-            print("%s automatic calibration loading Trim[%.2f]" % (side, cmd_neg10))
-            self.set_side_param_and_refresh(side, trim_param, float, cmd_neg10)
+            print("%s automatic calibration loading Trim[%.2f]" % (side, cmd_trim))
+            self.set_side_param_and_refresh(side, trim_param, float, cmd_trim)
 
             print("%s automatic calibration finished" % side)
         finally:
@@ -906,21 +910,21 @@ class FourSliderGUI:
             self.set_side_param_and_refresh(side, max_param, int, 2100)
             self.set_side_param_and_refresh(side, trim_param, float, 0.0)
 
-            cmd_neg35 = self.move_elevon_to_angle(side, output_function, -33.0, -0.01)
-            pwm_neg35 = self.get_side_expected_pwm(side, cmd_neg35)
+            cmd_neg = self.move_elevon_to_angle(side, output_function, self.angle_neg_degs, -0.01)
+            pwm_neg = self.get_side_expected_pwm(side, cmd_neg)
 
-            cmd_pos35 = self.move_elevon_to_angle(side, output_function, 35.0, 0.01)
-            pwm_pos35 = self.get_side_expected_pwm(side, cmd_pos35)
+            cmd_pos = self.move_elevon_to_angle(side, output_function, self.angle_pos_degs, 0.01)
+            pwm_pos = self.get_side_expected_pwm(side, cmd_pos)
 
             print("%s automatic calibration loading Min[%s] Max[%s]" %
-                  (side, str(pwm_neg35), str(pwm_pos35)))
-            self.set_side_param_and_refresh(side, min_param, int, pwm_neg35)
-            self.set_side_param_and_refresh(side, max_param, int, pwm_pos35)
+                  (side, str(pwm_neg), str(pwm_pos)))
+            self.set_side_param_and_refresh(side, min_param, int, pwm_neg)
+            self.set_side_param_and_refresh(side, max_param, int, pwm_pos)
 
-            cmd_neg10 = self.move_elevon_to_angle(side, output_function, -5.0, -0.01)
+            cmd_trim = self.move_elevon_to_angle(side, output_function, self.angle_trim_degs, -0.01)
 
-            print("%s automatic calibration loading Trim[%.2f]" % (side, cmd_neg10))
-            self.set_side_param_and_refresh(side, trim_param, float, cmd_neg10)
+            print("%s automatic calibration loading Trim[%.2f]" % (side, cmd_trim))
+            self.set_side_param_and_refresh(side, trim_param, float, cmd_trim)
 
             print("%s automatic calibration finished" % side)
         finally:
@@ -1180,10 +1184,10 @@ class FourSliderGUI:
 
 
 if __name__ == "__main__":
-    drone_interface = DroneInterface("COM4")
+    drone_interface = DroneInterface("COM20") # COM4 on FS PC
     drone_interface.connect()
 
-    position_reader = PositionReader("COM9")
+    position_reader = PositionReader("COM5") # COM9 on FS PC
     position_reader.start()
 
     root = tk.Tk()
