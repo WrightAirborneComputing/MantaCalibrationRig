@@ -1,12 +1,11 @@
 {
-    "drone_name": "SN020",
     "LEFT": {
         "scaler": 0.0042,
-        "offset": -71.18159999999999
+        "offset": -69.0984
     },
     "RIGHT": {
         "scaler": 0.0045,
-        "offset": 113.64299999999999
+        "offset": 118.82699999999998
     },
     "ANGLES": {
         "angle_neg_degs": -33.0,

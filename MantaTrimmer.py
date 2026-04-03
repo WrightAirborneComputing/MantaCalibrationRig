@@ -332,8 +332,6 @@ class PositionReader:
             with open(self.calibration_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            self.drone_name = str(data.get("drone_name", ""))
-
             left = data.get("LEFT", {})
             right = data.get("RIGHT", {})
             angles = data.get("ANGLES", {})
@@ -356,10 +354,9 @@ class PositionReader:
                 self.angle_trim_degs = float(angles["angle_trim_degs"])
 
             print(
-                "Loaded calibration from %s: drone_name=%s, LEFT scaler=%.6f offset=%.6f, RIGHT scaler=%.6f offset=%.6f, angles=(%.2f, %.2f, %.2f)"
+                "Loaded calibration from %s: LEFT scaler=%.6f offset=%.6f, RIGHT scaler=%.6f offset=%.6f, angles=(%.2f, %.2f, %.2f)"
                 % (
                     self.calibration_file,
-                    self.drone_name,
                     self.left_scaler,
                     self.left_offset,
                     self.right_scaler,
@@ -376,7 +373,6 @@ class PositionReader:
 
     def save_calibration(self):
         data = {
-            "drone_name": self.drone_name,
             "LEFT": {
                 "scaler": self.left_scaler,
                 "offset": self.left_offset,
@@ -397,10 +393,9 @@ class PositionReader:
                 json.dump(data, f, indent=4)
 
             print(
-                "Saved calibration to %s: drone_name=%s, LEFT scaler=%.6f offset=%.6f, RIGHT scaler=%.6f offset=%.6f, angles=(%.2f, %.2f, %.2f)"
+                "Saved calibration to %s: LEFT scaler=%.6f offset=%.6f, RIGHT scaler=%.6f offset=%.6f, angles=(%.2f, %.2f, %.2f)"
                 % (
                     self.calibration_file,
-                    self.drone_name,
                     self.left_scaler,
                     self.left_offset,
                     self.right_scaler,
@@ -579,7 +574,7 @@ class FourSliderGUI:
         self.left_cal_active = False
         self.right_cal_active = False
 
-        self.drone_name_var = tk.StringVar(value=self.position_reader.drone_name)
+        self.drone_name_var = tk.StringVar(value="")
 
         self.angle_neg_degs = self.position_reader.angle_neg_degs
         self.angle_pos_degs = self.position_reader.angle_pos_degs
@@ -893,7 +888,7 @@ class FourSliderGUI:
             self.uid_var.set("--" if ident is None else str(ident))
 
             self.drone_name_var.set("")
-            self.position_reader.set_drone_name("")
+            self.position_reader.drone_name = ""
             print("Drone name cleared after connect")
 
             left_min_param = self.drone_interface.get_param(self.LEFT_MIN_PARAM, int)
@@ -952,7 +947,7 @@ class FourSliderGUI:
     def apply_drone_name(self):
         try:
             name = self.drone_name_var.get().strip()
-            self.position_reader.set_drone_name(name)
+            self.position_reader.drone_name = str(name)
             print("drone_name = %s" % name)
         except Exception as e:
             print("Invalid drone name: %s" % str(e))
@@ -997,7 +992,11 @@ class FourSliderGUI:
             date_str = now.strftime("%Y-%m-%d")
             time_str = now.strftime("%H:%M:%S")
 
-            uid = self.uid_var.get().strip()
+            uid_text = self.uid_var.get().strip()
+            uid = ""
+
+            if uid_text != "" and uid_text != "--":
+                uid = str(int(uid_text))
 
             angle_neg = float(self.angle_neg_var.get().strip())
             angle_pos = float(self.angle_pos_var.get().strip())
