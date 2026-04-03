@@ -76,6 +76,20 @@ class DroneInterface:
         ))
     # def
 
+    def reconnect(self):
+        try:
+            if self.master is not None:
+                close_fn = getattr(self.master, "close", None)
+                if callable(close_fn):
+                    close_fn()
+        except Exception as e:
+            print("Previous MAVLink close failed: %s" % str(e))
+
+        self.master = None
+        self._param_cache.clear()
+        self.connect()
+    # def
+
     def get_id(self, timeout=5.0):
 
         print("Requesting AUTOPILOT_VERSION...")
@@ -613,7 +627,7 @@ class FourSliderGUI:
         print("MAIN6 reversed = %s" % str(((self.main_rev >> 5) & 1) != 0))
 
         # Angle configuration panel
-        angle_group = tk.LabelFrame(main_frame, text="Calibration Angles", padx=10, pady=10)
+        angle_group = tk.LabelFrame(main_frame, text="Settings and Control", padx=10, pady=10)
         angle_group.pack(side=tk.LEFT, padx=10, anchor="n", fill=tk.Y)
 
         name_row = tk.Frame(angle_group, bd=1, relief="groove", padx=4, pady=4)
@@ -642,6 +656,38 @@ class FourSliderGUI:
         self.create_angle_entry(angle_group, "Neg deg", self.angle_neg_var, self.apply_angle_neg)
         self.create_angle_entry(angle_group, "Pos deg", self.angle_pos_var, self.apply_angle_pos)
         self.create_angle_entry(angle_group, "Trim deg", self.angle_trim_var, self.apply_angle_trim)
+
+        connect_btn = tk.Button(
+            angle_group,
+            text="Connect",
+            width=18,
+            command=self.connect_mavlink
+        )
+        connect_btn.pack(pady=(8, 2), anchor="w")
+
+        zero_angles_btn = tk.Button(
+            angle_group,
+            text="Zero angles",
+            width=18,
+            command=self.zero_both_angles
+        )
+        zero_angles_btn.pack(pady=2, anchor="w")
+
+        auto_both_btn = tk.Button(
+            angle_group,
+            text="Auto calibrate",
+            width=18,
+            command=self.start_both_calibration
+        )
+        auto_both_btn.pack(pady=2, anchor="w")
+
+        stop_both_btn = tk.Button(
+            angle_group,
+            text="Stop auto",
+            width=18,
+            command=self.stop_both_calibration
+        )
+        stop_both_btn.pack(pady=2, anchor="w")
 
         log_cal_btn = tk.Button(
             angle_group,
@@ -838,6 +884,71 @@ class FourSliderGUI:
         return entry
     # def
 
+    def connect_mavlink(self):
+        try:
+            print("Reconnecting MAVLink...")
+            self.drone_interface.reconnect()
+
+            ident = self.drone_interface.get_id()
+            self.uid_var.set("--" if ident is None else str(ident))
+
+            self.drone_name_var.set("")
+            self.position_reader.set_drone_name("")
+            print("Drone name cleared after connect")
+
+            left_min_param = self.drone_interface.get_param(self.LEFT_MIN_PARAM, int)
+            left_max_param = self.drone_interface.get_param(self.LEFT_MAX_PARAM, int)
+            left_trim_param = self.drone_interface.get_param(self.LEFT_TRIM_PARAM, float)
+            right_min_param = self.drone_interface.get_param(self.RIGHT_MIN_PARAM, int)
+            right_max_param = self.drone_interface.get_param(self.RIGHT_MAX_PARAM, int)
+            right_trim_param = self.drone_interface.get_param(self.RIGHT_TRIM_PARAM, float)
+            main_rev_param = self.drone_interface.get_param("PWM_MAIN_REV", int)
+
+            if left_min_param is not None:
+                self.left_min_var.set(str(int(left_min_param)))
+            if left_max_param is not None:
+                self.left_max_var.set(str(int(left_max_param)))
+            if left_trim_param is not None:
+                self.left_trim_var.set("%.3f" % float(left_trim_param))
+
+            if right_min_param is not None:
+                self.right_min_var.set(str(int(right_min_param)))
+            if right_max_param is not None:
+                self.right_max_var.set(str(int(right_max_param)))
+            if right_trim_param is not None:
+                self.right_trim_var.set("%.3f" % float(right_trim_param))
+
+            if main_rev_param is not None:
+                self.main_rev = int(main_rev_param)
+
+            print("Reconnect complete")
+            print("PWM_MAIN_REV = %d (0x%X)" % (self.main_rev, self.main_rev))
+            print("MAIN5 reversed = %s" % str(((self.main_rev >> 4) & 1) != 0))
+            print("MAIN6 reversed = %s" % str(((self.main_rev >> 5) & 1) != 0))
+
+        except Exception as e:
+            print("Reconnect failed: %s" % str(e))
+    # def
+
+    def zero_both_angles(self):
+        print("Zeroing both angles...")
+        self.centre_left()
+        self.centre_right()
+    # def
+
+    def start_both_calibration(self):
+        print("Starting automatic calibration on both sides...")
+        self.zero_both_sliders()
+        self._start_left_calibration_worker()
+        self._start_right_calibration_worker()
+    # def
+
+    def stop_both_calibration(self):
+        print("Stopping automatic calibration on both sides...")
+        self.stop_left_calibration()
+        self.stop_right_calibration()
+    # def
+
     def apply_drone_name(self):
         try:
             name = self.drone_name_var.get().strip()
@@ -876,12 +987,16 @@ class FourSliderGUI:
 
     def log_calibration(self):
         try:
+            drone_name = self.drone_name_var.get().strip()
+            if drone_name == "":
+                print("Cannot log calibration: Drone name has not been set")
+                return
+
             now = datetime.now()
 
             date_str = now.strftime("%Y-%m-%d")
             time_str = now.strftime("%H:%M:%S")
 
-            drone_name = self.drone_name_var.get().strip()
             uid = self.uid_var.get().strip()
 
             angle_neg = float(self.angle_neg_var.get().strip())
@@ -1128,6 +1243,22 @@ class FourSliderGUI:
         return int(round(pwm))
     # def
 
+    def zero_side_slider(self, side):
+        if side == "LEFT":
+            self.left_pos.set(0.0)
+            self.left_pos.update_idletasks()
+            print("Left slider zeroed")
+        elif side == "RIGHT":
+            self.right_pos.set(0.0)
+            self.right_pos.update_idletasks()
+            print("Right slider zeroed")
+    # def
+
+    def zero_both_sliders(self):
+        self.zero_side_slider("LEFT")
+        self.zero_side_slider("RIGHT")
+    # def
+
     def centre_left(self):
         print("Centering LEFT...")
         self.position_reader.set_center("LEFT")
@@ -1329,7 +1460,7 @@ class FourSliderGUI:
             self.drone_interface.command_elevon(output_function, 0.0)
     # def
 
-    def start_left_calibration(self):
+    def _start_left_calibration_worker(self):
         if self.left_cal_thread is not None and self.left_cal_thread.is_alive():
             print("Left automatic calibration already running")
             return
@@ -1342,7 +1473,7 @@ class FourSliderGUI:
         self.left_cal_thread.start()
     # def
 
-    def start_right_calibration(self):
+    def _start_right_calibration_worker(self):
         if self.right_cal_thread is not None and self.right_cal_thread.is_alive():
             print("Right automatic calibration already running")
             return
@@ -1353,6 +1484,16 @@ class FourSliderGUI:
             daemon=True
         )
         self.right_cal_thread.start()
+    # def
+
+    def start_left_calibration(self):
+        self.zero_side_slider("LEFT")
+        self._start_left_calibration_worker()
+    # def
+
+    def start_right_calibration(self):
+        self.zero_side_slider("RIGHT")
+        self._start_right_calibration_worker()
     # def
 
     def stop_left_calibration(self):
