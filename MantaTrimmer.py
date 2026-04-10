@@ -574,6 +574,9 @@ class FourSliderGUI:
         self.left_cal_active = False
         self.right_cal_active = False
 
+        self.sweep_thread = None
+        self.sweep_active = False
+
         self.drone_name_var = tk.StringVar(value="")
 
         self.angle_neg_degs = self.position_reader.angle_neg_degs
@@ -683,6 +686,14 @@ class FourSliderGUI:
             command=self.stop_both_calibration
         )
         stop_both_btn.pack(pady=2, anchor="w")
+
+        sweep_btn = tk.Button(
+            angle_group,
+            text="Sweep to CSV",
+            width=18,
+            command=self.start_sweep_to_csv
+        )
+        sweep_btn.pack(pady=(8, 2), anchor="w")
 
         log_cal_btn = tk.Button(
             angle_group,
@@ -860,6 +871,132 @@ class FourSliderGUI:
         self.update_actuators()
         self.update_expected_pwm()
         self.update_log_window()
+    # def
+
+    def make_safe_filename(self, text):
+        safe = str(text).strip()
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", safe)
+        safe = safe.strip("._")
+        if safe == "":
+            safe = "drone"
+        return safe
+    # def
+
+    def wait_for_valid_both_angles(self, timeout=5.0, poll_s=0.05):
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            left_angle = self.get_left_value()
+            right_angle = self.get_right_value()
+
+            if left_angle is not None and right_angle is not None:
+                return left_angle, right_angle
+
+            time.sleep(poll_s)
+
+        return None, None
+    # def
+
+    def clear_position_queues(self):
+        try:
+            self.position_reader.clear_queues()
+        except Exception as e:
+            print("Failed to clear position queues: %s" % str(e))
+    # def
+
+    def start_sweep_to_csv(self):
+        if self.sweep_thread is not None and self.sweep_thread.is_alive():
+            print("Sweep already running")
+            return
+
+        self.stop_both_calibration()
+
+        self.sweep_active = True
+        self.sweep_thread = threading.Thread(
+            target=self._sweep_to_csv_worker,
+            daemon=True
+        )
+        self.sweep_thread.start()
+    # def
+
+    def _sweep_to_csv_worker(self):
+        try:
+            drone_name = self.drone_name_var.get().strip()
+            if drone_name == "":
+                drone_name = "drone"
+
+            safe_name = self.make_safe_filename(drone_name)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            csv_filename = "%s_%s.csv" % (safe_name, timestamp)
+
+            print("Starting sweep to CSV: %s" % csv_filename)
+
+            sweep_values = []
+            i = -10
+            while i <= 10:
+                sweep_values.append(round(i / 10.0, 1))
+                i += 1
+
+            with open(csv_filename, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "date",
+                    "time",
+                    "drone_name",
+                    "input_cmd",
+                    "left_angle_deg",
+                    "right_angle_deg",
+                ])
+
+                for cmd in sweep_values:
+                    if not self.sweep_active:
+                        print("Sweep stopped")
+                        break
+
+                    print("Sweep step: cmd=%.1f" % cmd)
+
+                    self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, cmd)
+                    self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, cmd)
+
+                    time.sleep(1.0)
+                    self.clear_position_queues()
+
+                    left_angle, right_angle = self.wait_for_valid_both_angles(timeout=5.0, poll_s=0.05)
+
+                    if left_angle is None or right_angle is None:
+                        print("Skipping sweep point %.1f because valid angles were not received on both sides" % cmd)
+                        continue
+
+                    now = datetime.now()
+                    date_str = now.strftime("%Y-%m-%d")
+                    time_str = now.strftime("%H:%M:%S")
+
+                    writer.writerow([
+                        date_str,
+                        time_str,
+                        drone_name,
+                        "%.1f" % cmd,
+                        "%.3f" % left_angle,
+                        "%.3f" % right_angle,
+                    ])
+                    f.flush()
+
+                    print(
+                        "Logged sweep point: cmd=%.1f left_angle=%.3f right_angle=%.3f" %
+                        (cmd, left_angle, right_angle)
+                    )
+
+            self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, 0.0)
+            self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, 0.0)
+            self.root.after(0, lambda: self.left_pos.set(0.0))
+            self.root.after(0, lambda: self.right_pos.set(0.0))
+
+            print("Sweep finished: %s" % csv_filename)
+
+        except Exception as e:
+            print("Sweep to CSV failed: %s" % str(e))
+        finally:
+            self.sweep_active = False
     # def
 
     def create_angle_entry(self, parent, label, text_var, apply_callback):
@@ -1396,6 +1533,7 @@ class FourSliderGUI:
 
             trim_step = -0.01 if self.angle_trim_degs < 0.0 else 0.01
             cmd_trim = self.move_elevon_to_angle(side, output_function, self.angle_trim_degs, trim_step)
+
             if not self.left_cal_active or cmd_trim is None:
                 print("%s automatic calibration stopped before trim completed" % side)
                 return
@@ -1446,6 +1584,7 @@ class FourSliderGUI:
 
             trim_step = -0.01 if self.angle_trim_degs < 0.0 else 0.01
             cmd_trim = self.move_elevon_to_angle(side, output_function, self.angle_trim_degs, trim_step)
+
             if not self.right_cal_active or cmd_trim is None:
                 print("%s automatic calibration stopped before trim completed" % side)
                 return
@@ -1724,11 +1863,11 @@ class FourSliderGUI:
 
     def update_actuators(self):
         try:
-            if not self.left_cal_active:
+            if not self.left_cal_active and not self.sweep_active:
                 left_cmd = float(self.left_pos.get())
                 self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, left_cmd)
 
-            if not self.right_cal_active:
+            if not self.right_cal_active and not self.sweep_active:
                 right_cmd = float(self.right_pos.get())
                 self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, right_cmd)
 
