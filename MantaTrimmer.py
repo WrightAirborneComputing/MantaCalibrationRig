@@ -477,6 +477,7 @@ class PositionReader:
             with serial.Serial(self.port, baudrate=self.baud, timeout=self.timeout) as ser:
                 while True:
                     line = ser.readline()
+                    # print(f"Got [{line}]")
                     if not line:
                         continue
 
@@ -1749,10 +1750,10 @@ class FourSliderGUI:
 
 
 if __name__ == "__main__":
-    drone_interface = DroneInterface("COM20")  # COM4 on FS PC
+    drone_interface = DroneInterface("COM4")  # COM4 on FS PC
     drone_interface.connect()
 
-    position_reader = PositionReader("COM5")  # COM9 on FS PC
+    position_reader = PositionReader("COM19")  # COM19 on FS PC
     position_reader.start()
 
     root = tk.Tk()
