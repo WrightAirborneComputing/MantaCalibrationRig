@@ -1,17 +1,33 @@
-import tkinter as tk
+try:
+    import tkinter as tk
+    from tkinter import ttk
+except ImportError:
+    raise SystemExit(
+        "tkinter is not available.\n"
+        "  Debian/Ubuntu: sudo apt install python3-tk\n"
+        "  Fedora:        sudo dnf install python3-tkinter\n"
+        "  Windows/macOS: reinstall Python with the Tcl/Tk option enabled"
+    )
+
 import threading
 import time
 import re
 import struct
 import builtins
 import queue
+import sys
+import errno
 from collections import deque
 from pymavlink import mavutil
 import json
 import os
 import serial
+import serial.tools.list_ports
 import csv
 from datetime import datetime
+
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 class InstrumentationLog:
@@ -52,45 +68,349 @@ def print(*args, **kwargs):
 # def
 
 
+IS_LINUX = sys.platform.startswith("linux")
+IS_WINDOWS = sys.platform.startswith("win")
+
+SERIAL_BAUD = 115200
+
+# The rig Pico enumerates as a Raspberry Pi USB CDC device. This is the
+# authoritative way to spot it; probe_pico() is only a fallback.
+PICO_VIDS = {0x2E8A}
+PICO_VID_PIDS = {
+    (0x2E8A, 0x0005),  # RP2040 CDC, MicroPython
+    (0x2E8A, 0x000A),  # RP2040 CDC, CircuitPython
+}
+
+# Only a hint used to order the MAVLink probe. The heartbeat is what decides.
+FCU_VID_HINTS = {
+    0x3185,  # ARK Electronics
+    0x26AC,  # 3DR / PX4
+    0x1209,  # pid.codes (generic PX4 boards)
+    0x0483,  # STMicroelectronics
+}
+
+# One line per sample from the Pico: "[<left_u16>/<right_u16>]"
+POSITION_REGEX = re.compile(r"\[(?P<position1>-?\d+)\s*/\s*(?P<position2>-?\d+)\]")
+
+
+class PortCandidate:
+    def __init__(self, info):
+        self.device = info.device
+        self.description = info.description or ""
+        self.hwid = info.hwid or ""
+        self.vid = info.vid
+        self.pid = info.pid
+        self.manufacturer = info.manufacturer or ""
+        self.product = info.product or ""
+        self.serial_number = info.serial_number or ""
+    # def
+
+    def label(self):
+        detail = ("%s %s" % (self.manufacturer, self.product)).strip()
+        if not detail:
+            detail = self.description.strip()
+        if not detail or detail == "n/a":
+            return self.device
+        return "%s  -  %s" % (self.device, detail)
+    # def
+
+    def is_pico_by_id(self):
+        if self.vid is None:
+            return False
+        if (self.vid, self.pid) in PICO_VID_PIDS:
+            return True
+        return self.vid in PICO_VIDS
+    # def
+
+    def is_fcu_by_id(self):
+        return self.vid is not None and self.vid in FCU_VID_HINTS
+    # def
+
+    def is_legacy(self):
+        # Motherboard UARTs: no USB VID and nothing useful in hwid.
+        if self.vid is not None:
+            return False
+        return self.device.startswith("/dev/ttyS") or self.hwid in ("", "n/a")
+    # def
+# class
+
+
+def list_serial_ports(include_legacy=False):
+    candidates = []
+
+    try:
+        infos = serial.tools.list_ports.comports()
+    except Exception as e:
+        print("Failed to enumerate serial ports: %s" % str(e))
+        return candidates
+
+    for info in infos:
+        candidate = PortCandidate(info)
+        if candidate.is_legacy() and not include_legacy:
+            continue
+        candidates.append(candidate)
+
+    # USB devices first, then stable ordering by device name.
+    candidates.sort(key=lambda c: (c.vid is None, c.device))
+    return candidates
+# def
+
+
+def find_candidate(ports, device):
+    if not device:
+        return None
+    for candidate in ports:
+        if candidate.device == device:
+            return candidate
+    return None
+# def
+
+
+def describe_serial_error(device, exc):
+    text = str(exc)
+    lowered = text.lower()
+
+    errno_value = getattr(exc, "errno", None)
+
+    is_permission = (
+        isinstance(exc, PermissionError)
+        or errno_value == errno.EACCES
+        or "permission denied" in lowered
+        or "access is denied" in lowered
+    )
+    is_busy = (
+        errno_value == errno.EBUSY
+        or "resource busy" in lowered
+        or "device or resource busy" in lowered
+        or "in use" in lowered
+    )
+
+    if is_permission:
+        if IS_LINUX:
+            return (
+                "Permission denied opening %s. Add yourself to the dialout group:\n"
+                "    sudo usermod -aG dialout $USER\n"
+                "then log out and back in." % device
+            )
+        return "Permission denied opening %s. Close any program already using it." % device
+
+    if is_busy:
+        if IS_LINUX:
+            return (
+                "%s is busy. Another program (QGroundControl, a second copy of this tool, "
+                "or a serial monitor) may have it open. Note ModemManager also grabs "
+                "/dev/ttyACM* for a few seconds after plug-in, so a retry often works." % device
+            )
+        return "%s is in use by another application." % device
+
+    return "Error opening %s: %s" % (device, text)
+# def
+
+
+def probe_pico(device, timeout=2.0):
+    """Fallback identification: open the port and look for the Pico's line format."""
+    try:
+        with serial.Serial(device, baudrate=SERIAL_BAUD, timeout=0.3) as ser:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                line = ser.readline()
+                if not line:
+                    continue
+                text = line.decode("ascii", errors="ignore").strip()
+                if text and POSITION_REGEX.search(text):
+                    return True
+    except (serial.SerialException, OSError) as e:
+        print(describe_serial_error(device, e))
+
+    return False
+# def
+
+
+def probe_mavlink(device, baud=SERIAL_BAUD, timeout=3.0):
+    """Return (system, component) if a MAVLink heartbeat arrives, else None."""
+    master = None
+    try:
+        master = mavutil.mavlink_connection(device, baud)
+        heartbeat = master.wait_heartbeat(timeout=timeout)
+        if heartbeat is None:
+            return None
+        return (master.target_system, master.target_component)
+
+    except (serial.SerialException, OSError) as e:
+        print(describe_serial_error(device, e))
+        return None
+
+    except Exception as e:
+        print("MAVLink probe of %s failed: %s" % (device, str(e)))
+        return None
+
+    finally:
+        # Must always close, or the real connect afterwards hits "device busy".
+        if master is not None:
+            try:
+                master.close()
+            except Exception:
+                pass
+# def
+
+
+def discover_ports(prefer_pico=None, prefer_drone=None):
+    """Identify the Pico and the flight controller. Slow (probes) - never call on the Tk thread."""
+    ports = list_serial_ports()
+    messages = []
+
+    pico_device = None
+
+    preferred = find_candidate(ports, prefer_pico)
+    if preferred is not None:
+        pico_device = preferred.device
+        messages.append("Pico: reusing remembered port %s" % pico_device)
+
+    if pico_device is None:
+        for candidate in ports:
+            if candidate.is_pico_by_id():
+                pico_device = candidate.device
+                messages.append("Pico: identified %s by USB ID (%04X:%04X)" %
+                                (candidate.device, candidate.vid, candidate.pid or 0))
+                break
+
+    if pico_device is None:
+        for candidate in ports:
+            if probe_pico(candidate.device):
+                pico_device = candidate.device
+                messages.append("Pico: identified %s by data format" % candidate.device)
+                break
+
+    if pico_device is None:
+        messages.append("Pico: not found")
+
+    # Drone: heartbeat is authoritative. Never probe the port already claimed
+    # by the Pico - it wastes the timeout and disturbs the MicroPython REPL.
+    drone_device = None
+    drone_ids = None
+
+    ordered = [c for c in ports if c.device != pico_device]
+    ordered.sort(key=lambda c: (c.device != prefer_drone, not c.is_fcu_by_id(), c.device))
+
+    for candidate in ordered:
+        ids = probe_mavlink(candidate.device)
+        if ids is not None:
+            drone_device = candidate.device
+            drone_ids = ids
+            messages.append("Drone: MAVLink heartbeat on %s (system %d component %d)" %
+                            (candidate.device, ids[0], ids[1]))
+            break
+
+    if drone_device is None:
+        messages.append("Drone: no MAVLink heartbeat found")
+
+    return {
+        "ports": ports,
+        "pico": pico_device,
+        "drone": drone_device,
+        "drone_ids": drone_ids,
+        "messages": messages,
+    }
+# def
+
+
 class DroneInterface:
 
-    def __init__(self, port):
+    def __init__(self, port=None):
         self.port = port
-        self.baud = 115200
+        self.baud = SERIAL_BAUD
         self.timeout = 5.0
+        self.connect_timeout = 5.0
         self.master = None
+        self.last_error = None
+        self.last_error_kind = None   # "open" | "heartbeat" | "no_port" | None
 
         self._mav_lock = threading.Lock()
         self._param_cache = {}
     # def
 
-    def connect(self):
-        print("Connecting to %s at %d baud..." % (self.port, self.baud))
-        self.master = mavutil.mavlink_connection(self.port, self.baud)
+    def is_connected(self):
+        return self.master is not None
+    # def
 
-        print("Waiting for heartbeat from PX4...")
-        self.master.wait_heartbeat()
+    def set_port(self, port):
+        self.port = port
+    # def
+
+    def connect(self, port=None, timeout=None):
+        """Open the link and wait for a heartbeat. Returns True on success.
+
+        Never blocks indefinitely - wait_heartbeat() is bounded so a missing
+        flight controller cannot hang the caller (or the GUI thread).
+        """
+        if port is not None:
+            self.port = port
+
+        if not self.port:
+            self.last_error = "No MAVLink port selected"
+            self.last_error_kind = "no_port"
+            print(self.last_error)
+            return False
+
+        timeout = self.connect_timeout if timeout is None else timeout
+        self.last_error = None
+        self.last_error_kind = None
+
+        print("Connecting to %s at %d baud..." % (self.port, self.baud))
+        try:
+            self.master = mavutil.mavlink_connection(self.port, self.baud)
+        except (serial.SerialException, OSError) as e:
+            self.last_error = describe_serial_error(self.port, e)
+            self.last_error_kind = "open"
+            print(self.last_error)
+            self.master = None
+            return False
+        except Exception as e:
+            self.last_error = "Failed to open MAVLink on %s: %s" % (self.port, str(e))
+            self.last_error_kind = "open"
+            print(self.last_error)
+            self.master = None
+            return False
+
+        print("Waiting for heartbeat from PX4 (up to %.0fs)..." % timeout)
+        heartbeat = self.master.wait_heartbeat(timeout=timeout)
+
+        if heartbeat is None:
+            self.last_error = "No heartbeat on %s after %.0fs" % (self.port, timeout)
+            self.last_error_kind = "heartbeat"
+            print(self.last_error)
+            self.close()
+            return False
+
         print("Heartbeat from system %s component %s" % (
             self.master.target_system,
             self.master.target_component
         ))
+        return True
     # def
 
-    def reconnect(self):
+    def close(self):
         try:
             if self.master is not None:
                 close_fn = getattr(self.master, "close", None)
                 if callable(close_fn):
                     close_fn()
         except Exception as e:
-            print("Previous MAVLink close failed: %s" % str(e))
+            print("MAVLink close failed: %s" % str(e))
 
         self.master = None
-        self._param_cache.clear()
-        self.connect()
+        with self._mav_lock:
+            self._param_cache.clear()
+    # def
+
+    def reconnect(self, port=None, timeout=None):
+        self.close()
+        return self.connect(port, timeout)
     # def
 
     def get_id(self, timeout=5.0):
+        if not self.is_connected():
+            return None
 
         print("Requesting AUTOPILOT_VERSION...")
         self.master.mav.command_long_send(
@@ -171,6 +491,8 @@ class DroneInterface:
     # def
 
     def get_param(self, param_name, py_type=None, timeout=5.0):
+        if not self.is_connected():
+            return None
 
         with self._mav_lock:
             if param_name in self._param_cache:
@@ -206,6 +528,9 @@ class DroneInterface:
     # def
 
     def set_param_value(self, param_name, py_type, value, verify_timeout=5.0, retry_interval=0.2):
+        if not self.is_connected():
+            print("Cannot set %s: not connected" % param_name)
+            return False
 
         if py_type in (int, bool):
             if isinstance(value, bool):
@@ -268,6 +593,8 @@ class DroneInterface:
     # def
 
     def command_elevon(self, output_function, value):
+        if not self.is_connected():
+            return
 
         MAV_CMD_ACTUATOR_TEST = 310
         timeout_s = 60.0
@@ -291,13 +618,10 @@ class DroneInterface:
 # class
 
 
-POSITION_REGEX = re.compile(r"\[(?P<position1>-?\d+)\s*/\s*(?P<position2>-?\d+)\]")
-
-
 class PositionReader:
-    def __init__(self, port):
+    def __init__(self, port=None):
         self.port = port
-        self.baud = 115200
+        self.baud = SERIAL_BAUD
         self.timeout = 1.0
         self.num_samples = 10
 
@@ -305,10 +629,19 @@ class PositionReader:
         self._queue_right = deque()
         self._lock = threading.Lock()
         self._thread = None
+        self._stop = threading.Event()
 
-        self.calibration_file = "settings.json"
+        self.connected = False
+        self.last_error = None
+        self._last_sample_time = 0.0
+
+        self.calibration_file = os.path.join(APP_DIR, "settings.json")
 
         self.drone_name = ""
+
+        # Ports remembered from the previous run; used to pre-select in the UI.
+        self.pico_port = None
+        self.drone_port = None
 
         self.left_offset = -75.68
         self.left_scaler = 0.0042
@@ -335,6 +668,10 @@ class PositionReader:
             left = data.get("LEFT", {})
             right = data.get("RIGHT", {})
             angles = data.get("ANGLES", {})
+            ports = data.get("PORTS", {})
+
+            self.pico_port = ports.get("pico") or None
+            self.drone_port = ports.get("drone") or None
 
             if "scaler" in left:
                 self.left_scaler = float(left["scaler"])
@@ -386,6 +723,10 @@ class PositionReader:
                 "angle_pos_degs": self.angle_pos_degs,
                 "angle_trim_degs": self.angle_trim_degs,
             },
+            "PORTS": {
+                "pico": self.pico_port,
+                "drone": self.drone_port,
+            },
         }
 
         try:
@@ -413,6 +754,21 @@ class PositionReader:
     def set_drone_name(self, drone_name):
         self.drone_name = str(drone_name)
         self.save_calibration()
+    # def
+
+    def set_remembered_ports(self, pico_port=None, drone_port=None):
+        changed = False
+
+        if pico_port is not None and pico_port != self.pico_port:
+            self.pico_port = pico_port
+            changed = True
+
+        if drone_port is not None and drone_port != self.drone_port:
+            self.drone_port = drone_port
+            changed = True
+
+        if changed:
+            self.save_calibration()
     # def
 
     def set_angle_settings(self, angle_neg_degs=None, angle_pos_degs=None, angle_trim_degs=None):
@@ -472,22 +828,21 @@ class PositionReader:
     # def
 
     def _position_reader_loop(self):
-        print("Opening position stream on %s at %d baud..." % (self.port, self.baud))
+        port = self.port
+        print("Opening position stream on %s at %d baud..." % (port, self.baud))
+
         try:
-            with serial.Serial(self.port, baudrate=self.baud, timeout=self.timeout) as ser:
-                while True:
+            with serial.Serial(port, baudrate=self.baud, timeout=self.timeout) as ser:
+                self.connected = True
+                self.last_error = None
+
+                while not self._stop.is_set():
                     line = ser.readline()
                     if not line:
                         continue
 
-                    try:
-                        text = line.decode("ascii", errors="ignore").strip()
-                    except Exception:
-                        print("No decode")
-                        continue
-
+                    text = line.decode("ascii", errors="ignore").strip()
                     if not text:
-                        print("Not text")
                         continue
 
                     m = POSITION_REGEX.search(text)
@@ -495,30 +850,77 @@ class PositionReader:
                         try:
                             p1 = int(m.group("position1"))
                             p2 = int(m.group("position2"))
-
-                            with self._lock:
-                                self._queue_left.append(p1)
-                                self._queue_right.append(p2)
-
-                                if len(self._queue_left) > 500:
-                                    self._queue_left.popleft()
-                                if len(self._queue_right) > 500:
-                                    self._queue_right.popleft()
-
                         except ValueError:
-                            pass
+                            continue
 
-        except serial.SerialException as e:
-            print("Error opening/reading %s: %s" % (self.port, e))
+                        with self._lock:
+                            self._queue_left.append(p1)
+                            self._queue_right.append(p2)
+
+                            if len(self._queue_left) > 500:
+                                self._queue_left.popleft()
+                            if len(self._queue_right) > 500:
+                                self._queue_right.popleft()
+
+                            self._last_sample_time = time.time()
+
+        except (serial.SerialException, OSError) as e:
+            self.last_error = describe_serial_error(port, e)
+            print(self.last_error)
+
+        finally:
+            self.connected = False
+            print("Position stream on %s closed" % port)
     # def
 
     def start(self):
         if self._thread is not None and self._thread.is_alive():
             return
 
+        if not self.port:
+            print("No Pico port selected")
+            return
+
+        self._stop.clear()
         t = threading.Thread(target=self._position_reader_loop, daemon=True)
         self._thread = t
         t.start()
+    # def
+
+    def stop(self, join_timeout=2.0):
+        self._stop.set()
+
+        t = self._thread
+        if t is not None and t.is_alive():
+            # readline() has a 1s timeout, so this returns promptly.
+            t.join(join_timeout)
+
+        self._thread = None
+        self.connected = False
+    # def
+
+    def set_port(self, port):
+        if port == self.port and self._thread is not None and self._thread.is_alive():
+            return
+
+        self.stop()
+        self.port = port
+        self.last_error = None
+        self._last_sample_time = 0.0
+        self.clear_queues()
+
+        if port:
+            self.start()
+    # def
+
+    def is_streaming(self, max_age=1.0):
+        if not self.connected:
+            return False
+
+        with self._lock:
+            last = self._last_sample_time
+
+        return last > 0.0 and (time.time() - last) <= max_age
     # def
 
     def clear_queues(self):
@@ -557,7 +959,17 @@ class FourSliderGUI:
         self.position_reader = position_reader
         self.drone_interface = drone_interface
 
-        self.calibration_log_file = "calibration_log.csv"
+        self.calibration_log_file = os.path.join(APP_DIR, "calibration_log.csv")
+
+        self.DEFAULT_PWM_MIN = 1000
+        self.DEFAULT_PWM_MAX = 2000
+        self.DEFAULT_TRIM = 0.0
+
+        self._closing = False
+
+        # Worker threads never touch widgets directly. They push callables here
+        # and the Tk thread runs them in _drain_gui_queue().
+        self._gui_queue = queue.Queue()
 
         self.LEFT_OUTPUT_FUNCTION = 1201
         self.LEFT_MIN_PARAM = "PWM_MAIN_MIN5"
@@ -590,43 +1002,25 @@ class FourSliderGUI:
         main_frame = tk.Frame(root)
         main_frame.pack(padx=20, pady=20)
 
-        ident = drone_interface.get_id()
-        self.uid_var = tk.StringVar(value="--" if ident is None else str(ident))
+        # Widgets are built from defaults; the real values are fetched by
+        # refresh_params_from_drone() once a link is up. Nothing here may block
+        # on MAVLink - the window must appear even with no hardware attached.
+        self.uid_var = tk.StringVar(value="--")
 
-        left_min_param = drone_interface.get_param(self.LEFT_MIN_PARAM, int)
-        left_max_param = drone_interface.get_param(self.LEFT_MAX_PARAM, int)
-        left_trim_param = drone_interface.get_param(self.LEFT_TRIM_PARAM, float)
-        right_min_param = drone_interface.get_param(self.RIGHT_MIN_PARAM, int)
-        right_max_param = drone_interface.get_param(self.RIGHT_MAX_PARAM, int)
-        right_trim_param = drone_interface.get_param(self.RIGHT_TRIM_PARAM, float)
-        main_rev_param = drone_interface.get_param("PWM_MAIN_REV", int)
+        left_min_param = self.DEFAULT_PWM_MIN
+        left_max_param = self.DEFAULT_PWM_MAX
+        left_trim_param = self.DEFAULT_TRIM
+        right_min_param = self.DEFAULT_PWM_MIN
+        right_max_param = self.DEFAULT_PWM_MAX
+        right_trim_param = self.DEFAULT_TRIM
 
-        if left_min_param is None:
-            left_min_param = 1000
-        if left_max_param is None:
-            left_max_param = 2000
-        if left_trim_param is None:
-            left_trim_param = 0.0
-
-        if right_min_param is None:
-            right_min_param = 1000
-        if right_max_param is None:
-            right_max_param = 2000
-        if right_trim_param is None:
-            right_trim_param = 0.0
-
-        if main_rev_param is None:
-            main_rev_param = 0
-        self.main_rev = int(main_rev_param)
-
-        print("PX4 UID = %s" % str(ident))
-        print("PWM_MAIN_REV = %d (0x%X)" % (self.main_rev, self.main_rev))
-        print("MAIN5 reversed = %s" % str(((self.main_rev >> 4) & 1) != 0))
-        print("MAIN6 reversed = %s" % str(((self.main_rev >> 5) & 1) != 0))
+        self.main_rev = 0
 
         # Angle configuration panel
         angle_group = tk.LabelFrame(main_frame, text="Settings and Control", padx=10, pady=10)
         angle_group.pack(side=tk.LEFT, padx=10, anchor="n", fill=tk.Y)
+
+        self.build_connection_panel(angle_group)
 
         name_row = tk.Frame(angle_group, bd=1, relief="groove", padx=4, pady=4)
         name_row.pack(anchor="w", pady=3, fill=tk.X)
@@ -654,14 +1048,6 @@ class FourSliderGUI:
         self.create_angle_entry(angle_group, "Neg deg", self.angle_neg_var, self.apply_angle_neg)
         self.create_angle_entry(angle_group, "Pos deg", self.angle_pos_var, self.apply_angle_pos)
         self.create_angle_entry(angle_group, "Trim deg", self.angle_trim_var, self.apply_angle_trim)
-
-        connect_btn = tk.Button(
-            angle_group,
-            text="Connect",
-            width=18,
-            command=self.connect_mavlink
-        )
-        connect_btn.pack(pady=(8, 2), anchor="w")
 
         zero_angles_btn = tk.Button(
             angle_group,
@@ -867,6 +1253,7 @@ class FourSliderGUI:
         log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text.config(yscrollcommand=log_scroll.set)
 
+        self._drain_gui_queue()
         self.update_labels()
         self.update_actuators()
         self.update_expected_pwm()
@@ -927,7 +1314,7 @@ class FourSliderGUI:
 
             safe_name = self.make_safe_filename(drone_name)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            csv_filename = "%s_%s.csv" % (safe_name, timestamp)
+            csv_filename = os.path.join(APP_DIR, "%s_%s.csv" % (safe_name, timestamp))
 
             print("Starting sweep to CSV: %s" % csv_filename)
 
@@ -1016,17 +1403,266 @@ class FourSliderGUI:
         return entry
     # def
 
-    def connect_mavlink(self):
+    def build_connection_panel(self, parent):
+        group = tk.LabelFrame(parent, text="Connection", padx=6, pady=6)
+        group.pack(anchor="w", pady=(0, 8), fill=tk.X)
+
+        self.drone_port_var = tk.StringVar(value="")
+        self.pico_port_var = tk.StringVar(value="")
+        self._port_by_label = {}
+
+        drone_row = tk.Frame(group)
+        drone_row.pack(anchor="w", pady=2, fill=tk.X)
+        tk.Label(drone_row, text="Drone", width=6, anchor="w").pack(side=tk.LEFT)
+        self.drone_combo = ttk.Combobox(drone_row, textvariable=self.drone_port_var, width=30)
+        self.drone_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.drone_status_label = tk.Label(group, text="Drone: not connected", anchor="w", fg="black")
+        self.drone_status_label.pack(anchor="w", padx=(46, 0))
+
+        pico_row = tk.Frame(group)
+        pico_row.pack(anchor="w", pady=(6, 2), fill=tk.X)
+        tk.Label(pico_row, text="Pico", width=6, anchor="w").pack(side=tk.LEFT)
+        self.pico_combo = ttk.Combobox(pico_row, textvariable=self.pico_port_var, width=30)
+        self.pico_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.pico_status_label = tk.Label(group, text="Pico: not connected", anchor="w", fg="black")
+        self.pico_status_label.pack(anchor="w", padx=(46, 0))
+
+        button_row = tk.Frame(group)
+        button_row.pack(anchor="w", pady=(8, 0), fill=tk.X)
+
+        self.refresh_btn = tk.Button(
+            button_row,
+            text="Refresh ports",
+            width=13,
+            command=self.refresh_port_list
+        )
+        self.refresh_btn.pack(side=tk.LEFT)
+
+        self.connect_btn = tk.Button(
+            button_row,
+            text="Connect",
+            width=13,
+            command=self.connect_mavlink
+        )
+        self.connect_btn.pack(side=tk.LEFT, padx=(6, 0))
+    # def
+
+    def device_from_label(self, label):
+        """Map a combobox entry back to a device path, allowing hand-typed values."""
+        label = (label or "").strip()
+        if not label:
+            return None
+        if label in self._port_by_label:
+            return self._port_by_label[label]
+        # Typed in by hand, e.g. "/dev/ttyUSB0" or "COM7".
+        return label.split(" ")[0]
+    # def
+
+    def set_conn_status(self, which, text, ok=None):
+        label = self.drone_status_label if which == "drone" else self.pico_status_label
+        colour = "black" if ok is None else ("dark green" if ok else "red")
+        label.config(text=text, fg=colour)
+    # def
+
+    def set_connection_controls_enabled(self, enabled):
+        state = "normal" if enabled else "disabled"
+        self.refresh_btn.config(state=state)
+        self.connect_btn.config(state=state, text="Connect" if enabled else "Working...")
+    # def
+
+    def populate_port_combos(self, ports, drone_device=None, pico_device=None):
+        """Tk thread only."""
+        labels = [c.label() for c in ports]
+        self._port_by_label = dict(zip(labels, [c.device for c in ports]))
+
+        self.drone_combo.config(values=labels)
+        self.pico_combo.config(values=labels)
+
+        for device, var in ((drone_device, self.drone_port_var), (pico_device, self.pico_port_var)):
+            if device is None:
+                continue
+            for label, dev in self._port_by_label.items():
+                if dev == device:
+                    var.set(label)
+                    break
+            else:
+                var.set(device)
+    # def
+
+    def refresh_port_list(self):
+        self.set_connection_controls_enabled(False)
+        threading.Thread(target=self._discover_worker, args=(False,), daemon=True).start()
+    # def
+
+    def autodetect_and_connect(self):
+        self.set_connection_controls_enabled(False)
+        threading.Thread(target=self._discover_worker, args=(True,), daemon=True).start()
+    # def
+
+    def _discover_worker(self, auto_connect):
+        """Worker thread: enumerate and probe, then hand the result back to Tk."""
         try:
-            print("Reconnecting MAVLink...")
-            self.drone_interface.reconnect()
+            print("Scanning serial ports...")
+            result = discover_ports(
+                prefer_pico=self.position_reader.pico_port,
+                prefer_drone=self.position_reader.drone_port,
+            )
+            for message in result["messages"]:
+                print(message)
 
+        except Exception as e:
+            print("Port scan failed: %s" % str(e))
+            result = {"ports": [], "pico": None, "drone": None, "drone_ids": None}
+
+        self.post_to_gui(lambda: self._apply_discovery_result(result, auto_connect))
+    # def
+
+    def _apply_discovery_result(self, result, auto_connect):
+        """Tk thread."""
+        if self._closing:
+            return
+
+        self.populate_port_combos(result["ports"], result["drone"], result["pico"])
+
+        if result["pico"] is None:
+            self.set_conn_status("pico", "Pico: not found", False)
+        if result["drone"] is None:
+            self.set_conn_status("drone", "Drone: no heartbeat found", False)
+
+        if auto_connect and (result["pico"] or result["drone"]):
+            self.connect_mavlink()
+        else:
+            self.set_connection_controls_enabled(True)
+    # def
+
+    def connect_mavlink(self):
+        drone_device = self.device_from_label(self.drone_port_var.get())
+        pico_device = self.device_from_label(self.pico_port_var.get())
+
+        self.set_connection_controls_enabled(False)
+
+        if drone_device:
+            self.set_conn_status("drone", "Drone: connecting...", None)
+        if pico_device:
+            self.set_conn_status("pico", "Pico: opening...", None)
+
+        threading.Thread(
+            target=self._connect_worker,
+            args=(drone_device, pico_device),
+            daemon=True
+        ).start()
+    # def
+
+    def _connect_worker(self, drone_device, pico_device):
+        """Worker thread: open both links, then report status back to Tk."""
+        drone_text = "Drone: no port selected"
+        drone_ok = False
+
+        try:
+            if drone_device:
+                print("Connecting MAVLink on %s..." % drone_device)
+                if self.drone_interface.reconnect(drone_device):
+                    drone_ok = True
+                    self.refresh_params_from_drone(clear_name=True)
+                    drone_text = "Drone: connected (system %s)" % self.drone_interface.master.target_system
+                    self.position_reader.set_remembered_ports(drone_port=drone_device)
+                elif self.drone_interface.last_error_kind == "open":
+                    drone_text = "Drone: cannot open %s" % drone_device
+                else:
+                    drone_text = "Drone: no heartbeat on %s" % drone_device
+
+        except Exception as e:
+            drone_text = "Drone: connect failed"
+            print("MAVLink connect failed: %s" % str(e))
+
+        pico_text = "Pico: no port selected"
+        pico_ok = False
+
+        try:
+            if pico_device:
+                print("Opening Pico on %s..." % pico_device)
+                self.position_reader.set_port(pico_device)
+
+                # Give the reader a moment to produce its first sample.
+                deadline = time.time() + 2.0
+                while time.time() < deadline and not self.position_reader.is_streaming():
+                    time.sleep(0.1)
+
+                if self.position_reader.is_streaming():
+                    pico_ok = True
+                    pico_text = "Pico: streaming on %s" % pico_device
+                    self.position_reader.set_remembered_ports(pico_port=pico_device)
+                elif self.position_reader.last_error is not None:
+                    pico_text = "Pico: cannot open %s" % pico_device
+                else:
+                    pico_text = "Pico: no data on %s" % pico_device
+
+        except Exception as e:
+            pico_text = "Pico: open failed"
+            print("Pico open failed: %s" % str(e))
+
+        def finish():
+            if self._closing:
+                return
+            self.set_conn_status("drone", drone_text, drone_ok)
+            self.set_conn_status("pico", pico_text, pico_ok)
+            self.set_connection_controls_enabled(True)
+
+        self.post_to_gui(finish)
+    # def
+
+    def post_to_gui(self, fn):
+        """Queue a callable to run on the Tk thread. Safe from any thread.
+
+        Deliberately not root.after() - that registers a Tcl command and is not
+        safe to call from a worker thread.
+        """
+        self._gui_queue.put(fn)
+    # def
+
+    def _drain_gui_queue(self):
+        if self._closing:
+            return
+
+        while True:
+            try:
+                fn = self._gui_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            try:
+                fn()
+            except Exception as e:
+                print("GUI update failed: %s" % str(e))
+
+        self.root.after(50, self._drain_gui_queue)
+    # def
+
+    def set_var_on_gui_thread(self, text_var, value):
+        self.post_to_gui(lambda: text_var.set(value))
+    # def
+
+    def refresh_params_from_drone(self, clear_name=False):
+        """Read UID and the six elevon params from the FCU and populate the UI.
+
+        Safe to call from a worker thread: every widget write is marshalled
+        onto the Tk thread. Returns False if there is no link.
+        """
+        if not self.drone_interface.is_connected():
+            print("Not connected - keeping current parameter values")
+            return False
+
+        try:
             ident = self.drone_interface.get_id()
-            self.uid_var.set("--" if ident is None else str(ident))
+            self.set_var_on_gui_thread(self.uid_var, "--" if ident is None else str(ident))
+            print("PX4 UID = %s" % str(ident))
 
-            self.drone_name_var.set("")
-            self.position_reader.drone_name = ""
-            print("Drone name cleared after connect")
+            if clear_name:
+                self.set_var_on_gui_thread(self.drone_name_var, "")
+                self.position_reader.drone_name = ""
+                print("Drone name cleared after connect")
 
             left_min_param = self.drone_interface.get_param(self.LEFT_MIN_PARAM, int)
             left_max_param = self.drone_interface.get_param(self.LEFT_MAX_PARAM, int)
@@ -1037,29 +1673,30 @@ class FourSliderGUI:
             main_rev_param = self.drone_interface.get_param("PWM_MAIN_REV", int)
 
             if left_min_param is not None:
-                self.left_min_var.set(str(int(left_min_param)))
+                self.set_var_on_gui_thread(self.left_min_var, str(int(left_min_param)))
             if left_max_param is not None:
-                self.left_max_var.set(str(int(left_max_param)))
+                self.set_var_on_gui_thread(self.left_max_var, str(int(left_max_param)))
             if left_trim_param is not None:
-                self.left_trim_var.set("%.3f" % float(left_trim_param))
+                self.set_var_on_gui_thread(self.left_trim_var, "%.3f" % float(left_trim_param))
 
             if right_min_param is not None:
-                self.right_min_var.set(str(int(right_min_param)))
+                self.set_var_on_gui_thread(self.right_min_var, str(int(right_min_param)))
             if right_max_param is not None:
-                self.right_max_var.set(str(int(right_max_param)))
+                self.set_var_on_gui_thread(self.right_max_var, str(int(right_max_param)))
             if right_trim_param is not None:
-                self.right_trim_var.set("%.3f" % float(right_trim_param))
+                self.set_var_on_gui_thread(self.right_trim_var, "%.3f" % float(right_trim_param))
 
             if main_rev_param is not None:
                 self.main_rev = int(main_rev_param)
 
-            print("Reconnect complete")
             print("PWM_MAIN_REV = %d (0x%X)" % (self.main_rev, self.main_rev))
             print("MAIN5 reversed = %s" % str(((self.main_rev >> 4) & 1) != 0))
             print("MAIN6 reversed = %s" % str(((self.main_rev >> 5) & 1) != 0))
+            return True
 
         except Exception as e:
-            print("Reconnect failed: %s" % str(e))
+            print("Parameter refresh failed: %s" % str(e))
+            return False
     # def
 
     def zero_both_angles(self):
@@ -1817,6 +2454,9 @@ class FourSliderGUI:
     # def
 
     def update_labels(self):
+        if self._closing:
+            return
+
         left_val = self.get_left_value()
         right_val = self.get_right_value()
 
@@ -1834,6 +2474,9 @@ class FourSliderGUI:
     # def
 
     def update_expected_pwm(self):
+        if self._closing:
+            return
+
         try:
             left_min = self.get_int_var(self.left_min_var, 1000)
             left_max = self.get_int_var(self.left_max_var, 2000)
@@ -1862,6 +2505,9 @@ class FourSliderGUI:
     # def
 
     def update_actuators(self):
+        if self._closing:
+            return
+
         try:
             if not self.left_cal_active and not self.sweep_active:
                 left_cmd = float(self.left_pos.get())
@@ -1878,23 +2524,60 @@ class FourSliderGUI:
     # def
 
     def update_log_window(self):
+        if self._closing:
+            return
+
         lines = INSTRUMENTATION_LOG.drain()
         if lines:
             self.log_text.insert(tk.END, "".join(lines))
             self.log_text.see(tk.END)
         self.root.after(100, self.update_log_window)
     # def
+
+    def on_close(self):
+        """Window close: stop workers, centre the elevons, release both ports."""
+        if self._closing:
+            return
+        self._closing = True
+
+        print("Shutting down...")
+
+        self.left_cal_active = False
+        self.right_cal_active = False
+        self.sweep_active = False
+
+        for thread in (self.left_cal_thread, self.right_cal_thread, self.sweep_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(2.0)
+
+        try:
+            if self.drone_interface.is_connected():
+                self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, 0.0)
+                self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, 0.0)
+        except Exception as e:
+            print("Failed to centre elevons on exit: %s" % str(e))
+
+        self.position_reader.stop()
+        self.drone_interface.close()
+
+        self.root.destroy()
+    # def
 # class
 
 
 if __name__ == "__main__":
-    drone_interface = DroneInterface("COM20")  # COM4 on FS PC
-    drone_interface.connect()
-
-    position_reader = PositionReader("COM5")  # COM9 on FS PC
-    position_reader.start()
-
     root = tk.Tk()
+
+    position_reader = PositionReader()   # port chosen by auto-detect / the UI
+    drone_interface = DroneInterface()
+
     app = FourSliderGUI(root, position_reader, drone_interface)
+
+    root.protocol("WM_DELETE_WINDOW", app.on_close)
+
+    # Detection probes serial ports and can take a second or two, so it runs on
+    # a worker thread after the window is up rather than blocking startup.
+    root.after(200, app.autodetect_and_connect)
+
     root.mainloop()
 # if
