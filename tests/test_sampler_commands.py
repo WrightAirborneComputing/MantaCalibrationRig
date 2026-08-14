@@ -79,8 +79,8 @@ def test_only_g_requests_an_action(state, text):
 def test_fast_preset(state):
     new_state, reply, action = sampler.apply_command(state, "F")
 
-    assert reply == "# ACK F 500"
-    assert new_state == {"mode": "fast", "hz": 500, "ts": True}
+    assert reply == "# ACK F %d" % sampler.FAST_HZ
+    assert new_state == {"mode": "fast", "hz": sampler.FAST_HZ, "ts": True}
 # def
 
 
@@ -121,7 +121,7 @@ def test_lowercase_and_line_endings_are_accepted(state, text):
     """Terminals send CR, CRLF or LF depending on the tool; all must work."""
     new_state, reply, action = sampler.apply_command(state, text)
 
-    assert reply == "# ACK F 500"
+    assert reply == "# ACK F %d" % sampler.FAST_HZ
     assert new_state["mode"] == "fast"
 # def
 
@@ -167,7 +167,7 @@ def test_every_reply_is_comment_prefixed(state):
 # def
 
 
-@pytest.mark.parametrize("hz,period_us", [(10, 100000), (500, 2000), (1000, 1000)])
+@pytest.mark.parametrize("hz,period_us", [(10, 100000), (500, 2000), (1000, 1000), (1500, 666)])
 def test_period_matches_rate(hz, period_us):
     assert sampler.derive_timing(hz)[0] == period_us
 # def
@@ -175,7 +175,7 @@ def test_period_matches_rate(hz, period_us):
 
 def test_command_polling_stays_responsive_across_the_range():
     """Switch latency = cmd_interval * period. Must stay well under a second."""
-    for hz in (sampler.MIN_HZ, 10, 100, 500, 1000, sampler.MAX_HZ):
+    for hz in (sampler.MIN_HZ, 10, 100, 500, 1000, 1500, sampler.MAX_HZ):
         period_us, cmd_interval, blink_reload = sampler.derive_timing(hz)
 
         assert cmd_interval >= 1

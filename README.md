@@ -18,7 +18,7 @@ ports are detected automatically — see [Port detection](#port-detection).
 | `manta_common.py` | Shared constants and helpers (wire format, USB IDs, port discovery, angle maths). No tkinter or pymavlink, so it imports on a headless box. |
 | `pico_monitor.py` | CLI diagnostic: streams the Pico's raw pot data with the conversion shown at every stage. |
 | `range_test.py` | The range & rate test from the console. Also the analysis the GUI tab imports. |
-| `pico/sampler.py` | MicroPython firmware, dual-rate (10 Hz / 500 Hz). Copy to the Pico as `main.py`. |
+| `pico/sampler.py` | MicroPython firmware, dual-rate (10 Hz / 1000 Hz). Copy to the Pico as `main.py`. |
 | `pico/main.py` | The legacy 10 Hz-only firmware, kept as a fallback. |
 | `settings.json` | Persisted pot scalers/offsets, target angles, and last-used ports. |
 | `calibration_log.csv` | Append-only record of every logged calibration. Tracked on purpose, so it stays at the top level rather than in `reports/`. |
@@ -77,16 +77,41 @@ calibration. This is the original UI.
 
 ### Range & rate tab
 
-Drives each elevon hard over from −1 to +1 and back while capturing at 500 Hz,
-and reports how far it moved and how fast. Pick the phases — one side at a time,
-then both together, so coupling through shared power or linkage shows up as a
-difference — set the cycle count, and press **Run test**. It asks before moving
-anything.
+Drives the elevons hard over from −1 to +1 and back while capturing at 1000 Hz,
+and reports how far they moved and how fast. The default is both together over 30
+cycles. Running one side at a time was how this started — the point was to expose
+coupling through shared power or linkage — and it measured the same travel and
+rate either way, so the single-side phases are still there for isolating one
+servo but are no longer part of a routine run. Set the phases and the cycle
+count, then press **Run test**. It asks before moving anything.
 
 The headline is the 10–90% transit time, with rate derived from it. Endpoints are
 where a servo is slowest and least repeatable, so 10–90% is both the standard
 measure and the stable one. Results are reported as mean ± sample standard
-deviation across the cycles, and **Save CSV** writes the summary to `reports/`.
+deviation across the cycles.
+
+Alongside range, the table and both CSVs carry the **max and min settled angle**,
+each with its own standard deviation. Range is their difference and conceals
+them: a surface whose whole travel has shifted a few degrees reports an unchanged
+range while both endpoints have moved, and an endpoint that wanders between
+cycles shows up in its sd even when travel does not. The endpoints are clustered
+by direction and then ordered by value, not by direction name, because which way
+round they fall depends on the side's sign convention.
+
+Two export buttons sit side by side. **Save CSV** writes the summary — one row
+per phase/side/direction, mean ± sd. **Save samples** writes every captured
+sample, one row per reading, in the same schema as `range_test.py --samples-csv`
+so the same plotting scripts read both. Both files carry the run's timestamp
+rather than the moment you pressed the button, so they pair up on disk.
+
+Reach for the samples dump when the summary raises a question the aggregate
+cannot settle. The worked example: a run whose travel sd is four times the usual
+is either drifting steadily across the run or throwing a few bad cycles, and the
+mean ± sd is identical either way — but settled position plotted against cycle
+number separates them immediately. Samples are retained for every run, so the
+button can be pressed after the fact; a run past `MAX_EXPORT_SAMPLES` keeps the
+first rows and says so in the note line rather than quietly holding a partial
+record.
 
 Watch the trace, not just the table: a servo at its mechanical limit shows a
 rounded start as it accelerates and a settling approach at the end, while a
@@ -149,15 +174,15 @@ blinks a few times a second as a heartbeat.
 | Mode | Rate | Line format | For |
 |---|---|---|---|
 | slow (boot default) | 10 Hz | `[<left_u16>/<right_u16>]` | Reading on a console. Byte-identical to the legacy firmware. |
-| fast | 500 Hz | `[<ticks_us>:<left_u16>/<right_u16>]` | Resolving elevon travel and slew rate. |
+| fast | 1000 Hz | `[<ticks_us>:<left_u16>/<right_u16>]` | Resolving elevon travel and slew rate. |
 
 It boots slow, so plugging the board into any terminal gives readable output and
 the GUI keeps working unchanged. Fast mode exists because a 10 Hz stream covers a
-150–400 ms elevon transit in about two samples; 500 Hz covers it in a hundred.
+~100 ms elevon transit in one sample; 1000 Hz covers it in about a hundred.
 
 The microsecond stamp is taken next to the ADC read, so timing does not depend on
 when USB happened to deliver the line — USB CDC arrives in bursts on a 1 ms frame
-boundary. It also lets the host prove the board is *sampling* at 500 Hz rather
+boundary. It also lets the host prove the board is *sampling* at 1000 Hz rather
 than merely that lines are turning up. The counter wraps every ~17.9 minutes and
 the host unwraps it.
 
@@ -172,22 +197,37 @@ the per-line cost of formatting and printing. Measured on the rig's RP2040:
 | plus `print()` to USB CDC | 510 µs |
 | whole loop, incl. scheduling | **~660 µs** |
 
-Measured sustained rates: 500 Hz → 499.5, 1000 Hz → 998, 1500 Hz → 1517, and
-2000 Hz → 1508, i.e. it saturates around **1500 Hz**. At 500 Hz the loop uses a
-third of its 2000 µs budget, leaving ~3× headroom — which is why that is the fast
-preset rather than something closer to the edge.
+Measured sustained rates on the rig (20 s each, board's own `ticks_us`):
+
+| Requested | Sustained |
+|---|---|
+| 500 Hz | 499.5 Hz |
+| 750 Hz | 749.1 Hz |
+| 1000 Hz | 998.0 Hz |
+| 1250 Hz | 1228.5 Hz |
+| 1500 Hz | 1519.8 Hz — already free-running, no sleep margin left |
+| 1750 Hz | 1524.4 Hz — saturated |
+| 2000 Hz | 1512.9 Hz — saturated |
+
+So the board free-runs at about **1520 Hz** and cannot go faster. Nothing was ever
+lost in transport at any of these rates — every gap was the collector — so the
+ceiling is the loop cost, not the link.
+
+1000 Hz is the fast preset: two thirds of the ceiling, so a slow iteration still
+has somewhere to go. It was 500 Hz, which was needlessly conservative.
 
 ### The one wrinkle: collector stalls
 
 MicroPython's garbage collector stops the sample loop for ~7 ms whenever it runs,
-which at 500 Hz is every ~4.3 s and costs three consecutive samples (0.12% of the
-stream). It is not tunable away — a collect costs ~4.5 ms even on an empty heap,
+which at 1000 Hz is every ~2.5 s and costs seven consecutive samples (0.28% of
+the stream). It is not tunable away — a collect costs ~4.5 ms even on an empty heap,
 because the cost tracks heap size rather than garbage, so collecting *more* often
 only stalls more.
 
 What you can do is choose *when* it happens. Send `G` immediately before a
-capture and the stall is paid up front, buying a clean window of ~4.3 s —
-comfortably longer than an elevon transit. `pico_monitor.py` does this
+capture and the stall is paid up front, buying a clean window of ~2.5 s — a
+little longer than the ~2.4 s leg the range/rate test captures, so the margin is
+thin and an occasional gap late in a leg is expected rather than alarming. `pico_monitor.py` does this
 automatically after any mode switch.
 
 Because every sample is timestamped, a stall is always visible in the data rather
@@ -203,14 +243,14 @@ terminal:
 | Command | Effect |
 |---|---|
 | `S` | slow: 10 Hz, no timestamp |
-| `F` | fast: 500 Hz, timestamped |
-| `F<hz>` | fast at a given rate, e.g. `F1000` (clamped 1–2000) |
+| `F` | fast: 1000 Hz, timestamped |
+| `F<hz>` | fast at a given rate, e.g. `F1500` (clamped 1–2000) |
 | `G` | collect garbage now — see below |
 | `?` | report current mode |
 
-Replies are prefixed `#` (`# ACK F 500`), which cannot match the sample regex, so
+Replies are prefixed `#` (`# ACK F 1000`), which cannot match the sample regex, so
 they are ignored by every parser. Ctrl-C still drops to the REPL, which is the
-escape hatch when the board is streaming at 500 Hz.
+escape hatch when the board is streaming at 1000 Hz.
 
 `pico_monitor.py` drives all of this:
 

@@ -51,16 +51,16 @@ def rig():
 
 
 def test_history_depth_follows_the_rate():
-    """The 10 Hz case must not change; 500 Hz must outlast the averaging window."""
+    """The 10 Hz case must not change; 1000 Hz must outlast the averaging window."""
     assert MT.position_history_for(MT.SLOW_RATE_HZ) == 200
 
     fast = MT.position_history_for(MT.FAST_RATE_HZ)
-    assert fast == 2000
+    assert fast == 4000
     assert fast > MT.POSITION_WINDOW_S * MT.FAST_RATE_HZ
 # def
 
 
-@pytest.mark.parametrize("hz", [10, 100, 500, 1000, 2000])
+@pytest.mark.parametrize("hz", [10, 100, 500, 1000, 1500, 2000])
 def test_history_always_outlasts_the_averaging_window(hz):
     """The invariant that a fixed 200-sample backlog quietly broke at 500 Hz."""
     assert MT.position_history_for(hz) > MT.POSITION_WINDOW_S * hz
@@ -134,8 +134,9 @@ def test_capture_collects_raw_timestamped_samples(rig):
     assert not truncated
     assert not reader.is_capturing()
 
-    # 0.6 s at 500 Hz. Generous bounds - this is a real timed capture.
-    assert 150 < len(samples) < 450
+    # 0.6 s at the fast rate. Generous bounds - this is a real timed capture.
+    expected = 0.6 * MT.FAST_RATE_HZ
+    assert 0.5 * expected < len(samples) < 1.5 * expected
 
     host_t, pico_us, raw_l, raw_r = samples[0]
     assert pico_us is not None
@@ -193,7 +194,7 @@ def test_capture_is_cleared_when_the_port_changes(rig):
 # def
 
 
-def test_averaging_still_works_at_500hz(rig):
+def test_averaging_still_works_at_the_fast_rate(rig):
     """The regression the backlog resize prevents: the window outrunning history."""
     reader, _ = rig
     reader.set_sample_rate(MT.FAST_RATE_HZ)
@@ -243,7 +244,7 @@ def test_send_command_returns_none_without_a_port():
     reader = MT.PositionReader()
 
     assert reader.send_command("F") is None
-    assert reader.set_sample_rate(500) is None
+    assert reader.set_sample_rate(MT.FAST_RATE_HZ) is None
 # def
 
 

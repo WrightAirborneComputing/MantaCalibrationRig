@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Measure elevon travel range and slew rate from the console.
 
-Drives each elevon hard over from -1 to +1 and back while capturing position at
-500 Hz, then reports how far it moved and how fast. Runs each side on its own
-first, then both together, so cross-coupling (shared power, shared linkage) shows
-up as a difference between the two.
+Drives the elevons hard over from -1 to +1 and back while capturing position at
+1000 Hz, then reports how far they moved and how fast, averaged over 30 cycles.
+
+By default both servos are driven together. Running them one at a time was how
+this tool started - the point was to expose cross-coupling through shared power
+or shared linkage - and it measured the same travel and rate either way. LEFT and
+RIGHT therefore remain available through --phases for isolating a single servo,
+but the default no longer spends three times the wall clock proving a null.
 
     python3 range_test.py --dry-run     # full pipeline, no actuator commands
     python3 range_test.py               # the real thing - surfaces will move
 
 Method, and why it is built this way:
 
-  * Position comes from the Pico's raw 500 Hz stream, not from the GUI's
+  * Position comes from the Pico's raw 1000 Hz stream, not from the GUI's
     get_average_position_nonblocking(). That getter averages over a trailing
     0.5 s window, which carries ~250 ms of group delay - the same order as the
     transit being measured. It would swamp the answer.
@@ -21,7 +25,10 @@ Method, and why it is built this way:
 
   * Each leg is preceded by a "G" (collect garbage) so MicroPython's ~7 ms
     collector stall is paid before the capture rather than landing mid-transit.
-    That buys a clean window of ~4.3 s; a leg is ~2.3 s.
+    At 1000 Hz that buys a clean window of ~2.5 s against a ~2.4 s leg, so the
+    margin is thin: an occasional GC-shaped gap late in a leg is expected. It
+    costs ~7 consecutive samples, which is 7 ms of a ~100 ms transit, and the
+    10-90% fit is taken across hundreds of samples either side of it.
 
   * The headline number is the 10-90% transit time. Endpoints are where a servo
     is slowest and least repeatable (approach, backlash, current limit), so
@@ -46,6 +53,9 @@ import serial
 
 from manta_common import (
     APP_DIR,
+    DEFAULT_CYCLES,
+    DEFAULT_PHASES,
+    FAST_RATE_HZ,
     PICO_TICKS_MODULO,
     POSITION_REGEX,
     REPLY_PREFIX,
@@ -73,7 +83,9 @@ OUTPUT_FUNCTION = {
     "RIGHT": RIGHT_OUTPUT_FUNCTION,
 }
 
-# One at a time, then all - so a difference under load is attributable.
+# One at a time, then all - so a difference under load would be attributable.
+# Measured: there is none. DEFAULT_PHASES is BOTH alone; these other two stay
+# selectable for isolating a single servo.
 PHASES = ("LEFT", "RIGHT", "BOTH")
 
 PHASE_SIDES = {
@@ -236,6 +248,45 @@ def analyse_leg(series):
 # def
 
 
+def endpoint_stats(legs):
+    """((max mean, sd), (min mean, sd)) of the settled angles a side reaches.
+
+    A hard-over ends at one of two places, so the settled angles form two
+    clusters and which one is the maximum depends on the side's sign convention
+    rather than on the direction name. They are therefore split by direction and
+    then ordered by value, not by label.
+
+    Reported alongside range because range is their difference and conceals
+    them: a surface whose whole travel has shifted a few degrees reports an
+    unchanged range, while its endpoints have both moved. The sd is per
+    endpoint, so an endpoint that wanders shows up here even when travel does
+    not - which is exactly the failure that a mean-of-travel cannot express.
+    """
+    by_direction = {}
+
+    for leg in legs:
+        by_direction.setdefault(leg["direction"], []).append(leg["final_deg"])
+
+    clusters = [mean_sd(v) for v in by_direction.values() if v]
+
+    if not clusters:
+        return ((None, None), (None, None))
+
+    if len(clusters) == 1:
+        # Only one direction ran, so the surface has one known endpoint.
+        return (clusters[0], (None, None))
+
+    clusters.sort(key=lambda pair: pair[0])
+    return (clusters[-1], clusters[0])
+# def
+
+
+def num(value, fmt_spec):
+    """A number for the CSV, or an empty cell when it is undefined."""
+    return "" if value is None else fmt_spec % value
+# def
+
+
 def mean_sd(values):
     """(mean, sample stdev) - stdev is None when a single value makes it undefined."""
     if not values:
@@ -358,9 +409,13 @@ class RangeRateTest:
                 ends = [r["final_deg"] for r in ok]
                 span = max(ends) - min(ends)
 
+                angle_max, angle_min = endpoint_stats(ok)
+
                 print("\n%s phase, %s elevon" % (phase, side))
                 print("  range           %.2f deg   (%.2f to %.2f)"
                       % (span, min(ends), max(ends)))
+                print("  endpoints   max %s   min %s"
+                      % (fmt(*angle_max, unit="deg"), fmt(*angle_min, unit="deg")))
 
                 for direction in ("neg_to_pos", "pos_to_neg"):
                     legs = [r for r in ok if r["direction"] == direction]
@@ -382,6 +437,8 @@ class RangeRateTest:
                     rows.append([
                         phase, side, direction, len(legs),
                         "%.3f" % span,
+                        num(angle_max[0], "%.3f"), num(angle_max[1], "%.3f"),
+                        num(angle_min[0], "%.3f"), num(angle_min[1], "%.3f"),
                         "%.3f" % travel[0],
                         "" if travel[1] is None else "%.3f" % travel[1],
                         "%.2f" % transit[0],
@@ -413,16 +470,20 @@ def main():
     ap.add_argument("--drone-port", help="flight controller device (default: auto-detect)")
     ap.add_argument("--settings", default=SETTINGS_PATH)
     ap.add_argument("--name", default="", help="label for the output files")
-    ap.add_argument("--cycles", type=int, default=3,
-                    help="hard-over cycles per phase (default: 3)")
+    ap.add_argument("--cycles", type=int, default=DEFAULT_CYCLES,
+                    help="hard-over cycles per phase (default: %d)" % DEFAULT_CYCLES)
     ap.add_argument("--settle", type=float, default=2.0,
                     help="seconds allowed for a hard-over to complete (default: 2.0)")
-    ap.add_argument("--rate", type=int, default=500,
-                    help="Pico sample rate in Hz (default: 500)")
-    ap.add_argument("--phases", nargs="+", default=list(PHASES), choices=PHASES,
-                    help="which phases to run (default: LEFT RIGHT BOTH)")
+    ap.add_argument("--rate", type=int, default=FAST_RATE_HZ,
+                    help="Pico sample rate in Hz (default: %d)" % FAST_RATE_HZ)
+    ap.add_argument("--phases", nargs="+", default=list(DEFAULT_PHASES), choices=PHASES,
+                    help="which phases to run (default: %s). LEFT and RIGHT measure "
+                         "the same travel and rate as BOTH, so they are for isolating "
+                         "one servo rather than for routine runs."
+                         % " ".join(DEFAULT_PHASES))
     ap.add_argument("--samples-csv", action="store_true",
-                    help="also write every captured sample, for plotting")
+                    help="also write every captured sample, for plotting. At the "
+                         "default cycles and rate this is ~290k rows, ~20 MB.")
     ap.add_argument("--dry-run", action="store_true",
                     help="exercise everything but send no actuator commands")
     args = ap.parse_args()
@@ -517,6 +578,7 @@ def main():
     write_csv(
         report_path(APP_DIR, "%s_%s_rangerate.csv" % (label, stamp)),
         ["phase", "side", "direction", "cycles", "range_deg",
+         "angle_max_deg", "angle_max_sd", "angle_min_deg", "angle_min_sd",
          "travel_deg", "travel_sd", "transit_ms", "transit_sd",
          "rate_deg_s", "rate_sd", "latency_ms", "latency_sd"],
         rows,

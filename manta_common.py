@@ -84,6 +84,30 @@ REPLY_PREFIX = "#"
 # be taken modulo this or a wrap reads as a colossal backwards jump.
 PICO_TICKS_MODULO = 1 << 30
 
+# Sample-rate presets understood by pico/sampler.py, mirrored here because the
+# GUI, the console test and the monitor all need them and none of them should be
+# the authority. SLOW_RATE_HZ is the board's boot default and the legacy format;
+# it is fixed by compatibility, not by choice.
+SLOW_RATE_HZ = 10
+
+# The fast preset. Measured on this rig 2026-08-14: the board free-runs at about
+# 1520 Hz (asking for 1750 or 2000 yields 1515-1524 Hz, i.e. it saturates), so
+# the loop costs ~660 us and 1000 Hz spends two thirds of its 1000 us budget. At
+# 1000 Hz the board sustained 998.0 Hz over 20 s with no transport-shaped gaps,
+# and the host's readline() path captured 2393 of an expected 2400 samples per
+# leg. See pico/sampler.py for the full measurement.
+FAST_RATE_HZ = 1000
+
+# Hard-over cycles per phase in the range/rate test. 30 is enough for the sample
+# stdev of travel, transit and rate to mean something; 3 was not.
+DEFAULT_CYCLES = 30
+
+# Which phases the range/rate test runs unless told otherwise. Driving the servos
+# one at a time was measured to give the same travel and rate as driving them in
+# unison, so LEFT and RIGHT are diagnostic options now rather than the default -
+# which is what makes 30 cycles affordable in wall-clock terms.
+DEFAULT_PHASES = ("BOTH",)
+
 
 def position_to_degrees(side, raw_position, scaler, offset):
     """Convert raw ADC counts to degrees.

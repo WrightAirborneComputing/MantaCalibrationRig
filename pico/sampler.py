@@ -10,12 +10,13 @@ firmware.
 Two presets, switched over USB at runtime:
 
     slow (boot default)   10 Hz   "[<left_u16>/<right_u16>]"
-    fast                 500 Hz   "[<ticks_us>:<left_u16>/<right_u16>]"
+    fast                1000 Hz   "[<ticks_us>:<left_u16>/<right_u16>]"
 
 Slow mode is byte-identical to the legacy firmware, so plugging the board into
 any terminal gives readable output and the existing host tools keep working
-untouched. Fast mode exists to resolve an elevon transit (150-400 ms) into 100+
-samples, which is what measuring travel range and slew rate needs.
+untouched. Fast mode exists to resolve an elevon transit - measured on this rig
+at ~100 ms - into 100+ samples, which is what measuring travel range and slew
+rate needs.
 
 The ceiling is the per-line cost of formatting and printing over USB CDC, not
 the ADC and not SERIAL_BAUD - this is a USB CDC virtual port, so the baud rate
@@ -28,9 +29,28 @@ Measured on an RP2040 at MicroPython 1.19.1:
     plus print() to USB CDC          510 us
 
 The whole loop - ADC, formatting, print, scheduling and the command poll - comes
-to ~660 us, and the board sustains rates up to about 1500 Hz. Asking for 2000 Hz
-yields ~1508 Hz, i.e. it saturates rather than keeps up. 500 Hz spends a third of
-its 2000 us budget, leaving ~3x headroom, which is why it is the fast preset.
+to ~660 us, so the board free-runs at about 1520 Hz and cannot go faster.
+
+Re-measured on the rig 2026-08-14 with `pico_monitor.py --rate N --seconds 20
+--quiet --stats`, which reads the board's own ticks_us rather than host arrival
+times:
+
+    requested   sustained   gaps
+      500 Hz     499.5 Hz   all GC-shaped
+      750 Hz     749.1 Hz   all GC-shaped
+     1000 Hz     998.0 Hz   all GC-shaped
+     1250 Hz    1228.5 Hz   all GC-shaped
+     1500 Hz    1519.8 Hz   already free-running: no sleep margin left
+     1750 Hz    1524.4 Hz   saturated
+     2000 Hz    1512.9 Hz   saturated
+
+Nothing was ever lost in transport - every gap at every rate was the collector,
+so the ceiling really is the loop cost and not the link.
+
+1000 Hz is the fast preset: two thirds of the free-running ceiling, so a slow
+iteration still has somewhere to go. The rig's elevons transit in ~100 ms, so
+this is ~100 samples across the edge being measured where 500 Hz gave ~50. It was
+500 Hz, which was needlessly conservative.
 
 MAX_HZ is left above the sustainable ceiling on purpose: asking for more produces
 an honest "could not sustain" report from pico_monitor rather than silent drift.
@@ -42,25 +62,26 @@ replaces despite doing more.
 
 The microsecond stamp in fast mode is taken next to the ADC read, so timing is
 immune to USB's bursty 1 ms-frame delivery - and it is what lets the host prove
-the board is *sampling* at 500 Hz rather than merely that lines are arriving.
+the board is *sampling* at 1000 Hz rather than merely that lines are arriving.
 ticks_us() wraps at 2^30 us (~17.9 min); the host unwraps it.
 
 Command protocol - newline-terminated ASCII, case-insensitive, tolerant of CRLF:
 
     S        slow preset: 10 Hz, no timestamp      -> "# ACK S 10"
-    F        fast preset: 500 Hz, timestamp on     -> "# ACK F 500"
+    F        fast preset: 1000 Hz, timestamp on    -> "# ACK F 1000"
     F<hz>    fast at a given rate, e.g. "F1000"    -> "# ACK F 1000"
     G        collect garbage now                   -> "# ACK G"
     ?        status                                -> "# STATUS mode=slow hz=10 ts=0"
     other                                          -> "# ERR <text>"
 
 `G` exists because MicroPython's garbage collector stalls the sample loop for
-~7.7 ms whenever it runs, which at 500 Hz is roughly every 4.3 seconds and costs
-three consecutive samples. Measured on this board, a collect costs ~4.5 ms even
-on an almost-empty heap, so the cost tracks heap size rather than garbage volume
-and collecting *more often* would only stall more. Instead the host calls G
-immediately before a capture, paying the stall at a moment when nothing is being
-measured and buying a clean window of a few seconds after it.
+~7.7 ms whenever it runs, which at 1000 Hz is roughly every 2.5 seconds and costs
+seven consecutive samples - 8 gaps and 56 samples over a measured 20 s run.
+Measured on this board, a collect costs ~4.5 ms even on an almost-empty heap, so
+the cost tracks heap size rather than garbage volume and collecting *more often*
+would only stall more. Instead the host calls G immediately before a capture,
+paying the stall at a moment when nothing is being measured and buying a clean
+window of a couple of seconds after it.
 
 Every board-to-host reply is prefixed "#", which cannot match the sample regex,
 so replies are inert to every parser on the host side. Commands are short enough
@@ -68,7 +89,7 @@ to type by hand into a serial terminal, which is the point - the console is the
 debugging tool.
 
 Ctrl-C is deliberately left enabled: it is the escape hatch when the board is
-firehosing at 500 Hz. The host must therefore never send a raw 0x03, which costs
+firehosing at 1000 Hz. The host must therefore never send a raw 0x03, which costs
 nothing since every command is letters and digits.
 """
 
@@ -79,7 +100,7 @@ import sys
 import utime
 
 SLOW_HZ = 10
-FAST_HZ = 500
+FAST_HZ = 1000
 
 # Below 1 Hz the period arithmetic degenerates; above ~2-3 kHz the print cost
 # exceeds the sample period and the loop silently stops keeping time.
@@ -168,7 +189,7 @@ def derive_timing(hz):
     """Loop constants for a sample rate: (period_us, cmd_interval, blink_reload).
 
     Command polling is decimated rather than run every sample so the hot loop
-    stays lean: 20 ms of switch latency at 500 Hz, and every sample at 10 Hz
+    stays lean: 20 ms of switch latency at 1000 Hz, and every sample at 10 Hz
     where there is budget to spare. Blinking is decimated to ~2-4 Hz so the LED
     reads as "alive" instead of a blur.
     """

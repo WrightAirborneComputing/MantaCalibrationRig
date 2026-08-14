@@ -20,6 +20,7 @@ from range_test import (
     MIN_TRAVEL_DEG,
     analyse_leg,
     crossing_time,
+    endpoint_stats,
     mean_sd,
     signed_tick_delta,
     to_series,
@@ -228,4 +229,41 @@ def test_mean_sd():
     mean, sd = mean_sd([1.0, 2.0, 3.0])
     assert mean == pytest.approx(2.0)
     assert sd == pytest.approx(1.0)
+# def
+
+
+def test_endpoint_stats_orders_by_value_not_by_direction_name():
+    """Which direction ends high depends on the side's sign convention."""
+    legs = [
+        {"direction": "neg_to_pos", "final_deg": 30.0},
+        {"direction": "neg_to_pos", "final_deg": 31.0},
+        {"direction": "pos_to_neg", "final_deg": -37.0},
+        {"direction": "pos_to_neg", "final_deg": -36.0},
+    ]
+
+    (hi, hi_sd), (lo, lo_sd) = endpoint_stats(legs)
+
+    assert hi == pytest.approx(30.5)
+    assert lo == pytest.approx(-36.5)
+    assert hi_sd == pytest.approx(0.7071, abs=1e-3)
+    assert lo_sd == pytest.approx(0.7071, abs=1e-3)
+
+    # Reversed convention: the same clustering, still ordered by value.
+    flipped = [{**leg, "final_deg": -leg["final_deg"]} for leg in legs]
+    (hi2, _), (lo2, _) = endpoint_stats(flipped)
+
+    assert hi2 == pytest.approx(36.5)
+    assert lo2 == pytest.approx(-30.5)
+# def
+
+
+def test_endpoint_stats_survives_a_single_direction():
+    """One-legged runs must report the endpoint they have, not crash."""
+    (hi, _), (lo, lo_sd) = endpoint_stats(
+        [{"direction": "neg_to_pos", "final_deg": 30.0}])
+
+    assert hi == pytest.approx(30.0)
+    assert lo is None and lo_sd is None
+
+    assert endpoint_stats([]) == ((None, None), (None, None))
 # def
