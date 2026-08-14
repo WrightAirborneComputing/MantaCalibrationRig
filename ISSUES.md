@@ -9,7 +9,33 @@ Line references point at `MantaTrimmer.py` as of that branch. Issues in the dele
 
 ---
 
-## 1. Tk variables are read from worker threads — High
+## 1. Tk variables are read from worker threads — High — **FIXED**
+
+*Fixed on `fix/issues-round-1`.* Four changes:
+
+- `_set_side_param_vars_on_gui_thread` now uses `post_to_gui` rather than `root.after` —
+  one line covering all 12 calibration-worker call sites. `after()` registers a Tcl
+  command and is itself unsafe off the Tk thread, so the "correct" pattern was only ever
+  half right.
+- The sweep worker's two `root.after` calls collapse to one `post_to_gui`.
+- `drone_name_var.get()` is read on the GUI thread in `start_sweep_to_csv` and passed to
+  the worker as an argument.
+- `get_side_expected_pwm` goes through a new `call_on_gui_thread(fn, timeout=2.0)`, which
+  runs a read on the Tk thread and returns its result over a one-slot queue. A
+  start-of-run snapshot would have been wrong here: the calibration worker rewrites
+  min/max/trim part-way through its own run. The timeout and `_closing` check are
+  load-bearing — once the window closes, `_drain_gui_queue` stops rescheduling and an
+  unbounded wait would hang the worker through shutdown.
+
+Verified under Xvfb with a real `mainloop`: 4 reader threads and 4 writer threads for
+7.6 s, 600 marshalled reads and 600 marshalled writes, zero cross-thread errors, correct
+round-trip values, and an immediate return on the closing path.
+
+Original report follows.
+
+---
+
+## 1a. (original text) Tk variables are read from worker threads
 
 **Location:** `_sweep_to_csv_worker` reads `drone_name_var.get()` at
 [MantaTrimmer.py:1311](MantaTrimmer.py#L1311); the calibration workers reach

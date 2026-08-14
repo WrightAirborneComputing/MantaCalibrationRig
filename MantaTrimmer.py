@@ -1374,20 +1374,23 @@ class FourSliderGUI:
 
         self.stop_both_calibration()
 
+        # Read the Tk variable here, on the GUI thread, and hand the value to the
+        # worker. Tk is not thread-safe, so the worker must never touch it.
+        drone_name = self.drone_name_var.get().strip()
+        if drone_name == "":
+            drone_name = "drone"
+
         self.sweep_active = True
         self.sweep_thread = threading.Thread(
             target=self._sweep_to_csv_worker,
+            args=(drone_name,),
             daemon=True
         )
         self.sweep_thread.start()
     # def
 
-    def _sweep_to_csv_worker(self):
+    def _sweep_to_csv_worker(self, drone_name):
         try:
-            drone_name = self.drone_name_var.get().strip()
-            if drone_name == "":
-                drone_name = "drone"
-
             safe_name = self.make_safe_filename(drone_name)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             csv_filename = os.path.join(APP_DIR, "%s_%s.csv" % (safe_name, timestamp))
@@ -1453,8 +1456,7 @@ class FourSliderGUI:
 
             self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, 0.0)
             self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, 0.0)
-            self.root.after(0, lambda: self.left_pos.set(0.0))
-            self.root.after(0, lambda: self.right_pos.set(0.0))
+            self.post_to_gui(self.zero_both_sliders)
 
             print("Sweep finished: %s" % csv_filename)
 
@@ -1724,6 +1726,40 @@ class FourSliderGUI:
         self.post_to_gui(lambda: text_var.set(value))
     # def
 
+    def call_on_gui_thread(self, fn, timeout=2.0):
+        """Run fn on the Tk thread and return its result. NEVER call from the Tk thread.
+
+        For the few places a worker must *read* a Tk variable. The timeout is
+        load-bearing: once the window closes, _drain_gui_queue stops rescheduling
+        and an unbounded wait would hang the calling worker through shutdown.
+        """
+        if self._closing:
+            return None
+
+        box = queue.Queue(maxsize=1)
+
+        def runner():
+            try:
+                box.put(("ok", fn()))
+            except Exception as e:
+                box.put(("err", e))
+        # def
+
+        self.post_to_gui(runner)
+
+        try:
+            kind, value = box.get(timeout=timeout)
+        except queue.Empty:
+            print("GUI round-trip timed out")
+            return None
+
+        if kind == "err":
+            print("GUI round-trip failed: %s" % str(value))
+            return None
+
+        return value
+    # def
+
     def refresh_params_from_drone(self, clear_name=False):
         """Read UID and the six elevon params from the FCU and populate the UI.
 
@@ -1926,7 +1962,10 @@ class FourSliderGUI:
                     self.right_trim_var.set("%.3f" % float(trim_val))
         # def
 
-        self.root.after(0, do_update)
+        # post_to_gui, not root.after: after() registers a Tcl command and is
+        # not safe to call from a worker thread. All 12 callers of this are
+        # calibration workers.
+        self.post_to_gui(do_update)
     # def
 
     def refresh_side_param_vars_from_drone(self, side):
@@ -2130,20 +2169,36 @@ class FourSliderGUI:
         return None
     # def
 
+    def read_side_param_snapshot(self, side):
+        """Read a side's min/max/trim entries. Tk thread only."""
+        if side == "LEFT":
+            return (
+                self.get_int_var(self.left_min_var, self.DEFAULT_PWM_MIN),
+                self.get_int_var(self.left_max_var, self.DEFAULT_PWM_MAX),
+                self.get_float_var(self.left_trim_var, self.DEFAULT_TRIM),
+            )
+        return (
+            self.get_int_var(self.right_min_var, self.DEFAULT_PWM_MIN),
+            self.get_int_var(self.right_max_var, self.DEFAULT_PWM_MAX),
+            self.get_float_var(self.right_trim_var, self.DEFAULT_TRIM),
+        )
+    # def
+
     def get_side_expected_pwm(self, side, cmd):
+        """Called from the calibration workers, so the Tk reads are marshalled.
+
+        A snapshot taken once at worker start would be wrong here: the worker
+        rewrites min/max/trim part-way through its own run.
+        """
         if cmd is None:
             return None
 
-        if side == "LEFT":
-            pwm_min = self.get_int_var(self.left_min_var, 1000)
-            pwm_max = self.get_int_var(self.left_max_var, 2000)
-            trim = self.get_float_var(self.left_trim_var, 0.0)
-            rev = self.is_main_channel_reversed(5)
-        else:
-            pwm_min = self.get_int_var(self.right_min_var, 1000)
-            pwm_max = self.get_int_var(self.right_max_var, 2000)
-            trim = self.get_float_var(self.right_trim_var, 0.0)
-            rev = self.is_main_channel_reversed(6)
+        snapshot = self.call_on_gui_thread(lambda: self.read_side_param_snapshot(side))
+        if snapshot is None:
+            return None
+
+        pwm_min, pwm_max, trim = snapshot
+        rev = self.is_main_channel_reversed(5 if side == "LEFT" else 6)
 
         return self.expected_pwm(cmd, pwm_min, pwm_max, trim, rev)
     # def
