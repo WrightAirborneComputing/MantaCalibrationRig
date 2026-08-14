@@ -35,6 +35,7 @@ from manta_common import (
     PICO_VID_PIDS,
     FCU_VID_HINTS,
     POSITION_REGEX,
+    REPLY_PREFIX,
     PortCandidate,
     describe_serial_error,
     find_candidate,
@@ -53,7 +54,31 @@ from manta_common import (
 # cannot disagree. 0.5 s gives ~5 samples (about 2.2x noise reduction) for 250 ms
 # of group delay, which is well inside the calibration mover's 250 ms step cadence.
 POSITION_WINDOW_S = 0.5
-POSITION_HISTORY = 200          # ~20 s of backlog at 10 Hz
+
+# Backlog is sized in *seconds*, not samples, because the Pico's rate is now
+# negotiable. A fixed 200 entries meant 20 s at 10 Hz but only 0.4 s at 500 Hz -
+# shorter than the averaging window it has to feed, which would have made
+# POSITION_WINDOW_S quietly stop meaning anything. The floor keeps the 10 Hz
+# case byte-for-byte as it was.
+POSITION_HISTORY_S = 4.0
+MIN_POSITION_HISTORY = 200
+
+# Presets understood by pico/sampler.py.
+SLOW_RATE_HZ = 10
+FAST_RATE_HZ = 500
+
+# A capture left running by a crashed worker must not grow without bound.
+# 60000 samples is two minutes at 500 Hz - far longer than any single leg.
+MAX_CAPTURE_SAMPLES = 60000
+
+# "# ACK F 500" / "# ACK S 10"
+ACK_RATE_REGEX = re.compile(r"ACK\s+[SF]\s+(\d+)")
+
+
+def position_history_for(hz):
+    """Backlog depth for a given sample rate. Never shorter than the old default."""
+    return max(MIN_POSITION_HISTORY, int(POSITION_HISTORY_S * float(hz)))
+# def
 
 MAX_LOG_QUEUE = 2000
 MAX_LOG_LINES = 2000
@@ -520,11 +545,25 @@ class PositionReader:
 
         # (monotonic_timestamp, raw_value) pairs. Read non-destructively by any
         # number of consumers; maxlen bounds the backlog.
-        self._queue_left = deque(maxlen=POSITION_HISTORY)
-        self._queue_right = deque(maxlen=POSITION_HISTORY)
+        self.sample_hz = SLOW_RATE_HZ
+        self._queue_left = deque(maxlen=position_history_for(self.sample_hz))
+        self._queue_right = deque(maxlen=position_history_for(self.sample_hz))
         self._lock = threading.Lock()
         self._thread = None
         self._stop = threading.Event()
+
+        # The reader thread owns the port. Commands are written from other
+        # threads through send_command(), and the reply comes back via the
+        # reader - it stays the only thing that ever reads the port.
+        self._serial = None
+        self._write_lock = threading.Lock()
+        self._replies = queue.Queue(maxsize=32)
+
+        # Raw timestamped capture, for measurements that cannot use the
+        # averaged getter. None means "not capturing".
+        self._capture = None
+        self._capture_limit = MAX_CAPTURE_SAMPLES
+        self._capture_truncated = False
 
         self.connected = False
         self.last_error = None
@@ -784,6 +823,9 @@ class PositionReader:
 
         try:
             with serial.Serial(port, baudrate=self.baud, timeout=self.timeout) as ser:
+                with self._lock:
+                    self._serial = ser
+
                 self.connected = True
                 self.last_error = None
 
@@ -796,6 +838,16 @@ class PositionReader:
                     if not text:
                         continue
 
+                    # Firmware replies ("# ACK F 500"). Cannot match
+                    # POSITION_REGEX, but routing them explicitly is what lets
+                    # send_command() wait for an answer without a second reader.
+                    if text.startswith(REPLY_PREFIX):
+                        try:
+                            self._replies.put_nowait(text)
+                        except queue.Full:
+                            pass
+                        continue
+
                     m = POSITION_REGEX.search(text)
                     if m:
                         try:
@@ -804,19 +856,146 @@ class PositionReader:
                         except ValueError:
                             continue
 
+                        raw_t_us = m.group("t_us")
+                        pico_us = int(raw_t_us) if raw_t_us is not None else None
+
                         now = time.monotonic()
                         with self._lock:
                             self._queue_left.append((now, p1))
                             self._queue_right.append((now, p2))
                             self._last_sample_time = now
 
+                            if self._capture is not None:
+                                if len(self._capture) < self._capture_limit:
+                                    self._capture.append((now, pico_us, p1, p2))
+                                else:
+                                    self._capture_truncated = True
+
         except (serial.SerialException, OSError) as e:
             self.last_error = describe_serial_error(port, e)
             print(self.last_error)
 
         finally:
+            with self._lock:
+                self._serial = None
+
             self.connected = False
             print("Position stream on %s closed" % port)
+    # def
+
+    def send_command(self, command, timeout=1.5, attempts=3):
+        """Send a firmware command and return its reply, or None.
+
+        Retried because a freshly opened USB CDC port swallows writes issued
+        before it settles, and a lost write is indistinguishable from a board
+        that never answers. Every command pico/sampler.py accepts is idempotent,
+        so a duplicate is harmless.
+
+        Returns None against the legacy firmware, which never reads stdin.
+        """
+        for _ in range(max(1, attempts)):
+            with self._lock:
+                ser = self._serial
+
+            if ser is None:
+                return None
+
+            with self._write_lock:
+                # Drop replies to earlier commands so we cannot mistake one for
+                # the answer to this one.
+                while True:
+                    try:
+                        self._replies.get_nowait()
+                    except queue.Empty:
+                        break
+
+                try:
+                    ser.write((command + "\n").encode("ascii"))
+                    ser.flush()
+                except (serial.SerialException, OSError) as e:
+                    print("Failed to send %r to the Pico: %s" % (command, str(e)))
+                    return None
+
+            try:
+                return self._replies.get(timeout=timeout)
+            except queue.Empty:
+                continue
+
+        return None
+    # def
+
+    def set_sample_rate(self, hz):
+        """Negotiate a sample rate with the Pico. Returns the rate it accepted.
+
+        Resizing the backlog is not optional: POSITION_HISTORY_S has to follow
+        the rate or the averaging window silently outruns the buffer feeding it.
+        """
+        hz = int(hz)
+        command = "S" if hz <= SLOW_RATE_HZ else "F%d" % hz
+
+        reply = self.send_command(command)
+        if reply is None:
+            print("Pico did not accept a rate command - assuming legacy 10 Hz firmware")
+            return None
+
+        match = ACK_RATE_REGEX.search(reply)
+        achieved = int(match.group(1)) if match else hz
+
+        self._resize_history(achieved)
+        self.sample_hz = achieved
+
+        print("Pico sample rate: %d Hz" % achieved)
+        return achieved
+    # def
+
+    def _resize_history(self, hz):
+        size = position_history_for(hz)
+
+        with self._lock:
+            if self._queue_left.maxlen == size:
+                return
+
+            # deque(iterable, maxlen=n) keeps the newest n, which is what we want.
+            self._queue_left = deque(self._queue_left, maxlen=size)
+            self._queue_right = deque(self._queue_right, maxlen=size)
+    # def
+
+    def start_capture(self, limit=MAX_CAPTURE_SAMPLES):
+        """Begin recording raw timestamped samples.
+
+        Separate from the averaged getter on purpose. get_average_position_
+        nonblocking() smooths over POSITION_WINDOW_S, which carries ~250 ms of
+        group delay - the same order as an elevon transit, so it would swamp any
+        measurement of one. Capture keeps every sample and the board's own
+        microsecond stamp.
+        """
+        with self._lock:
+            self._capture = []
+            self._capture_limit = int(limit)
+            self._capture_truncated = False
+    # def
+
+    def stop_capture(self):
+        """Return (samples, truncated).
+
+        samples is a list of (host_monotonic, pico_us, raw_left, raw_right);
+        pico_us is None on legacy firmware, which emits no timestamp.
+        """
+        with self._lock:
+            samples = self._capture if self._capture is not None else []
+            truncated = self._capture_truncated
+            self._capture = None
+            self._capture_truncated = False
+
+        if truncated:
+            print("Capture hit the %d sample cap - data is incomplete" % self._capture_limit)
+
+        return samples, truncated
+    # def
+
+    def is_capturing(self):
+        with self._lock:
+            return self._capture is not None
     # def
 
     def start(self):
@@ -833,7 +1012,15 @@ class PositionReader:
         t.start()
     # def
 
-    def stop(self, join_timeout=2.0):
+    def stop(self, join_timeout=2.0, restore_slow=True):
+        # Hand the board back in its readable 10 Hz mode, so whatever opens the
+        # port next - a terminal, pico_monitor, the next run - is not met with a
+        # 500 Hz firehose. Best effort and deliberately impatient: this is on the
+        # shutdown path and must not hang it. Must happen before _stop, since the
+        # reader thread is what collects the reply.
+        if restore_slow and self.connected and self.sample_hz != SLOW_RATE_HZ:
+            self.send_command("S", timeout=0.5, attempts=1)
+
         self._stop.set()
 
         t = self._thread
@@ -843,6 +1030,7 @@ class PositionReader:
 
         self._thread = None
         self.connected = False
+        self.sample_hz = SLOW_RATE_HZ
     # def
 
     def set_port(self, port):
@@ -854,6 +1042,10 @@ class PositionReader:
         self.last_error = None
         self._last_sample_time = 0.0
         self.clear_queues()
+
+        with self._lock:
+            self._capture = None
+            self._capture_truncated = False
 
         if port:
             self.start()

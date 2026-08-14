@@ -11,40 +11,14 @@ the console verification in the README.
 
 import os
 import sys
-import types
 
 import pytest
 
-PICO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pico")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from fake_pico import load_sampler
 
-def _load_sampler():
-    """Import pico/sampler.py with its MicroPython-only imports stubbed out."""
-    machine = types.ModuleType("machine")
-    machine.Pin = object
-    machine.ADC = object
-
-    utime = types.ModuleType("utime")
-    utime.ticks_us = lambda: 0
-    utime.ticks_add = lambda a, b: a + b
-    utime.ticks_diff = lambda a, b: a - b
-    utime.sleep_us = lambda us: None
-
-    sys.modules["machine"] = machine
-    sys.modules["utime"] = utime
-    sys.path.insert(0, PICO_DIR)
-
-    try:
-        import sampler
-        return sampler
-    finally:
-        sys.path.remove(PICO_DIR)
-        del sys.modules["machine"]
-        del sys.modules["utime"]
-# def
-
-
-sampler = _load_sampler()
+sampler = load_sampler()
 
 
 @pytest.fixture
