@@ -60,7 +60,35 @@ remaining call sites should be migrated to `post_to_gui` as part of this fix.
 
 ---
 
-## 2. Blocking MAVLink calls run on the GUI thread — High
+## 2. Blocking MAVLink calls run on the GUI thread — High — **FIXED**
+
+*Fixed on `fix/issues-round-1`.* The six `apply_*` callbacks and `clear_left`/`clear_right`
+now hand their writes to a worker and report back through `post_to_gui`.
+
+`clear_left`/`clear_right` were worse than the issue originally recorded — three
+`set_param_value` calls each, up to 15 s of frozen window.
+
+There is no clean way to thread a write while the entry stays editable: typing a new value
+mid-flight means the completion callback stamps the FCU's readback of the *old* value over
+the edit. Three layers handle it:
+
+1. The entry goes `readonly` (value stays legible) and the Set button `disabled` with text
+   `"..."` for the duration, so a stale edit cannot be created.
+2. A per-key generation counter — a superseded write re-enables the widgets but does not
+   write its readback back. Re-enabling is unconditional, or a superseded write would
+   leave the field locked forever.
+3. Writes are refused outright while that side is calibrating, since the calibration
+   worker writes the same parameters and there is no arbitration between them.
+
+Verified under Xvfb against a simulated 3 s-per-write FCU: 68 UI ticks during a single
+write and 208 through a 9 s clear (pre-fix: zero, frozen), widgets lock and re-enable
+correctly, superseded writes drop their readback, and calibration-time writes are refused.
+
+Original report follows.
+
+---
+
+## 2a. (original text) Blocking MAVLink calls run on the GUI thread
 
 **Location:** `apply_left_min` at [MantaTrimmer.py:2346](MantaTrimmer.py#L2346) and its
 five sibling apply callbacks.

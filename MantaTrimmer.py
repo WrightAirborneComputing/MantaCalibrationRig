@@ -1054,6 +1054,11 @@ class FourSliderGUI:
         # and the Tk thread runs them in _drain_gui_queue().
         self._gui_queue = queue.Queue()
 
+        # Parameter-entry widgets by key, and a generation counter per key so a
+        # superseded write cannot stamp a stale readback over a newer edit.
+        self._param_widgets = {}
+        self._param_write_seq = {}
+
         self.LEFT_OUTPUT_FUNCTION = 1201
         self.LEFT_MIN_PARAM = "PWM_MAIN_MIN5"
         self.LEFT_MAX_PARAM = "PWM_MAIN_MAX5"
@@ -1207,9 +1212,9 @@ class FourSliderGUI:
         self.left_max_var = tk.StringVar(value=str(left_max_param))
         self.left_trim_var = tk.StringVar(value="%.3f" % left_trim_param)
 
-        self.create_param_entry(left_params, "Left-min", self.left_min_var, self.apply_left_min)
-        self.create_param_entry(left_params, "Left-max", self.left_max_var, self.apply_left_max)
-        self.create_param_entry(left_params, "Left-trim", self.left_trim_var, self.apply_left_trim)
+        self.create_param_entry(left_params, "left_min", "Left-min", self.left_min_var, self.apply_left_min)
+        self.create_param_entry(left_params, "left_max", "Left-max", self.left_max_var, self.apply_left_max)
+        self.create_param_entry(left_params, "left_trim", "Left-trim", self.left_trim_var, self.apply_left_trim)
 
         left_pos_frame = tk.Frame(left_group, bd=1, relief="groove", padx=6, pady=6)
         left_pos_frame.pack()
@@ -1281,9 +1286,9 @@ class FourSliderGUI:
         self.right_max_var = tk.StringVar(value=str(right_max_param))
         self.right_trim_var = tk.StringVar(value="%.3f" % right_trim_param)
 
-        self.create_param_entry(right_params, "Right-min", self.right_min_var, self.apply_right_min)
-        self.create_param_entry(right_params, "Right-max", self.right_max_var, self.apply_right_max)
-        self.create_param_entry(right_params, "Right-trim", self.right_trim_var, self.apply_right_trim)
+        self.create_param_entry(right_params, "right_min", "Right-min", self.right_min_var, self.apply_right_min)
+        self.create_param_entry(right_params, "right_max", "Right-max", self.right_max_var, self.apply_right_max)
+        self.create_param_entry(right_params, "right_trim", "Right-trim", self.right_trim_var, self.apply_right_trim)
 
         right_pos_frame = tk.Frame(right_group, bd=1, relief="groove", padx=6, pady=6)
         right_pos_frame.pack()
@@ -1998,7 +2003,7 @@ class FourSliderGUI:
         return ok
     # def
 
-    def create_param_entry(self, parent, label, text_var, apply_callback):
+    def create_param_entry(self, parent, key, label, text_var, apply_callback):
         row = tk.Frame(parent)
         row.pack(anchor="w", pady=2)
 
@@ -2011,6 +2016,9 @@ class FourSliderGUI:
 
         btn = tk.Button(row, text="Set", width=5, command=apply_callback)
         btn.pack(side=tk.LEFT, padx=(5, 0))
+
+        # Kept so a write in flight can lock its own field - see start_param_write.
+        self._param_widgets[key] = (entry, btn)
 
         return entry
     # def
@@ -2431,62 +2439,147 @@ class FourSliderGUI:
     # def
 
     def clear_left(self):
-        try:
-            left_min = 900
-            left_max = 2100
-            left_trim = 0.0
-
-            ok_min = self.drone_interface.set_param_value(self.LEFT_MIN_PARAM, int, left_min)
-            ok_max = self.drone_interface.set_param_value(self.LEFT_MAX_PARAM, int, left_max)
-            ok_trim = self.drone_interface.set_param_value(self.LEFT_TRIM_PARAM, float, left_trim)
-
-            if ok_min:
-                self.left_min_var.set(str(left_min))
-            if ok_max:
-                self.left_max_var.set(str(left_max))
-            if ok_trim:
-                self.left_trim_var.set("%.3f" % left_trim)
-
-            self.left_pos.set(0.0)
-
-            print("Left cleared")
-        except Exception as e:
-            print("Failed to clear left: %s" % str(e))
+        self.start_side_clear("LEFT")
     # def
 
     def clear_right(self):
+        self.start_side_clear("RIGHT")
+    # def
+
+    def start_side_clear(self, side):
+        """Reset one side's min/max/trim. Three writes, so up to 15 s - off-thread."""
+        if self.is_calibration_active(side):
+            print("%s is calibrating - not clearing" % side)
+            return
+
+        if side == "LEFT":
+            keys = ["left_min", "left_max", "left_trim"]
+            params = (self.LEFT_MIN_PARAM, self.LEFT_MAX_PARAM, self.LEFT_TRIM_PARAM)
+            slider = self.left_pos
+        else:
+            keys = ["right_min", "right_max", "right_trim"]
+            params = (self.RIGHT_MIN_PARAM, self.RIGHT_MAX_PARAM, self.RIGHT_TRIM_PARAM)
+            slider = self.right_pos
+
+        for key in keys:
+            self._param_write_seq[key] = self._param_write_seq.get(key, 0) + 1
+
+        self.set_param_widgets_enabled(keys, False)
+        slider.set(0.0)
+
+        threading.Thread(
+            target=self._side_clear_worker,
+            args=(side, keys, params),
+            daemon=True
+        ).start()
+    # def
+
+    def _side_clear_worker(self, side, keys, params):
+        min_param, max_param, trim_param = params
+        clear_min = 900
+        clear_max = 2100
+        clear_trim = 0.0
+
+        results = {}
         try:
-            right_min = 900
-            right_max = 2100
-            right_trim = 0.0
+            if self.drone_interface.set_param_value(min_param, int, clear_min):
+                results[keys[0]] = str(clear_min)
+            if self.drone_interface.set_param_value(max_param, int, clear_max):
+                results[keys[1]] = str(clear_max)
+            if self.drone_interface.set_param_value(trim_param, float, clear_trim):
+                results[keys[2]] = "%.3f" % clear_trim
 
-            ok_min = self.drone_interface.set_param_value(self.RIGHT_MIN_PARAM, int, right_min)
-            ok_max = self.drone_interface.set_param_value(self.RIGHT_MAX_PARAM, int, right_max)
-            ok_trim = self.drone_interface.set_param_value(self.RIGHT_TRIM_PARAM, float, right_trim)
-
-            if ok_min:
-                self.right_min_var.set(str(right_min))
-            if ok_max:
-                self.right_max_var.set(str(right_max))
-            if ok_trim:
-                self.right_trim_var.set("%.3f" % right_trim)
-
-            self.right_pos.set(0.0)
-
-            print("Right cleared")
+            print("%s cleared" % side)
         except Exception as e:
-            print("Failed to clear right: %s" % str(e))
+            print("Failed to clear %s: %s" % (side, str(e)))
+
+        def finish():
+            if self._closing:
+                return
+            self.set_param_widgets_enabled(keys, True)
+            for key, text in results.items():
+                entry_var = self._param_text_var(key)
+                if entry_var is not None:
+                    entry_var.set(text)
+        # def
+
+        self.post_to_gui(finish)
+    # def
+
+    def _param_text_var(self, key):
+        return {
+            "left_min": self.left_min_var,
+            "left_max": self.left_max_var,
+            "left_trim": self.left_trim_var,
+            "right_min": self.right_min_var,
+            "right_max": self.right_max_var,
+            "right_trim": self.right_trim_var,
+        }.get(key)
+    # def
+
+    def set_param_widgets_enabled(self, keys, enabled):
+        """Tk thread. Lock a field while its write is in flight."""
+        for key in keys:
+            widgets = self._param_widgets.get(key)
+            if widgets is None:
+                continue
+            entry, btn = widgets
+            # readonly rather than disabled: the value stays legible.
+            entry.config(state="normal" if enabled else "readonly")
+            btn.config(state="normal" if enabled else "disabled",
+                       text="Set" if enabled else "...")
+    # def
+
+    def start_param_write(self, key, side, label, param_name, py_type, value, text_var, fmt):
+        """GUI thread: lock the field and hand the blocking write to a worker.
+
+        set_param_value retries to a 5 s deadline and the readback adds another,
+        so doing this inline froze the whole window for up to 10 s per press.
+        """
+        if self.is_calibration_active(side):
+            print("%s is calibrating - not writing %s" % (side, param_name))
+            return
+
+        print("%s [%s]" % (label, fmt % value))
+
+        self._param_write_seq[key] = self._param_write_seq.get(key, 0) + 1
+        seq = self._param_write_seq[key]
+
+        self.set_param_widgets_enabled([key], False)
+
+        threading.Thread(
+            target=self._param_write_worker,
+            args=(key, param_name, py_type, value, text_var, fmt, seq),
+            daemon=True
+        ).start()
+    # def
+
+    def _param_write_worker(self, key, param_name, py_type, value, text_var, fmt, seq):
+        confirmed = None
+        try:
+            if self.drone_interface.set_param_value(param_name, py_type, value):
+                confirmed = self.drone_interface.get_param(param_name, py_type)
+        except Exception as e:
+            print("Failed to set %s: %s" % (param_name, str(e)))
+
+        def finish():
+            if self._closing:
+                return
+            # Re-enable unconditionally, or a superseded write leaves the field
+            # locked forever. Only the write-back is gated on the generation.
+            self.set_param_widgets_enabled([key], True)
+            if confirmed is not None and seq == self._param_write_seq.get(key):
+                text_var.set(fmt % confirmed)
+        # def
+
+        self.post_to_gui(finish)
     # def
 
     def apply_left_min(self):
         try:
             value = self.parse_int_param_entry(self.left_min_var)
-            print("Left-min [%d]" % value)
-            ok = self.drone_interface.set_param_value(self.LEFT_MIN_PARAM, int, value)
-            if ok:
-                confirmed = self.drone_interface.get_param(self.LEFT_MIN_PARAM, int)
-                if confirmed is not None:
-                    self.left_min_var.set(str(confirmed))
+            self.start_param_write("left_min", "LEFT", "Left-min",
+                                   self.LEFT_MIN_PARAM, int, value, self.left_min_var, "%d")
         except Exception as e:
             print("Failed to set left min: %s" % str(e))
     # def
@@ -2494,12 +2587,8 @@ class FourSliderGUI:
     def apply_left_max(self):
         try:
             value = self.parse_int_param_entry(self.left_max_var)
-            print("Left-max [%d]" % value)
-            ok = self.drone_interface.set_param_value(self.LEFT_MAX_PARAM, int, value)
-            if ok:
-                confirmed = self.drone_interface.get_param(self.LEFT_MAX_PARAM, int)
-                if confirmed is not None:
-                    self.left_max_var.set(str(confirmed))
+            self.start_param_write("left_max", "LEFT", "Left-max",
+                                   self.LEFT_MAX_PARAM, int, value, self.left_max_var, "%d")
         except Exception as e:
             print("Failed to set left max: %s" % str(e))
     # def
@@ -2507,12 +2596,8 @@ class FourSliderGUI:
     def apply_left_trim(self):
         try:
             value = self.parse_trim_param_entry(self.left_trim_var)
-            print("Left-trim [%.3f]" % value)
-            ok = self.drone_interface.set_param_value(self.LEFT_TRIM_PARAM, float, value)
-            if ok:
-                confirmed = self.drone_interface.get_param(self.LEFT_TRIM_PARAM, float)
-                if confirmed is not None:
-                    self.left_trim_var.set("%.3f" % confirmed)
+            self.start_param_write("left_trim", "LEFT", "Left-trim",
+                                   self.LEFT_TRIM_PARAM, float, value, self.left_trim_var, "%.3f")
         except Exception as e:
             print("Failed to set left trim: %s" % str(e))
     # def
@@ -2520,12 +2605,8 @@ class FourSliderGUI:
     def apply_right_min(self):
         try:
             value = self.parse_int_param_entry(self.right_min_var)
-            print("Right-min [%d]" % value)
-            ok = self.drone_interface.set_param_value(self.RIGHT_MIN_PARAM, int, value)
-            if ok:
-                confirmed = self.drone_interface.get_param(self.RIGHT_MIN_PARAM, int)
-                if confirmed is not None:
-                    self.right_min_var.set(str(confirmed))
+            self.start_param_write("right_min", "RIGHT", "Right-min",
+                                   self.RIGHT_MIN_PARAM, int, value, self.right_min_var, "%d")
         except Exception as e:
             print("Failed to set right min: %s" % str(e))
     # def
@@ -2533,12 +2614,8 @@ class FourSliderGUI:
     def apply_right_max(self):
         try:
             value = self.parse_int_param_entry(self.right_max_var)
-            print("Right-max [%d]" % value)
-            ok = self.drone_interface.set_param_value(self.RIGHT_MAX_PARAM, int, value)
-            if ok:
-                confirmed = self.drone_interface.get_param(self.RIGHT_MAX_PARAM, int)
-                if confirmed is not None:
-                    self.right_max_var.set(str(confirmed))
+            self.start_param_write("right_max", "RIGHT", "Right-max",
+                                   self.RIGHT_MAX_PARAM, int, value, self.right_max_var, "%d")
         except Exception as e:
             print("Failed to set right max: %s" % str(e))
     # def
@@ -2546,12 +2623,8 @@ class FourSliderGUI:
     def apply_right_trim(self):
         try:
             value = self.parse_trim_param_entry(self.right_trim_var)
-            print("Right-trim [%.3f]" % value)
-            ok = self.drone_interface.set_param_value(self.RIGHT_TRIM_PARAM, float, value)
-            if ok:
-                confirmed = self.drone_interface.get_param(self.RIGHT_TRIM_PARAM, float)
-                if confirmed is not None:
-                    self.right_trim_var.set("%.3f" % confirmed)
+            self.start_param_write("right_trim", "RIGHT", "Right-trim",
+                                   self.RIGHT_TRIM_PARAM, float, value, self.right_trim_var, "%.3f")
         except Exception as e:
             print("Failed to set right trim: %s" % str(e))
     # def
