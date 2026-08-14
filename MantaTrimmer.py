@@ -26,12 +26,35 @@ import serial.tools.list_ports
 import csv
 from datetime import datetime
 
-
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+from manta_common import (
+    APP_DIR,
+    IS_LINUX,
+    IS_WINDOWS,
+    SERIAL_BAUD,
+    PICO_VIDS,
+    PICO_VID_PIDS,
+    FCU_VID_HINTS,
+    POSITION_REGEX,
+    PortCandidate,
+    describe_serial_error,
+    find_candidate,
+    list_serial_ports,
+    position_to_degrees,
+    probe_pico,
+)
 
 
 # Bounds on the instrumentation pane. Overflow only drops lines from the GUI
 # widget - _ORIGINAL_PRINT still puts everything on stdout.
+# Position samples are averaged over a trailing time window rather than being
+# consumed. The window must be at least 2x the Pico's 10 Hz sample period so a
+# dropped serial line still leaves samples to average, and shorter than
+# PositionReader.is_streaming()'s max_age so "link dead" and "window empty"
+# cannot disagree. 0.5 s gives ~5 samples (about 2.2x noise reduction) for 250 ms
+# of group delay, which is well inside the calibration mover's 250 ms step cadence.
+POSITION_WINDOW_S = 0.5
+POSITION_HISTORY = 200          # ~20 s of backlog at 10 Hz
+
 MAX_LOG_QUEUE = 2000
 MAX_LOG_LINES = 2000
 
@@ -90,173 +113,6 @@ def print(*args, **kwargs):
 
     _ORIGINAL_PRINT(*args, **kwargs)
     INSTRUMENTATION_LOG.write(text)
-# def
-
-
-IS_LINUX = sys.platform.startswith("linux")
-IS_WINDOWS = sys.platform.startswith("win")
-
-SERIAL_BAUD = 115200
-
-# Position samples are averaged over a trailing time window rather than being
-# consumed. The window must be at least 2x the Pico's 10 Hz sample period so a
-# dropped serial line still leaves samples to average, and shorter than
-# PositionReader.is_streaming()'s max_age so "link dead" and "window empty"
-# cannot disagree. 0.5 s gives ~5 samples (about 2.2x noise reduction) for 250 ms
-# of group delay, which is well inside the calibration mover's 250 ms step cadence.
-POSITION_WINDOW_S = 0.5
-POSITION_HISTORY = 200          # ~20 s of backlog at 10 Hz
-
-# The rig Pico enumerates as a Raspberry Pi USB CDC device. This is the
-# authoritative way to spot it; probe_pico() is only a fallback.
-PICO_VIDS = {0x2E8A}
-PICO_VID_PIDS = {
-    (0x2E8A, 0x0005),  # RP2040 CDC, MicroPython
-    (0x2E8A, 0x000A),  # RP2040 CDC, CircuitPython
-}
-
-# Only a hint used to order the MAVLink probe. The heartbeat is what decides.
-FCU_VID_HINTS = {
-    0x3185,  # ARK Electronics
-    0x26AC,  # 3DR / PX4
-    0x1209,  # pid.codes (generic PX4 boards)
-    0x0483,  # STMicroelectronics
-}
-
-# One line per sample from the Pico: "[<left_u16>/<right_u16>]"
-POSITION_REGEX = re.compile(r"\[(?P<position1>-?\d+)\s*/\s*(?P<position2>-?\d+)\]")
-
-
-class PortCandidate:
-    def __init__(self, info):
-        self.device = info.device
-        self.description = info.description or ""
-        self.hwid = info.hwid or ""
-        self.vid = info.vid
-        self.pid = info.pid
-        self.manufacturer = info.manufacturer or ""
-        self.product = info.product or ""
-        self.serial_number = info.serial_number or ""
-    # def
-
-    def label(self):
-        detail = ("%s %s" % (self.manufacturer, self.product)).strip()
-        if not detail:
-            detail = self.description.strip()
-        if not detail or detail == "n/a":
-            return self.device
-        return "%s  -  %s" % (self.device, detail)
-    # def
-
-    def is_pico_by_id(self):
-        if self.vid is None:
-            return False
-        if (self.vid, self.pid) in PICO_VID_PIDS:
-            return True
-        return self.vid in PICO_VIDS
-    # def
-
-    def is_fcu_by_id(self):
-        return self.vid is not None and self.vid in FCU_VID_HINTS
-    # def
-
-    def is_legacy(self):
-        # Motherboard UARTs: no USB VID and nothing useful in hwid.
-        if self.vid is not None:
-            return False
-        return self.device.startswith("/dev/ttyS") or self.hwid in ("", "n/a")
-    # def
-# class
-
-
-def list_serial_ports(include_legacy=False):
-    candidates = []
-
-    try:
-        infos = serial.tools.list_ports.comports()
-    except Exception as e:
-        print("Failed to enumerate serial ports: %s" % str(e))
-        return candidates
-
-    for info in infos:
-        candidate = PortCandidate(info)
-        if candidate.is_legacy() and not include_legacy:
-            continue
-        candidates.append(candidate)
-
-    # USB devices first, then stable ordering by device name.
-    candidates.sort(key=lambda c: (c.vid is None, c.device))
-    return candidates
-# def
-
-
-def find_candidate(ports, device):
-    if not device:
-        return None
-    for candidate in ports:
-        if candidate.device == device:
-            return candidate
-    return None
-# def
-
-
-def describe_serial_error(device, exc):
-    text = str(exc)
-    lowered = text.lower()
-
-    errno_value = getattr(exc, "errno", None)
-
-    is_permission = (
-        isinstance(exc, PermissionError)
-        or errno_value == errno.EACCES
-        or "permission denied" in lowered
-        or "access is denied" in lowered
-    )
-    is_busy = (
-        errno_value == errno.EBUSY
-        or "resource busy" in lowered
-        or "device or resource busy" in lowered
-        or "in use" in lowered
-    )
-
-    if is_permission:
-        if IS_LINUX:
-            return (
-                "Permission denied opening %s. Add yourself to the dialout group:\n"
-                "    sudo usermod -aG dialout $USER\n"
-                "then log out and back in." % device
-            )
-        return "Permission denied opening %s. Close any program already using it." % device
-
-    if is_busy:
-        if IS_LINUX:
-            return (
-                "%s is busy. Another program (QGroundControl, a second copy of this tool, "
-                "or a serial monitor) may have it open. Note ModemManager also grabs "
-                "/dev/ttyACM* for a few seconds after plug-in, so a retry often works." % device
-            )
-        return "%s is in use by another application." % device
-
-    return "Error opening %s: %s" % (device, text)
-# def
-
-
-def probe_pico(device, timeout=2.0):
-    """Fallback identification: open the port and look for the Pico's line format."""
-    try:
-        with serial.Serial(device, baudrate=SERIAL_BAUD, timeout=0.3) as ser:
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                line = ser.readline()
-                if not line:
-                    continue
-                text = line.decode("ascii", errors="ignore").strip()
-                if text and POSITION_REGEX.search(text):
-                    return True
-    except (serial.SerialException, OSError) as e:
-        print(describe_serial_error(device, e))
-
-    return False
 # def
 
 
@@ -877,9 +733,9 @@ class PositionReader:
 
     def position_to_degrees(self, side, raw_position):
         if side == "LEFT":
-            return (self.left_scaler * raw_position) + self.left_offset
-        elif side == "RIGHT":
-            return -(self.right_scaler * raw_position) + self.right_offset
+            return position_to_degrees(side, raw_position, self.left_scaler, self.left_offset)
+        if side == "RIGHT":
+            return position_to_degrees(side, raw_position, self.right_scaler, self.right_offset)
         return None
     # def
 

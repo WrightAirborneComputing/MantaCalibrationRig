@@ -290,6 +290,26 @@ never register as reached — the move then runs to its 60 s timeout.
 
 ---
 
+## D. Duplicated wire format between the two tools — **FIXED**
+
+*Found after `ISSUES.md` was written; fixed on `fix/issues-round-1`.*
+
+`pico_monitor.py` re-implemented `POSITION_REGEX`, `SERIAL_BAUD`, the Pico VID, the
+settings loader, the angle conversion and port discovery. The regex was the dangerous one:
+issue 9's firmware change is exactly the edit that would silently desync two copies.
+
+Extracted into `manta_common.py`, imported by both. It deliberately depends on nothing
+beyond pyserial and the standard library — no tkinter, no pymavlink — which is why
+`pico_monitor.py` could not simply import `MantaTrimmer` (the guarded tkinter import
+raises `SystemExit`, and `mavutil` comes with it). `probe_mavlink` and `discover_ports`
+stay in `MantaTrimmer.py` since they need `mavutil`.
+
+Also widened `describe_serial_error` to recognise pyserial's "multiple access on port"
+wording, which is what you actually get when another process holds the device — it was
+previously reported as a generic error rather than as "busy".
+
+---
+
 ## 9. Pico firmware sample rate limits angle resolution — Informational
 
 **Location:** `utime.sleep(0.1)` in [pico/main.py:21](pico/main.py#L21).
