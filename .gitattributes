@@ -1,0 +1,12 @@
+# MantaTrimmer.py and pico/main.py were authored on Windows and are stored with
+# CRLF. Take git out of the line-ending business entirely: store the bytes as
+# they are, on every platform, so nothing silently rewrites them.
+#
+# This matters because a tool that flips the endings turns a 400-line review into
+# a 5000-line whole-file diff, which is how this branch nearly shipped. If you
+# edit these files with a script, write bytes, not text.
+*.py -text
+*.md -text
+*.json -text
+*.txt -text
+*.csv -text

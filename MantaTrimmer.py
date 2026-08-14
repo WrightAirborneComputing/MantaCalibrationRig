@@ -26,13 +26,61 @@ import serial.tools.list_ports
 import csv
 from datetime import datetime
 
+from manta_common import (
+    APP_DIR,
+    IS_LINUX,
+    IS_WINDOWS,
+    SERIAL_BAUD,
+    PICO_VIDS,
+    PICO_VID_PIDS,
+    FCU_VID_HINTS,
+    POSITION_REGEX,
+    PortCandidate,
+    describe_serial_error,
+    find_candidate,
+    list_serial_ports,
+    position_to_degrees,
+    probe_pico,
+)
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Bounds on the instrumentation pane. Overflow only drops lines from the GUI
+# widget - _ORIGINAL_PRINT still puts everything on stdout.
+# Position samples are averaged over a trailing time window rather than being
+# consumed. The window must be at least 2x the Pico's 10 Hz sample period so a
+# dropped serial line still leaves samples to average, and shorter than
+# PositionReader.is_streaming()'s max_age so "link dead" and "window empty"
+# cannot disagree. 0.5 s gives ~5 samples (about 2.2x noise reduction) for 250 ms
+# of group delay, which is well inside the calibration mover's 250 ms step cadence.
+POSITION_WINDOW_S = 0.5
+POSITION_HISTORY = 200          # ~20 s of backlog at 10 Hz
+
+MAX_LOG_QUEUE = 2000
+MAX_LOG_LINES = 2000
+
+# Column order of calibration_log.csv. The existing file on disk ends in
+# "Folding?", which was hand-added; the writer must match it exactly.
+CAL_LOG_COLUMNS = [
+    "date",
+    "time",
+    "drone_name",
+    "uid",
+    "angle_neg_degs",
+    "angle_pos_degs",
+    "angle_trim_degs",
+    "left_min",
+    "left_max",
+    "left_trim",
+    "right_min",
+    "right_max",
+    "right_trim",
+    "Folding?",
+]
 
 
 class InstrumentationLog:
     def __init__(self):
-        self._queue = queue.Queue()
+        self._queue = queue.Queue(maxsize=MAX_LOG_QUEUE)
     # def
 
     def write(self, text):
@@ -65,164 +113,6 @@ def print(*args, **kwargs):
 
     _ORIGINAL_PRINT(*args, **kwargs)
     INSTRUMENTATION_LOG.write(text)
-# def
-
-
-IS_LINUX = sys.platform.startswith("linux")
-IS_WINDOWS = sys.platform.startswith("win")
-
-SERIAL_BAUD = 115200
-
-# The rig Pico enumerates as a Raspberry Pi USB CDC device. This is the
-# authoritative way to spot it; probe_pico() is only a fallback.
-PICO_VIDS = {0x2E8A}
-PICO_VID_PIDS = {
-    (0x2E8A, 0x0005),  # RP2040 CDC, MicroPython
-    (0x2E8A, 0x000A),  # RP2040 CDC, CircuitPython
-}
-
-# Only a hint used to order the MAVLink probe. The heartbeat is what decides.
-FCU_VID_HINTS = {
-    0x3185,  # ARK Electronics
-    0x26AC,  # 3DR / PX4
-    0x1209,  # pid.codes (generic PX4 boards)
-    0x0483,  # STMicroelectronics
-}
-
-# One line per sample from the Pico: "[<left_u16>/<right_u16>]"
-POSITION_REGEX = re.compile(r"\[(?P<position1>-?\d+)\s*/\s*(?P<position2>-?\d+)\]")
-
-
-class PortCandidate:
-    def __init__(self, info):
-        self.device = info.device
-        self.description = info.description or ""
-        self.hwid = info.hwid or ""
-        self.vid = info.vid
-        self.pid = info.pid
-        self.manufacturer = info.manufacturer or ""
-        self.product = info.product or ""
-        self.serial_number = info.serial_number or ""
-    # def
-
-    def label(self):
-        detail = ("%s %s" % (self.manufacturer, self.product)).strip()
-        if not detail:
-            detail = self.description.strip()
-        if not detail or detail == "n/a":
-            return self.device
-        return "%s  -  %s" % (self.device, detail)
-    # def
-
-    def is_pico_by_id(self):
-        if self.vid is None:
-            return False
-        if (self.vid, self.pid) in PICO_VID_PIDS:
-            return True
-        return self.vid in PICO_VIDS
-    # def
-
-    def is_fcu_by_id(self):
-        return self.vid is not None and self.vid in FCU_VID_HINTS
-    # def
-
-    def is_legacy(self):
-        # Motherboard UARTs: no USB VID and nothing useful in hwid.
-        if self.vid is not None:
-            return False
-        return self.device.startswith("/dev/ttyS") or self.hwid in ("", "n/a")
-    # def
-# class
-
-
-def list_serial_ports(include_legacy=False):
-    candidates = []
-
-    try:
-        infos = serial.tools.list_ports.comports()
-    except Exception as e:
-        print("Failed to enumerate serial ports: %s" % str(e))
-        return candidates
-
-    for info in infos:
-        candidate = PortCandidate(info)
-        if candidate.is_legacy() and not include_legacy:
-            continue
-        candidates.append(candidate)
-
-    # USB devices first, then stable ordering by device name.
-    candidates.sort(key=lambda c: (c.vid is None, c.device))
-    return candidates
-# def
-
-
-def find_candidate(ports, device):
-    if not device:
-        return None
-    for candidate in ports:
-        if candidate.device == device:
-            return candidate
-    return None
-# def
-
-
-def describe_serial_error(device, exc):
-    text = str(exc)
-    lowered = text.lower()
-
-    errno_value = getattr(exc, "errno", None)
-
-    is_permission = (
-        isinstance(exc, PermissionError)
-        or errno_value == errno.EACCES
-        or "permission denied" in lowered
-        or "access is denied" in lowered
-    )
-    is_busy = (
-        errno_value == errno.EBUSY
-        or "resource busy" in lowered
-        or "device or resource busy" in lowered
-        or "in use" in lowered
-    )
-
-    if is_permission:
-        if IS_LINUX:
-            return (
-                "Permission denied opening %s. Add yourself to the dialout group:\n"
-                "    sudo usermod -aG dialout $USER\n"
-                "then log out and back in." % device
-            )
-        return "Permission denied opening %s. Close any program already using it." % device
-
-    if is_busy:
-        if IS_LINUX:
-            return (
-                "%s is busy. Another program (QGroundControl, a second copy of this tool, "
-                "or a serial monitor) may have it open. Note ModemManager also grabs "
-                "/dev/ttyACM* for a few seconds after plug-in, so a retry often works." % device
-            )
-        return "%s is in use by another application." % device
-
-    return "Error opening %s: %s" % (device, text)
-# def
-
-
-def probe_pico(device, timeout=2.0):
-    """Fallback identification: open the port and look for the Pico's line format."""
-    try:
-        with serial.Serial(device, baudrate=SERIAL_BAUD, timeout=0.3) as ser:
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                line = ser.readline()
-                if not line:
-                    continue
-                text = line.decode("ascii", errors="ignore").strip()
-                if text and POSITION_REGEX.search(text):
-                    return True
-    except (serial.SerialException, OSError) as e:
-        print(describe_serial_error(device, e))
-
-    return False
 # def
 
 
@@ -596,6 +486,10 @@ class DroneInterface:
         if not self.is_connected():
             return
 
+        # Test escape hatch: exercise the whole app without moving surfaces.
+        if os.environ.get("MANTA_NO_ACTUATE"):
+            return
+
         MAV_CMD_ACTUATOR_TEST = 310
         timeout_s = 60.0
 
@@ -623,10 +517,11 @@ class PositionReader:
         self.port = port
         self.baud = SERIAL_BAUD
         self.timeout = 1.0
-        self.num_samples = 10
 
-        self._queue_left = deque()
-        self._queue_right = deque()
+        # (monotonic_timestamp, raw_value) pairs. Read non-destructively by any
+        # number of consumers; maxlen bounds the backlog.
+        self._queue_left = deque(maxlen=POSITION_HISTORY)
+        self._queue_right = deque(maxlen=POSITION_HISTORY)
         self._lock = threading.Lock()
         self._thread = None
         self._stop = threading.Event()
@@ -635,7 +530,12 @@ class PositionReader:
         self.last_error = None
         self._last_sample_time = 0.0
 
+        # Serialises every read-modify-write of the settings file. Reentrant
+        # because set_center() mutates and then saves through one lock scope.
+        self._settings_lock = threading.RLock()
+
         self.calibration_file = os.path.join(APP_DIR, "settings.json")
+        self.backup_file = self.calibration_file + ".bak"
 
         self.drone_name = ""
 
@@ -654,6 +554,34 @@ class PositionReader:
         self.angle_trim_degs = -5.0
 
         self.load_calibration()
+    # def
+
+    def _read_settings_file(self):
+        """Return the settings document as a dict. Never raises; {} on any problem."""
+        try:
+            with open(self.calibration_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    # def
+
+    def _write_settings_atomic(self, data, path=None):
+        """Write the whole document via a temp file and an atomic rename.
+
+        os.replace is atomic on Linux and Windows, so a crash or a concurrent
+        reader can never observe a half-written file. The fsync matters because
+        the rig gets powered off abruptly.
+        """
+        path = self.calibration_file if path is None else path
+        tmp = path + ".tmp"
+
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp, path)
     # def
 
     def load_calibration(self):
@@ -704,89 +632,110 @@ class PositionReader:
                 )
             )
 
+            # Keep a known-good copy. If the live file is ever damaged, this is
+            # the difference between a restore and re-calibrating the rig.
+            try:
+                self._write_settings_atomic(data, self.backup_file)
+            except Exception as e:
+                print("Could not write calibration backup %s: %s" % (self.backup_file, str(e)))
+
         except Exception as e:
-            print("Failed to load calibration from %s: %s" % (self.calibration_file, str(e)))
+            print("FAILED TO LOAD CALIBRATION from %s: %s" % (self.calibration_file, str(e)))
+            print("Running on built-in defaults - your rig calibration is NOT loaded.")
+            if os.path.exists(self.backup_file):
+                print("A previous good copy is at %s - copy it over %s and restart."
+                      % (self.backup_file, self.calibration_file))
     # def
 
-    def save_calibration(self):
-        data = {
-            "LEFT": {
-                "scaler": self.left_scaler,
-                "offset": self.left_offset,
-            },
-            "RIGHT": {
-                "scaler": self.right_scaler,
-                "offset": self.right_offset,
-            },
-            "ANGLES": {
+    def _section_payload(self, section):
+        if section == "LEFT":
+            return {"scaler": self.left_scaler, "offset": self.left_offset}
+        if section == "RIGHT":
+            return {"scaler": self.right_scaler, "offset": self.right_offset}
+        if section == "ANGLES":
+            return {
                 "angle_neg_degs": self.angle_neg_degs,
                 "angle_pos_degs": self.angle_pos_degs,
                 "angle_trim_degs": self.angle_trim_degs,
-            },
-            "PORTS": {
-                "pico": self.pico_port,
-                "drone": self.drone_port,
-            },
-        }
-
-        try:
-            with open(self.calibration_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
-
-            print(
-                "Saved calibration to %s: LEFT scaler=%.6f offset=%.6f, RIGHT scaler=%.6f offset=%.6f, angles=(%.2f, %.2f, %.2f)"
-                % (
-                    self.calibration_file,
-                    self.left_scaler,
-                    self.left_offset,
-                    self.right_scaler,
-                    self.right_offset,
-                    self.angle_neg_degs,
-                    self.angle_pos_degs,
-                    self.angle_trim_degs,
-                )
-            )
-
-        except Exception as e:
-            print("Failed to save calibration to %s: %s" % (self.calibration_file, str(e)))
+            }
+        if section == "PORTS":
+            return {"pico": self.pico_port, "drone": self.drone_port}
+        return {}
     # def
 
-    def set_drone_name(self, drone_name):
-        self.drone_name = str(drone_name)
-        self.save_calibration()
+    def save_calibration(self, sections=None):
+        """Merge the named sections into what is on disk, then replace atomically.
+
+        Only the sections the caller actually changed are written. This object is
+        constructed once and never reloads, so writing every section on every save
+        would let an unrelated save - recording a port, say - stamp this instance's
+        stale calibration over newer values written by another instance or by hand.
+
+        sections=None means "all of them", for a deliberate full save.
+        """
+        if sections is None:
+            sections = ("LEFT", "RIGHT", "ANGLES", "PORTS")
+
+        with self._settings_lock:
+            data = self._read_settings_file()
+
+            for section in sections:
+                data.setdefault(section, {}).update(self._section_payload(section))
+
+            try:
+                self._write_settings_atomic(data)
+
+                print(
+                    "Saved calibration to %s: LEFT scaler=%.6f offset=%.6f, RIGHT scaler=%.6f offset=%.6f, angles=(%.2f, %.2f, %.2f)"
+                    % (
+                        self.calibration_file,
+                        self.left_scaler,
+                        self.left_offset,
+                        self.right_scaler,
+                        self.right_offset,
+                        self.angle_neg_degs,
+                        self.angle_pos_degs,
+                        self.angle_trim_degs,
+                    )
+                )
+
+            except Exception as e:
+                print("Failed to save calibration to %s: %s" % (self.calibration_file, str(e)))
     # def
 
     def set_remembered_ports(self, pico_port=None, drone_port=None):
-        changed = False
+        with self._settings_lock:
+            changed = False
 
-        if pico_port is not None and pico_port != self.pico_port:
-            self.pico_port = pico_port
-            changed = True
+            if pico_port is not None and pico_port != self.pico_port:
+                self.pico_port = pico_port
+                changed = True
 
-        if drone_port is not None and drone_port != self.drone_port:
-            self.drone_port = drone_port
-            changed = True
+            if drone_port is not None and drone_port != self.drone_port:
+                self.drone_port = drone_port
+                changed = True
 
-        if changed:
-            self.save_calibration()
+            if changed:
+                self.save_calibration(("PORTS",))
     # def
 
     def set_angle_settings(self, angle_neg_degs=None, angle_pos_degs=None, angle_trim_degs=None):
-        if angle_neg_degs is not None:
-            self.angle_neg_degs = float(angle_neg_degs)
-        if angle_pos_degs is not None:
-            self.angle_pos_degs = float(angle_pos_degs)
-        if angle_trim_degs is not None:
-            self.angle_trim_degs = float(angle_trim_degs)
+        with self._settings_lock:
+            if angle_neg_degs is not None:
+                self.angle_neg_degs = float(angle_neg_degs)
+            if angle_pos_degs is not None:
+                self.angle_pos_degs = float(angle_pos_degs)
+            if angle_trim_degs is not None:
+                self.angle_trim_degs = float(angle_trim_degs)
 
-        self.save_calibration()
+            self.save_calibration(("ANGLES",))
     # def
 
     def position_to_degrees(self, side, raw_position):
         if side == "LEFT":
-            return (self.left_scaler * raw_position) + self.left_offset
-        elif side == "RIGHT":
-            return -(self.right_scaler * raw_position) + self.right_offset
+            return position_to_degrees(side, raw_position, self.left_scaler, self.left_offset)
+        if side == "RIGHT":
+            return position_to_degrees(side, raw_position, self.right_scaler, self.right_offset)
         return None
     # def
 
@@ -796,35 +745,37 @@ class PositionReader:
             print("No data for centering %s" % side)
             return
 
-        if side == "LEFT":
-            self.left_offset = -(self.left_scaler * raw)
-            print("Left centred. Scaler=%.4f Offset = %.4f" % (self.left_scaler, self.left_offset))
-            self.save_calibration()
+        with self._settings_lock:
+            if side == "LEFT":
+                self.left_offset = -(self.left_scaler * raw)
+                print("Left centred. Scaler=%.4f Offset = %.4f" % (self.left_scaler, self.left_offset))
+                self.save_calibration(("LEFT",))
 
-        elif side == "RIGHT":
-            self.right_offset = (self.right_scaler * raw)
-            print("Right centred. Scaler=%.4f Offset = %.4f" % (self.right_scaler, self.right_offset))
-            self.save_calibration()
+            elif side == "RIGHT":
+                self.right_offset = (self.right_scaler * raw)
+                print("Right centred. Scaler=%.4f Offset = %.4f" % (self.right_scaler, self.right_offset))
+                self.save_calibration(("RIGHT",))
     # def
 
     def set_scaler_and_offset(self, side, scaler=None, offset=None):
-        if side == "LEFT":
-            if scaler is not None:
-                self.left_scaler = float(scaler)
-            if offset is not None:
-                self.left_offset = float(offset)
+        with self._settings_lock:
+            if side == "LEFT":
+                if scaler is not None:
+                    self.left_scaler = float(scaler)
+                if offset is not None:
+                    self.left_offset = float(offset)
 
-            print("LEFT calibration set. Scaler=%.6f Offset=%.6f" % (self.left_scaler, self.left_offset))
-            self.save_calibration()
+                print("LEFT calibration set. Scaler=%.6f Offset=%.6f" % (self.left_scaler, self.left_offset))
+                self.save_calibration(("LEFT",))
 
-        elif side == "RIGHT":
-            if scaler is not None:
-                self.right_scaler = float(scaler)
-            if offset is not None:
-                self.right_offset = float(offset)
+            elif side == "RIGHT":
+                if scaler is not None:
+                    self.right_scaler = float(scaler)
+                if offset is not None:
+                    self.right_offset = float(offset)
 
-            print("RIGHT calibration set. Scaler=%.6f Offset=%.6f" % (self.right_scaler, self.right_offset))
-            self.save_calibration()
+                print("RIGHT calibration set. Scaler=%.6f Offset=%.6f" % (self.right_scaler, self.right_offset))
+                self.save_calibration(("RIGHT",))
     # def
 
     def _position_reader_loop(self):
@@ -853,16 +804,11 @@ class PositionReader:
                         except ValueError:
                             continue
 
+                        now = time.monotonic()
                         with self._lock:
-                            self._queue_left.append(p1)
-                            self._queue_right.append(p2)
-
-                            if len(self._queue_left) > 500:
-                                self._queue_left.popleft()
-                            if len(self._queue_right) > 500:
-                                self._queue_right.popleft()
-
-                            self._last_sample_time = time.time()
+                            self._queue_left.append((now, p1))
+                            self._queue_right.append((now, p2))
+                            self._last_sample_time = now
 
         except (serial.SerialException, OSError) as e:
             self.last_error = describe_serial_error(port, e)
@@ -920,7 +866,7 @@ class PositionReader:
         with self._lock:
             last = self._last_sample_time
 
-        return last > 0.0 and (time.time() - last) <= max_age
+        return last > 0.0 and (time.monotonic() - last) <= max_age
     # def
 
     def clear_queues(self):
@@ -929,8 +875,22 @@ class PositionReader:
             self._queue_right.clear()
     # def
 
-    def get_average_position_nonblocking(self, side):
-        samples = []
+    def get_average_position_nonblocking(self, side, window_s=None):
+        """Mean of every sample from the last window_s seconds.
+
+        Non-destructive: the UI, the calibration workers and the centring buttons
+        can all read concurrently and all see the same data. Previously this
+        popped samples, so with a 10 Hz producer and a 10 Hz UI consumer each
+        caller usually got one sample - and whoever asked second got None.
+
+        Returns None only when nothing has arrived within the window, which now
+        genuinely means the stream is stale.
+        """
+        window = POSITION_WINDOW_S if window_s is None else float(window_s)
+        cutoff = time.monotonic() - window
+
+        total = 0.0
+        count = 0
 
         with self._lock:
             if side == "LEFT":
@@ -940,13 +900,17 @@ class PositionReader:
             else:
                 return None
 
-            while queue_ref and len(samples) < self.num_samples:
-                samples.append(queue_ref.popleft())
+            # Newest first; entries are time-ordered, so the first stale one ends it.
+            for timestamp, value in reversed(queue_ref):
+                if timestamp < cutoff:
+                    break
+                total += value
+                count += 1
 
-        if not samples:
+        if count == 0:
             return None
 
-        return sum(samples) / float(len(samples))
+        return total / float(count)
     # def
 # class
 
@@ -971,6 +935,11 @@ class FourSliderGUI:
         # and the Tk thread runs them in _drain_gui_queue().
         self._gui_queue = queue.Queue()
 
+        # Parameter-entry widgets by key, and a generation counter per key so a
+        # superseded write cannot stamp a stale readback over a newer edit.
+        self._param_widgets = {}
+        self._param_write_seq = {}
+
         self.LEFT_OUTPUT_FUNCTION = 1201
         self.LEFT_MIN_PARAM = "PWM_MAIN_MIN5"
         self.LEFT_MAX_PARAM = "PWM_MAIN_MAX5"
@@ -990,6 +959,7 @@ class FourSliderGUI:
         self.sweep_active = False
 
         self.drone_name_var = tk.StringVar(value="")
+        self.folding_var = tk.StringVar(value="")
 
         self.angle_neg_degs = self.position_reader.angle_neg_degs
         self.angle_pos_degs = self.position_reader.angle_pos_degs
@@ -1081,13 +1051,21 @@ class FourSliderGUI:
         )
         sweep_btn.pack(pady=(8, 2), anchor="w")
 
+        folding_row = tk.Frame(angle_group, bd=1, relief="groove", padx=4, pady=4)
+        folding_row.pack(anchor="w", pady=(8, 2), fill=tk.X)
+
+        tk.Label(folding_row, text="Folding", width=10, anchor="w").pack(side=tk.LEFT, padx=(0, 5))
+        folding_check = tk.Checkbutton(folding_row, variable=self.folding_var,
+                                       onvalue="y", offvalue="")
+        folding_check.pack(side=tk.LEFT)
+
         log_cal_btn = tk.Button(
             angle_group,
             text="Log calibration",
             width=18,
             command=self.log_calibration
         )
-        log_cal_btn.pack(pady=(8, 0), anchor="w")
+        log_cal_btn.pack(pady=(2, 0), anchor="w")
 
         # LEFT group
         left_group = tk.LabelFrame(main_frame, text="Left", padx=10, pady=10)
@@ -1124,9 +1102,9 @@ class FourSliderGUI:
         self.left_max_var = tk.StringVar(value=str(left_max_param))
         self.left_trim_var = tk.StringVar(value="%.3f" % left_trim_param)
 
-        self.create_param_entry(left_params, "Left-min", self.left_min_var, self.apply_left_min)
-        self.create_param_entry(left_params, "Left-max", self.left_max_var, self.apply_left_max)
-        self.create_param_entry(left_params, "Left-trim", self.left_trim_var, self.apply_left_trim)
+        self.create_param_entry(left_params, "left_min", "Left-min", self.left_min_var, self.apply_left_min)
+        self.create_param_entry(left_params, "left_max", "Left-max", self.left_max_var, self.apply_left_max)
+        self.create_param_entry(left_params, "left_trim", "Left-trim", self.left_trim_var, self.apply_left_trim)
 
         left_pos_frame = tk.Frame(left_group, bd=1, relief="groove", padx=6, pady=6)
         left_pos_frame.pack()
@@ -1198,9 +1176,9 @@ class FourSliderGUI:
         self.right_max_var = tk.StringVar(value=str(right_max_param))
         self.right_trim_var = tk.StringVar(value="%.3f" % right_trim_param)
 
-        self.create_param_entry(right_params, "Right-min", self.right_min_var, self.apply_right_min)
-        self.create_param_entry(right_params, "Right-max", self.right_max_var, self.apply_right_max)
-        self.create_param_entry(right_params, "Right-trim", self.right_trim_var, self.apply_right_trim)
+        self.create_param_entry(right_params, "right_min", "Right-min", self.right_min_var, self.apply_right_min)
+        self.create_param_entry(right_params, "right_max", "Right-max", self.right_max_var, self.apply_right_max)
+        self.create_param_entry(right_params, "right_trim", "Right-trim", self.right_trim_var, self.apply_right_trim)
 
         right_pos_frame = tk.Frame(right_group, bd=1, relief="groove", padx=6, pady=6)
         right_pos_frame.pack()
@@ -1284,13 +1262,6 @@ class FourSliderGUI:
         return None, None
     # def
 
-    def clear_position_queues(self):
-        try:
-            self.position_reader.clear_queues()
-        except Exception as e:
-            print("Failed to clear position queues: %s" % str(e))
-    # def
-
     def start_sweep_to_csv(self):
         if self.sweep_thread is not None and self.sweep_thread.is_alive():
             print("Sweep already running")
@@ -1298,20 +1269,23 @@ class FourSliderGUI:
 
         self.stop_both_calibration()
 
+        # Read the Tk variable here, on the GUI thread, and hand the value to the
+        # worker. Tk is not thread-safe, so the worker must never touch it.
+        drone_name = self.drone_name_var.get().strip()
+        if drone_name == "":
+            drone_name = "drone"
+
         self.sweep_active = True
         self.sweep_thread = threading.Thread(
             target=self._sweep_to_csv_worker,
+            args=(drone_name,),
             daemon=True
         )
         self.sweep_thread.start()
     # def
 
-    def _sweep_to_csv_worker(self):
+    def _sweep_to_csv_worker(self, drone_name):
         try:
-            drone_name = self.drone_name_var.get().strip()
-            if drone_name == "":
-                drone_name = "drone"
-
             safe_name = self.make_safe_filename(drone_name)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             csv_filename = os.path.join(APP_DIR, "%s_%s.csv" % (safe_name, timestamp))
@@ -1345,8 +1319,10 @@ class FourSliderGUI:
                     self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, cmd)
                     self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, cmd)
 
+                    # Settle. This must stay longer than POSITION_WINDOW_S: it is
+                    # what guarantees every sample in the averaging window was
+                    # taken after the elevon finished moving.
                     time.sleep(1.0)
-                    self.clear_position_queues()
 
                     left_angle, right_angle = self.wait_for_valid_both_angles(timeout=5.0, poll_s=0.05)
 
@@ -1375,8 +1351,7 @@ class FourSliderGUI:
 
             self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, 0.0)
             self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, 0.0)
-            self.root.after(0, lambda: self.left_pos.set(0.0))
-            self.root.after(0, lambda: self.right_pos.set(0.0))
+            self.post_to_gui(self.zero_both_sliders)
 
             print("Sweep finished: %s" % csv_filename)
 
@@ -1565,9 +1540,11 @@ class FourSliderGUI:
                 print("Connecting MAVLink on %s..." % drone_device)
                 if self.drone_interface.reconnect(drone_device):
                     drone_ok = True
-                    self.refresh_params_from_drone(clear_name=True)
                     drone_text = "Drone: connected (system %s)" % self.drone_interface.master.target_system
+                    # Remember the port before the long param refresh, so a
+                    # mid-refresh failure doesn't lose a known-good port.
                     self.position_reader.set_remembered_ports(drone_port=drone_device)
+                    self.refresh_params_from_drone(clear_name=True)
                 elif self.drone_interface.last_error_kind == "open":
                     drone_text = "Drone: cannot open %s" % drone_device
                 else:
@@ -1642,6 +1619,40 @@ class FourSliderGUI:
 
     def set_var_on_gui_thread(self, text_var, value):
         self.post_to_gui(lambda: text_var.set(value))
+    # def
+
+    def call_on_gui_thread(self, fn, timeout=2.0):
+        """Run fn on the Tk thread and return its result. NEVER call from the Tk thread.
+
+        For the few places a worker must *read* a Tk variable. The timeout is
+        load-bearing: once the window closes, _drain_gui_queue stops rescheduling
+        and an unbounded wait would hang the calling worker through shutdown.
+        """
+        if self._closing:
+            return None
+
+        box = queue.Queue(maxsize=1)
+
+        def runner():
+            try:
+                box.put(("ok", fn()))
+            except Exception as e:
+                box.put(("err", e))
+        # def
+
+        self.post_to_gui(runner)
+
+        try:
+            kind, value = box.get(timeout=timeout)
+        except queue.Empty:
+            print("GUI round-trip timed out")
+            return None
+
+        if kind == "err":
+            print("GUI round-trip failed: %s" % str(value))
+            return None
+
+        return value
     # def
 
     def refresh_params_from_drone(self, clear_name=False):
@@ -1784,43 +1795,42 @@ class FourSliderGUI:
             right_max = int(self.right_max_var.get().strip())
             right_trim = float(self.right_trim_var.get().strip())
 
+            folding = self.folding_var.get().strip()
+
+            row = [
+                date_str,
+                time_str,
+                drone_name,
+                uid,
+                angle_neg,
+                angle_pos,
+                angle_trim,
+                left_min,
+                left_max,
+                left_trim,
+                right_min,
+                right_max,
+                right_trim,
+                folding,
+            ]
+
+            # The header and the row drifted apart once already; refuse rather
+            # than silently append a misaligned line. Not an assert - asserts
+            # vanish under -O and would be swallowed by the except below.
+            if len(row) != len(CAL_LOG_COLUMNS):
+                print("Refusing to log: %d values for %d columns"
+                      % (len(row), len(CAL_LOG_COLUMNS)))
+                return
+
             file_exists = os.path.exists(self.calibration_log_file)
 
             with open(self.calibration_log_file, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
 
                 if not file_exists:
-                    writer.writerow([
-                        "date",
-                        "time",
-                        "drone_name",
-                        "uid",
-                        "angle_neg_degs",
-                        "angle_pos_degs",
-                        "angle_trim_degs",
-                        "left_min",
-                        "left_max",
-                        "left_trim",
-                        "right_min",
-                        "right_max",
-                        "right_trim",
-                    ])
+                    writer.writerow(CAL_LOG_COLUMNS)
 
-                writer.writerow([
-                    date_str,
-                    time_str,
-                    drone_name,
-                    uid,
-                    angle_neg,
-                    angle_pos,
-                    angle_trim,
-                    left_min,
-                    left_max,
-                    left_trim,
-                    right_min,
-                    right_max,
-                    right_trim,
-                ])
+                writer.writerow(row)
 
             print("Calibration logged to %s" % self.calibration_log_file)
 
@@ -1846,7 +1856,10 @@ class FourSliderGUI:
                     self.right_trim_var.set("%.3f" % float(trim_val))
         # def
 
-        self.root.after(0, do_update)
+        # post_to_gui, not root.after: after() registers a Tcl command and is
+        # not safe to call from a worker thread. All 12 callers of this are
+        # calibration workers.
+        self.post_to_gui(do_update)
     # def
 
     def refresh_side_param_vars_from_drone(self, side):
@@ -1879,7 +1892,7 @@ class FourSliderGUI:
         return ok
     # def
 
-    def create_param_entry(self, parent, label, text_var, apply_callback):
+    def create_param_entry(self, parent, key, label, text_var, apply_callback):
         row = tk.Frame(parent)
         row.pack(anchor="w", pady=2)
 
@@ -1892,6 +1905,9 @@ class FourSliderGUI:
 
         btn = tk.Button(row, text="Set", width=5, command=apply_callback)
         btn.pack(side=tk.LEFT, padx=(5, 0))
+
+        # Kept so a write in flight can lock its own field - see start_param_write.
+        self._param_widgets[key] = (entry, btn)
 
         return entry
     # def
@@ -2050,20 +2066,36 @@ class FourSliderGUI:
         return None
     # def
 
+    def read_side_param_snapshot(self, side):
+        """Read a side's min/max/trim entries. Tk thread only."""
+        if side == "LEFT":
+            return (
+                self.get_int_var(self.left_min_var, self.DEFAULT_PWM_MIN),
+                self.get_int_var(self.left_max_var, self.DEFAULT_PWM_MAX),
+                self.get_float_var(self.left_trim_var, self.DEFAULT_TRIM),
+            )
+        return (
+            self.get_int_var(self.right_min_var, self.DEFAULT_PWM_MIN),
+            self.get_int_var(self.right_max_var, self.DEFAULT_PWM_MAX),
+            self.get_float_var(self.right_trim_var, self.DEFAULT_TRIM),
+        )
+    # def
+
     def get_side_expected_pwm(self, side, cmd):
+        """Called from the calibration workers, so the Tk reads are marshalled.
+
+        A snapshot taken once at worker start would be wrong here: the worker
+        rewrites min/max/trim part-way through its own run.
+        """
         if cmd is None:
             return None
 
-        if side == "LEFT":
-            pwm_min = self.get_int_var(self.left_min_var, 1000)
-            pwm_max = self.get_int_var(self.left_max_var, 2000)
-            trim = self.get_float_var(self.left_trim_var, 0.0)
-            rev = self.is_main_channel_reversed(5)
-        else:
-            pwm_min = self.get_int_var(self.right_min_var, 1000)
-            pwm_max = self.get_int_var(self.right_max_var, 2000)
-            trim = self.get_float_var(self.right_trim_var, 0.0)
-            rev = self.is_main_channel_reversed(6)
+        snapshot = self.call_on_gui_thread(lambda: self.read_side_param_snapshot(side))
+        if snapshot is None:
+            return None
+
+        pwm_min, pwm_max, trim = snapshot
+        rev = self.is_main_channel_reversed(5 if side == "LEFT" else 6)
 
         return self.expected_pwm(cmd, pwm_min, pwm_max, trim, rev)
     # def
@@ -2104,7 +2136,7 @@ class FourSliderGUI:
                 reached = True
             elif target_angle_deg > 0.0 and angle_deg >= target_angle_deg:
                 reached = True
-            elif target_angle_deg == 0.0 and abs(angle_deg) <= 0.5:
+            elif abs(target_angle_deg) < 1e-6 and abs(angle_deg) <= 0.5:
                 reached = True
 
             if reached:
@@ -2296,62 +2328,147 @@ class FourSliderGUI:
     # def
 
     def clear_left(self):
-        try:
-            left_min = 900
-            left_max = 2100
-            left_trim = 0.0
-
-            ok_min = self.drone_interface.set_param_value(self.LEFT_MIN_PARAM, int, left_min)
-            ok_max = self.drone_interface.set_param_value(self.LEFT_MAX_PARAM, int, left_max)
-            ok_trim = self.drone_interface.set_param_value(self.LEFT_TRIM_PARAM, float, left_trim)
-
-            if ok_min:
-                self.left_min_var.set(str(left_min))
-            if ok_max:
-                self.left_max_var.set(str(left_max))
-            if ok_trim:
-                self.left_trim_var.set("%.3f" % left_trim)
-
-            self.left_pos.set(0.0)
-
-            print("Left cleared")
-        except Exception as e:
-            print("Failed to clear left: %s" % str(e))
+        self.start_side_clear("LEFT")
     # def
 
     def clear_right(self):
+        self.start_side_clear("RIGHT")
+    # def
+
+    def start_side_clear(self, side):
+        """Reset one side's min/max/trim. Three writes, so up to 15 s - off-thread."""
+        if self.is_calibration_active(side):
+            print("%s is calibrating - not clearing" % side)
+            return
+
+        if side == "LEFT":
+            keys = ["left_min", "left_max", "left_trim"]
+            params = (self.LEFT_MIN_PARAM, self.LEFT_MAX_PARAM, self.LEFT_TRIM_PARAM)
+            slider = self.left_pos
+        else:
+            keys = ["right_min", "right_max", "right_trim"]
+            params = (self.RIGHT_MIN_PARAM, self.RIGHT_MAX_PARAM, self.RIGHT_TRIM_PARAM)
+            slider = self.right_pos
+
+        for key in keys:
+            self._param_write_seq[key] = self._param_write_seq.get(key, 0) + 1
+
+        self.set_param_widgets_enabled(keys, False)
+        slider.set(0.0)
+
+        threading.Thread(
+            target=self._side_clear_worker,
+            args=(side, keys, params),
+            daemon=True
+        ).start()
+    # def
+
+    def _side_clear_worker(self, side, keys, params):
+        min_param, max_param, trim_param = params
+        clear_min = 900
+        clear_max = 2100
+        clear_trim = 0.0
+
+        results = {}
         try:
-            right_min = 900
-            right_max = 2100
-            right_trim = 0.0
+            if self.drone_interface.set_param_value(min_param, int, clear_min):
+                results[keys[0]] = str(clear_min)
+            if self.drone_interface.set_param_value(max_param, int, clear_max):
+                results[keys[1]] = str(clear_max)
+            if self.drone_interface.set_param_value(trim_param, float, clear_trim):
+                results[keys[2]] = "%.3f" % clear_trim
 
-            ok_min = self.drone_interface.set_param_value(self.RIGHT_MIN_PARAM, int, right_min)
-            ok_max = self.drone_interface.set_param_value(self.RIGHT_MAX_PARAM, int, right_max)
-            ok_trim = self.drone_interface.set_param_value(self.RIGHT_TRIM_PARAM, float, right_trim)
-
-            if ok_min:
-                self.right_min_var.set(str(right_min))
-            if ok_max:
-                self.right_max_var.set(str(right_max))
-            if ok_trim:
-                self.right_trim_var.set("%.3f" % right_trim)
-
-            self.right_pos.set(0.0)
-
-            print("Right cleared")
+            print("%s cleared" % side)
         except Exception as e:
-            print("Failed to clear right: %s" % str(e))
+            print("Failed to clear %s: %s" % (side, str(e)))
+
+        def finish():
+            if self._closing:
+                return
+            self.set_param_widgets_enabled(keys, True)
+            for key, text in results.items():
+                entry_var = self._param_text_var(key)
+                if entry_var is not None:
+                    entry_var.set(text)
+        # def
+
+        self.post_to_gui(finish)
+    # def
+
+    def _param_text_var(self, key):
+        return {
+            "left_min": self.left_min_var,
+            "left_max": self.left_max_var,
+            "left_trim": self.left_trim_var,
+            "right_min": self.right_min_var,
+            "right_max": self.right_max_var,
+            "right_trim": self.right_trim_var,
+        }.get(key)
+    # def
+
+    def set_param_widgets_enabled(self, keys, enabled):
+        """Tk thread. Lock a field while its write is in flight."""
+        for key in keys:
+            widgets = self._param_widgets.get(key)
+            if widgets is None:
+                continue
+            entry, btn = widgets
+            # readonly rather than disabled: the value stays legible.
+            entry.config(state="normal" if enabled else "readonly")
+            btn.config(state="normal" if enabled else "disabled",
+                       text="Set" if enabled else "...")
+    # def
+
+    def start_param_write(self, key, side, label, param_name, py_type, value, text_var, fmt):
+        """GUI thread: lock the field and hand the blocking write to a worker.
+
+        set_param_value retries to a 5 s deadline and the readback adds another,
+        so doing this inline froze the whole window for up to 10 s per press.
+        """
+        if self.is_calibration_active(side):
+            print("%s is calibrating - not writing %s" % (side, param_name))
+            return
+
+        print("%s [%s]" % (label, fmt % value))
+
+        self._param_write_seq[key] = self._param_write_seq.get(key, 0) + 1
+        seq = self._param_write_seq[key]
+
+        self.set_param_widgets_enabled([key], False)
+
+        threading.Thread(
+            target=self._param_write_worker,
+            args=(key, param_name, py_type, value, text_var, fmt, seq),
+            daemon=True
+        ).start()
+    # def
+
+    def _param_write_worker(self, key, param_name, py_type, value, text_var, fmt, seq):
+        confirmed = None
+        try:
+            if self.drone_interface.set_param_value(param_name, py_type, value):
+                confirmed = self.drone_interface.get_param(param_name, py_type)
+        except Exception as e:
+            print("Failed to set %s: %s" % (param_name, str(e)))
+
+        def finish():
+            if self._closing:
+                return
+            # Re-enable unconditionally, or a superseded write leaves the field
+            # locked forever. Only the write-back is gated on the generation.
+            self.set_param_widgets_enabled([key], True)
+            if confirmed is not None and seq == self._param_write_seq.get(key):
+                text_var.set(fmt % confirmed)
+        # def
+
+        self.post_to_gui(finish)
     # def
 
     def apply_left_min(self):
         try:
             value = self.parse_int_param_entry(self.left_min_var)
-            print("Left-min [%d]" % value)
-            ok = self.drone_interface.set_param_value(self.LEFT_MIN_PARAM, int, value)
-            if ok:
-                confirmed = self.drone_interface.get_param(self.LEFT_MIN_PARAM, int)
-                if confirmed is not None:
-                    self.left_min_var.set(str(confirmed))
+            self.start_param_write("left_min", "LEFT", "Left-min",
+                                   self.LEFT_MIN_PARAM, int, value, self.left_min_var, "%d")
         except Exception as e:
             print("Failed to set left min: %s" % str(e))
     # def
@@ -2359,12 +2476,8 @@ class FourSliderGUI:
     def apply_left_max(self):
         try:
             value = self.parse_int_param_entry(self.left_max_var)
-            print("Left-max [%d]" % value)
-            ok = self.drone_interface.set_param_value(self.LEFT_MAX_PARAM, int, value)
-            if ok:
-                confirmed = self.drone_interface.get_param(self.LEFT_MAX_PARAM, int)
-                if confirmed is not None:
-                    self.left_max_var.set(str(confirmed))
+            self.start_param_write("left_max", "LEFT", "Left-max",
+                                   self.LEFT_MAX_PARAM, int, value, self.left_max_var, "%d")
         except Exception as e:
             print("Failed to set left max: %s" % str(e))
     # def
@@ -2372,12 +2485,8 @@ class FourSliderGUI:
     def apply_left_trim(self):
         try:
             value = self.parse_trim_param_entry(self.left_trim_var)
-            print("Left-trim [%.3f]" % value)
-            ok = self.drone_interface.set_param_value(self.LEFT_TRIM_PARAM, float, value)
-            if ok:
-                confirmed = self.drone_interface.get_param(self.LEFT_TRIM_PARAM, float)
-                if confirmed is not None:
-                    self.left_trim_var.set("%.3f" % confirmed)
+            self.start_param_write("left_trim", "LEFT", "Left-trim",
+                                   self.LEFT_TRIM_PARAM, float, value, self.left_trim_var, "%.3f")
         except Exception as e:
             print("Failed to set left trim: %s" % str(e))
     # def
@@ -2385,12 +2494,8 @@ class FourSliderGUI:
     def apply_right_min(self):
         try:
             value = self.parse_int_param_entry(self.right_min_var)
-            print("Right-min [%d]" % value)
-            ok = self.drone_interface.set_param_value(self.RIGHT_MIN_PARAM, int, value)
-            if ok:
-                confirmed = self.drone_interface.get_param(self.RIGHT_MIN_PARAM, int)
-                if confirmed is not None:
-                    self.right_min_var.set(str(confirmed))
+            self.start_param_write("right_min", "RIGHT", "Right-min",
+                                   self.RIGHT_MIN_PARAM, int, value, self.right_min_var, "%d")
         except Exception as e:
             print("Failed to set right min: %s" % str(e))
     # def
@@ -2398,12 +2503,8 @@ class FourSliderGUI:
     def apply_right_max(self):
         try:
             value = self.parse_int_param_entry(self.right_max_var)
-            print("Right-max [%d]" % value)
-            ok = self.drone_interface.set_param_value(self.RIGHT_MAX_PARAM, int, value)
-            if ok:
-                confirmed = self.drone_interface.get_param(self.RIGHT_MAX_PARAM, int)
-                if confirmed is not None:
-                    self.right_max_var.set(str(confirmed))
+            self.start_param_write("right_max", "RIGHT", "Right-max",
+                                   self.RIGHT_MAX_PARAM, int, value, self.right_max_var, "%d")
         except Exception as e:
             print("Failed to set right max: %s" % str(e))
     # def
@@ -2411,12 +2512,8 @@ class FourSliderGUI:
     def apply_right_trim(self):
         try:
             value = self.parse_trim_param_entry(self.right_trim_var)
-            print("Right-trim [%.3f]" % value)
-            ok = self.drone_interface.set_param_value(self.RIGHT_TRIM_PARAM, float, value)
-            if ok:
-                confirmed = self.drone_interface.get_param(self.RIGHT_TRIM_PARAM, float)
-                if confirmed is not None:
-                    self.right_trim_var.set("%.3f" % confirmed)
+            self.start_param_write("right_trim", "RIGHT", "Right-trim",
+                                   self.RIGHT_TRIM_PARAM, float, value, self.right_trim_var, "%.3f")
         except Exception as e:
             print("Failed to set right trim: %s" % str(e))
     # def
@@ -2530,6 +2627,13 @@ class FourSliderGUI:
         lines = INSTRUMENTATION_LOG.drain()
         if lines:
             self.log_text.insert(tk.END, "".join(lines))
+
+            # Trim from the top, or a long calibration session grows the widget
+            # without limit.
+            line_count = int(self.log_text.index("end-1c").split(".")[0])
+            if line_count > MAX_LOG_LINES:
+                self.log_text.delete("1.0", "%d.0" % (line_count - MAX_LOG_LINES + 1))
+
             self.log_text.see(tk.END)
         self.root.after(100, self.update_log_window)
     # def

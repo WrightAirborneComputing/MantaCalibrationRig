@@ -15,6 +15,8 @@ ports are detected automatically — see [Port detection](#port-detection).
 | Path | What it is |
 |---|---|
 | `MantaTrimmer.py` | The desktop GUI. This is the tool you run. |
+| `manta_common.py` | Shared constants and helpers (wire format, USB IDs, port discovery, angle maths). No tkinter or pymavlink, so it imports on a headless box. |
+| `pico_monitor.py` | CLI diagnostic: streams the Pico's raw pot data with the conversion shown at every stage. |
 | `pico/main.py` | MicroPython firmware for the Pico. Copy to the Pico as `main.py`. |
 | `settings.json` | Persisted pot scalers/offsets, target angles, and last-used ports. |
 | `calibration_log.csv` | Append-only record of every logged calibration. |

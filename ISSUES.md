@@ -9,7 +9,33 @@ Line references point at `MantaTrimmer.py` as of that branch. Issues in the dele
 
 ---
 
-## 1. Tk variables are read from worker threads — High
+## 1. Tk variables are read from worker threads — High — **FIXED**
+
+*Fixed on `fix/issues-round-1`.* Four changes:
+
+- `_set_side_param_vars_on_gui_thread` now uses `post_to_gui` rather than `root.after` —
+  one line covering all 12 calibration-worker call sites. `after()` registers a Tcl
+  command and is itself unsafe off the Tk thread, so the "correct" pattern was only ever
+  half right.
+- The sweep worker's two `root.after` calls collapse to one `post_to_gui`.
+- `drone_name_var.get()` is read on the GUI thread in `start_sweep_to_csv` and passed to
+  the worker as an argument.
+- `get_side_expected_pwm` goes through a new `call_on_gui_thread(fn, timeout=2.0)`, which
+  runs a read on the Tk thread and returns its result over a one-slot queue. A
+  start-of-run snapshot would have been wrong here: the calibration worker rewrites
+  min/max/trim part-way through its own run. The timeout and `_closing` check are
+  load-bearing — once the window closes, `_drain_gui_queue` stops rescheduling and an
+  unbounded wait would hang the worker through shutdown.
+
+Verified under Xvfb with a real `mainloop`: 4 reader threads and 4 writer threads for
+7.6 s, 600 marshalled reads and 600 marshalled writes, zero cross-thread errors, correct
+round-trip values, and an immediate return on the closing path.
+
+Original report follows.
+
+---
+
+## 1a. (original text) Tk variables are read from worker threads
 
 **Location:** `_sweep_to_csv_worker` reads `drone_name_var.get()` at
 [MantaTrimmer.py:1311](MantaTrimmer.py#L1311); the calibration workers reach
@@ -34,7 +60,35 @@ remaining call sites should be migrated to `post_to_gui` as part of this fix.
 
 ---
 
-## 2. Blocking MAVLink calls run on the GUI thread — High
+## 2. Blocking MAVLink calls run on the GUI thread — High — **FIXED**
+
+*Fixed on `fix/issues-round-1`.* The six `apply_*` callbacks and `clear_left`/`clear_right`
+now hand their writes to a worker and report back through `post_to_gui`.
+
+`clear_left`/`clear_right` were worse than the issue originally recorded — three
+`set_param_value` calls each, up to 15 s of frozen window.
+
+There is no clean way to thread a write while the entry stays editable: typing a new value
+mid-flight means the completion callback stamps the FCU's readback of the *old* value over
+the edit. Three layers handle it:
+
+1. The entry goes `readonly` (value stays legible) and the Set button `disabled` with text
+   `"..."` for the duration, so a stale edit cannot be created.
+2. A per-key generation counter — a superseded write re-enables the widgets but does not
+   write its readback back. Re-enabling is unconditional, or a superseded write would
+   leave the field locked forever.
+3. Writes are refused outright while that side is calibrating, since the calibration
+   worker writes the same parameters and there is no arbitration between them.
+
+Verified under Xvfb against a simulated 3 s-per-write FCU: 68 UI ticks during a single
+write and 208 through a 9 s clear (pre-fix: zero, frozen), widgets lock and re-enable
+correctly, superseded writes drop their readback, and calibration-time writes are refused.
+
+Original report follows.
+
+---
+
+## 2a. (original text) Blocking MAVLink calls run on the GUI thread
 
 **Location:** `apply_left_min` at [MantaTrimmer.py:2346](MantaTrimmer.py#L2346) and its
 five sibling apply callbacks.
@@ -49,7 +103,38 @@ and show a pending state until a `post_to_gui` completion callback re-enables it
 
 ---
 
-## 3. Position samples are destructively consumed — High
+## 3. Position samples are destructively consumed — High — **FIXED**
+
+*Fixed on `fix/issues-round-1`.* This was the cause of the reported **"Zero angle"
+failure**: clicking it usually logged `No data for centering LEFT` and did nothing,
+taking several clicks to land.
+
+`set_center` read through the same popping getter as `update_labels`, which drains both
+queues at 10 Hz against a 10 Hz producer — so the button competed with the label refresh
+for the same single sample and lost most of the time. Measured on the pre-fix code with a
+simulated 10 Hz UI consumer: **26 of 40 centring attempts failed**. Post-fix: **0 of 40**.
+
+Samples are now `(monotonic_timestamp, raw)` pairs in a `maxlen`-bounded deque, and the
+getter *peeks* every sample newer than `POSITION_WINDOW_S` (0.5 s) instead of popping. Any
+number of consumers read concurrently and all see the same data. `None` now means
+"nothing within the window", i.e. genuinely stale, rather than "someone else got there
+first".
+
+Secondary benefit: centring now averages ~5 samples rather than one, so the zero point no
+longer carries the full ADC noise of a single reading — `num_samples = 10` had never
+actually applied, and that attribute is now gone.
+
+`clear_position_queues` and its call in the sweep were deleted: post-fix they would
+destroy the window the UI is concurrently displaying and force the following
+`wait_for_valid_both_angles` to wait a full producer period for nothing. The sweep's 1 s
+settle already guarantees every windowed sample is post-move — a comment there records
+that this invariant is now load-bearing.
+
+Original report follows.
+
+---
+
+## 3a. (original text) Position samples are destructively consumed
 
 **Location:** `get_average_position_nonblocking` at
 [MantaTrimmer.py:932](MantaTrimmer.py#L932) *pops* up to `num_samples` entries;
@@ -69,7 +154,24 @@ issue 9.
 
 ---
 
-## 4. `calibration_log.csv` column count mismatch — Medium
+## 4. `calibration_log.csv` column count mismatch — Medium — **FIXED**
+
+*Fixed on `fix/issues-round-1`.* The header is now a module constant
+`CAL_LOG_COLUMNS` including the 14th `Folding?` column, the row is built as a list, and
+`log_calibration` refuses to write on a length mismatch — an explicit `if`, not an
+`assert`, since asserts vanish under `-O` and would be swallowed by the surrounding
+`except`. The value is sourced from a new Folding checkbox beside the "Log calibration"
+button.
+
+Note the existing file still contains a mix of 13- and 14-field rows: the header and the
+hand-edited rows have 14, the rows written by the old code have 13. That history is left
+alone; only new rows are correct.
+
+Original report follows.
+
+---
+
+## 4a. (original text) `calibration_log.csv` column count mismatch
 
 **Location:** header written at [MantaTrimmer.py:1793](MantaTrimmer.py#L1793), row
 written at [MantaTrimmer.py:1809](MantaTrimmer.py#L1809).
@@ -85,7 +187,24 @@ from a new UI field (or an empty string while it stays a manual annotation). Ass
 
 ---
 
-## 5. Instrumentation log grows without bound — Medium
+## 5. Instrumentation log grows without bound — Medium — **FIXED**
+
+*Fixed on `fix/issues-round-1`.* The queue is now `maxsize=MAX_LOG_QUEUE` (2000) — `write`
+already swallowed the resulting `Full`, and `_ORIGINAL_PRINT` still reaches stdout, so
+overflow only drops lines from the pane. `update_log_window` trims the `Text` widget from
+the top to `MAX_LOG_LINES` after each insert.
+
+Note `ISSUES.md` originally suggested `"end-%dl"` for the delete; that is not valid as the
+*start* index of the deletion. The computed `"%d.0"` form is used instead.
+
+Verified: 10,000 writes leave the queue at exactly 2000, and 6,000 log lines leave the
+widget at exactly 2000.
+
+Original report follows.
+
+---
+
+## 5a. (original text) Instrumentation log grows without bound
 
 **Location:** `InstrumentationLog._queue` at [MantaTrimmer.py:35](MantaTrimmer.py#L35);
 `update_log_window` at [MantaTrimmer.py:2526](MantaTrimmer.py#L2526) only ever inserts.
@@ -99,7 +218,24 @@ the resulting exception, so full means drop) and trim the widget after each inse
 
 ---
 
-## 6. `set_drone_name` never persists the name — Low
+## 6. `set_drone_name` never persists the name — Low — **FIXED (by removal)**
+
+*Fixed on `fix/issues-round-1`.* The method turned out to have **zero callers** —
+`apply_drone_name` and `refresh_params_from_drone` assign `position_reader.drone_name`
+directly — so adding `drone_name` to the saved dict would have fixed nothing. It was
+deleted instead; its only behaviour was an unnecessary full-file write, i.e. a latent
+instance of issue B below.
+
+Persistence was **deliberately declined**. `refresh_params_from_drone(clear_name=True)`
+clears the name on connect on purpose, and `log_calibration` refusing to write when the
+name is empty is the safety mechanism that stops a calibration being filed under the
+previous airframe. Persisting the name across restarts would remove that check.
+
+Original report follows.
+
+---
+
+## 6a. (original text) `set_drone_name` never persists the name
 
 **Location:** [MantaTrimmer.py:754](MantaTrimmer.py#L754) calls `save_calibration()`,
 but `drone_name` is absent from the dict built at
@@ -132,7 +268,16 @@ rather than block when the lock is contended
 
 ---
 
-## 8. Float equality on a target angle — Low
+## 8. Float equality on a target angle — Low — **FIXED**
+
+*Fixed on `fix/issues-round-1`*, folded into the issue-3 commit since it lives in the same
+function. `target_angle_deg == 0.0` → `abs(target_angle_deg) < 1e-6`.
+
+Original report follows.
+
+---
+
+## 8a. (original text) Float equality on a target angle
 
 **Location:** `target_angle_deg == 0.0` at
 [MantaTrimmer.py:2107](MantaTrimmer.py#L2107).
@@ -142,6 +287,26 @@ target can miss the branch, fall through to the `< 0.0` / `> 0.0` comparisons, a
 never register as reached — the move then runs to its 60 s timeout.
 
 **Proposed fix:** `elif abs(target_angle_deg) < 1e-6:`.
+
+---
+
+## D. Duplicated wire format between the two tools — **FIXED**
+
+*Found after `ISSUES.md` was written; fixed on `fix/issues-round-1`.*
+
+`pico_monitor.py` re-implemented `POSITION_REGEX`, `SERIAL_BAUD`, the Pico VID, the
+settings loader, the angle conversion and port discovery. The regex was the dangerous one:
+issue 9's firmware change is exactly the edit that would silently desync two copies.
+
+Extracted into `manta_common.py`, imported by both. It deliberately depends on nothing
+beyond pyserial and the standard library — no tkinter, no pymavlink — which is why
+`pico_monitor.py` could not simply import `MantaTrimmer` (the guarded tkinter import
+raises `SystemExit`, and `mavutil` comes with it). `probe_mavlink` and `discover_ports`
+stay in `MantaTrimmer.py` since they need `mavutil`.
+
+Also widened `describe_serial_error` to recognise pyserial's "multiple access on port"
+wording, which is what you actually get when another process holds the device — it was
+previously reported as a generic error rather than as "busy".
 
 ---
 
@@ -155,6 +320,48 @@ each displayed angle is a single unfiltered ADC reading, so the value visibly ji
 **Proposed fix (firmware):** Oversample inside the Pico loop — average e.g. 16
 `read_u16()` calls per transmitted line. This costs nothing at the 10 Hz output rate
 and removes most of the noise before it reaches the host.
+
+---
+
+## B. `save_calibration()` overwrote newer on-disk values — **FIXED**
+
+*Found after `ISSUES.md` was written; fixed on `fix/issues-round-1`.*
+
+`save_calibration()` rebuilt the entire document from instance attributes and
+truncate-wrote it, while `load_calibration()` runs exactly once in `__init__` and never
+reloads. So any save — including `set_remembered_ports()`, called from the connect
+**worker thread** purely to record a port — stamped this instance's possibly-stale
+`LEFT`/`RIGHT`/`ANGLES` over whatever was on disk, silently reverting newer calibration
+written by another instance or by hand.
+
+Fixed by making the save a read-modify-write that merges **only the sections the caller
+actually changed**: `save_calibration(sections)`, with `set_remembered_ports` passing
+`("PORTS",)`, `set_angle_settings` passing `("ANGLES",)`, and the centring/scaler setters
+passing their own side. Section-level merging alone was not enough — the first attempt
+still wrote all four sections every time and still clobbered, which the regression test
+caught.
+
+---
+
+## C. The settings write was unlocked and non-atomic — **FIXED**
+
+*Found after `ISSUES.md` was written; fixed on `fix/issues-round-1`.*
+
+`save_calibration()` could run concurrently on the connect worker thread and the GUI
+thread (`apply_angle_*`, `centre_left`/`centre_right`) with no mutex, and wrote by
+truncating the live file in place. Two writers could interleave inside `open(..., "w")`.
+
+A torn file made `load_calibration` hit its broad `except` and **silently fall back to the
+hardcoded defaults** — the rig's entire calibration gone, with no backup and nothing but
+one quiet line in the instrumentation pane.
+
+Fixed three ways: a reentrant `_settings_lock` around every mutate-and-save; an atomic
+`_write_settings_atomic()` (temp file → `flush` → `fsync` → `os.replace`, atomic on Linux
+and Windows); and `settings.json.bak`, written from the parsed document on every
+successful load. The load-failure message is now loud and names the backup.
+
+Verified with 8 concurrent mutator threads against a continuous reader for 5 s: 4,561
+successful parses, zero torn reads, no `.tmp` litter.
 
 ---
 

@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+# Local rig state written by the atomic settings save
+settings.json.bak
+settings.json.tmp
