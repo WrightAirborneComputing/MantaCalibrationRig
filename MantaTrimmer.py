@@ -30,9 +30,34 @@ from datetime import datetime
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+# Bounds on the instrumentation pane. Overflow only drops lines from the GUI
+# widget - _ORIGINAL_PRINT still puts everything on stdout.
+MAX_LOG_QUEUE = 2000
+MAX_LOG_LINES = 2000
+
+# Column order of calibration_log.csv. The existing file on disk ends in
+# "Folding?", which was hand-added; the writer must match it exactly.
+CAL_LOG_COLUMNS = [
+    "date",
+    "time",
+    "drone_name",
+    "uid",
+    "angle_neg_degs",
+    "angle_pos_degs",
+    "angle_trim_degs",
+    "left_min",
+    "left_max",
+    "left_trim",
+    "right_min",
+    "right_max",
+    "right_trim",
+    "Folding?",
+]
+
+
 class InstrumentationLog:
     def __init__(self):
-        self._queue = queue.Queue()
+        self._queue = queue.Queue(maxsize=MAX_LOG_QUEUE)
     # def
 
     def write(self, text):
@@ -1078,6 +1103,7 @@ class FourSliderGUI:
         self.sweep_active = False
 
         self.drone_name_var = tk.StringVar(value="")
+        self.folding_var = tk.StringVar(value="")
 
         self.angle_neg_degs = self.position_reader.angle_neg_degs
         self.angle_pos_degs = self.position_reader.angle_pos_degs
@@ -1169,13 +1195,21 @@ class FourSliderGUI:
         )
         sweep_btn.pack(pady=(8, 2), anchor="w")
 
+        folding_row = tk.Frame(angle_group, bd=1, relief="groove", padx=4, pady=4)
+        folding_row.pack(anchor="w", pady=(8, 2), fill=tk.X)
+
+        tk.Label(folding_row, text="Folding", width=10, anchor="w").pack(side=tk.LEFT, padx=(0, 5))
+        folding_check = tk.Checkbutton(folding_row, variable=self.folding_var,
+                                       onvalue="y", offvalue="")
+        folding_check.pack(side=tk.LEFT)
+
         log_cal_btn = tk.Button(
             angle_group,
             text="Log calibration",
             width=18,
             command=self.log_calibration
         )
-        log_cal_btn.pack(pady=(8, 0), anchor="w")
+        log_cal_btn.pack(pady=(2, 0), anchor="w")
 
         # LEFT group
         left_group = tk.LabelFrame(main_frame, text="Left", padx=10, pady=10)
@@ -1905,43 +1939,42 @@ class FourSliderGUI:
             right_max = int(self.right_max_var.get().strip())
             right_trim = float(self.right_trim_var.get().strip())
 
+            folding = self.folding_var.get().strip()
+
+            row = [
+                date_str,
+                time_str,
+                drone_name,
+                uid,
+                angle_neg,
+                angle_pos,
+                angle_trim,
+                left_min,
+                left_max,
+                left_trim,
+                right_min,
+                right_max,
+                right_trim,
+                folding,
+            ]
+
+            # The header and the row drifted apart once already; refuse rather
+            # than silently append a misaligned line. Not an assert - asserts
+            # vanish under -O and would be swallowed by the except below.
+            if len(row) != len(CAL_LOG_COLUMNS):
+                print("Refusing to log: %d values for %d columns"
+                      % (len(row), len(CAL_LOG_COLUMNS)))
+                return
+
             file_exists = os.path.exists(self.calibration_log_file)
 
             with open(self.calibration_log_file, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
 
                 if not file_exists:
-                    writer.writerow([
-                        "date",
-                        "time",
-                        "drone_name",
-                        "uid",
-                        "angle_neg_degs",
-                        "angle_pos_degs",
-                        "angle_trim_degs",
-                        "left_min",
-                        "left_max",
-                        "left_trim",
-                        "right_min",
-                        "right_max",
-                        "right_trim",
-                    ])
+                    writer.writerow(CAL_LOG_COLUMNS)
 
-                writer.writerow([
-                    date_str,
-                    time_str,
-                    drone_name,
-                    uid,
-                    angle_neg,
-                    angle_pos,
-                    angle_trim,
-                    left_min,
-                    left_max,
-                    left_trim,
-                    right_min,
-                    right_max,
-                    right_trim,
-                ])
+                writer.writerow(row)
 
             print("Calibration logged to %s" % self.calibration_log_file)
 
@@ -2738,6 +2771,13 @@ class FourSliderGUI:
         lines = INSTRUMENTATION_LOG.drain()
         if lines:
             self.log_text.insert(tk.END, "".join(lines))
+
+            # Trim from the top, or a long calibration session grows the widget
+            # without limit.
+            line_count = int(self.log_text.index("end-1c").split(".")[0])
+            if line_count > MAX_LOG_LINES:
+                self.log_text.delete("1.0", "%d.0" % (line_count - MAX_LOG_LINES + 1))
+
             self.log_text.see(tk.END)
         self.root.after(100, self.update_log_window)
     # def

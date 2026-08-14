@@ -154,7 +154,24 @@ issue 9.
 
 ---
 
-## 4. `calibration_log.csv` column count mismatch — Medium
+## 4. `calibration_log.csv` column count mismatch — Medium — **FIXED**
+
+*Fixed on `fix/issues-round-1`.* The header is now a module constant
+`CAL_LOG_COLUMNS` including the 14th `Folding?` column, the row is built as a list, and
+`log_calibration` refuses to write on a length mismatch — an explicit `if`, not an
+`assert`, since asserts vanish under `-O` and would be swallowed by the surrounding
+`except`. The value is sourced from a new Folding checkbox beside the "Log calibration"
+button.
+
+Note the existing file still contains a mix of 13- and 14-field rows: the header and the
+hand-edited rows have 14, the rows written by the old code have 13. That history is left
+alone; only new rows are correct.
+
+Original report follows.
+
+---
+
+## 4a. (original text) `calibration_log.csv` column count mismatch
 
 **Location:** header written at [MantaTrimmer.py:1793](MantaTrimmer.py#L1793), row
 written at [MantaTrimmer.py:1809](MantaTrimmer.py#L1809).
@@ -170,7 +187,24 @@ from a new UI field (or an empty string while it stays a manual annotation). Ass
 
 ---
 
-## 5. Instrumentation log grows without bound — Medium
+## 5. Instrumentation log grows without bound — Medium — **FIXED**
+
+*Fixed on `fix/issues-round-1`.* The queue is now `maxsize=MAX_LOG_QUEUE` (2000) — `write`
+already swallowed the resulting `Full`, and `_ORIGINAL_PRINT` still reaches stdout, so
+overflow only drops lines from the pane. `update_log_window` trims the `Text` widget from
+the top to `MAX_LOG_LINES` after each insert.
+
+Note `ISSUES.md` originally suggested `"end-%dl"` for the delete; that is not valid as the
+*start* index of the deletion. The computed `"%d.0"` form is used instead.
+
+Verified: 10,000 writes leave the queue at exactly 2000, and 6,000 log lines leave the
+widget at exactly 2000.
+
+Original report follows.
+
+---
+
+## 5a. (original text) Instrumentation log grows without bound
 
 **Location:** `InstrumentationLog._queue` at [MantaTrimmer.py:35](MantaTrimmer.py#L35);
 `update_log_window` at [MantaTrimmer.py:2526](MantaTrimmer.py#L2526) only ever inserts.
