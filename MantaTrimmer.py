@@ -73,6 +73,15 @@ IS_WINDOWS = sys.platform.startswith("win")
 
 SERIAL_BAUD = 115200
 
+# Position samples are averaged over a trailing time window rather than being
+# consumed. The window must be at least 2x the Pico's 10 Hz sample period so a
+# dropped serial line still leaves samples to average, and shorter than
+# PositionReader.is_streaming()'s max_age so "link dead" and "window empty"
+# cannot disagree. 0.5 s gives ~5 samples (about 2.2x noise reduction) for 250 ms
+# of group delay, which is well inside the calibration mover's 250 ms step cadence.
+POSITION_WINDOW_S = 0.5
+POSITION_HISTORY = 200          # ~20 s of backlog at 10 Hz
+
 # The rig Pico enumerates as a Raspberry Pi USB CDC device. This is the
 # authoritative way to spot it; probe_pico() is only a fallback.
 PICO_VIDS = {0x2E8A}
@@ -627,10 +636,11 @@ class PositionReader:
         self.port = port
         self.baud = SERIAL_BAUD
         self.timeout = 1.0
-        self.num_samples = 10
 
-        self._queue_left = deque()
-        self._queue_right = deque()
+        # (monotonic_timestamp, raw_value) pairs. Read non-destructively by any
+        # number of consumers; maxlen bounds the backlog.
+        self._queue_left = deque(maxlen=POSITION_HISTORY)
+        self._queue_right = deque(maxlen=POSITION_HISTORY)
         self._lock = threading.Lock()
         self._thread = None
         self._stop = threading.Event()
@@ -913,16 +923,11 @@ class PositionReader:
                         except ValueError:
                             continue
 
+                        now = time.monotonic()
                         with self._lock:
-                            self._queue_left.append(p1)
-                            self._queue_right.append(p2)
-
-                            if len(self._queue_left) > 500:
-                                self._queue_left.popleft()
-                            if len(self._queue_right) > 500:
-                                self._queue_right.popleft()
-
-                            self._last_sample_time = time.time()
+                            self._queue_left.append((now, p1))
+                            self._queue_right.append((now, p2))
+                            self._last_sample_time = now
 
         except (serial.SerialException, OSError) as e:
             self.last_error = describe_serial_error(port, e)
@@ -980,7 +985,7 @@ class PositionReader:
         with self._lock:
             last = self._last_sample_time
 
-        return last > 0.0 and (time.time() - last) <= max_age
+        return last > 0.0 and (time.monotonic() - last) <= max_age
     # def
 
     def clear_queues(self):
@@ -989,8 +994,22 @@ class PositionReader:
             self._queue_right.clear()
     # def
 
-    def get_average_position_nonblocking(self, side):
-        samples = []
+    def get_average_position_nonblocking(self, side, window_s=None):
+        """Mean of every sample from the last window_s seconds.
+
+        Non-destructive: the UI, the calibration workers and the centring buttons
+        can all read concurrently and all see the same data. Previously this
+        popped samples, so with a 10 Hz producer and a 10 Hz UI consumer each
+        caller usually got one sample - and whoever asked second got None.
+
+        Returns None only when nothing has arrived within the window, which now
+        genuinely means the stream is stale.
+        """
+        window = POSITION_WINDOW_S if window_s is None else float(window_s)
+        cutoff = time.monotonic() - window
+
+        total = 0.0
+        count = 0
 
         with self._lock:
             if side == "LEFT":
@@ -1000,13 +1019,17 @@ class PositionReader:
             else:
                 return None
 
-            while queue_ref and len(samples) < self.num_samples:
-                samples.append(queue_ref.popleft())
+            # Newest first; entries are time-ordered, so the first stale one ends it.
+            for timestamp, value in reversed(queue_ref):
+                if timestamp < cutoff:
+                    break
+                total += value
+                count += 1
 
-        if not samples:
+        if count == 0:
             return None
 
-        return sum(samples) / float(len(samples))
+        return total / float(count)
     # def
 # class
 
@@ -1344,13 +1367,6 @@ class FourSliderGUI:
         return None, None
     # def
 
-    def clear_position_queues(self):
-        try:
-            self.position_reader.clear_queues()
-        except Exception as e:
-            print("Failed to clear position queues: %s" % str(e))
-    # def
-
     def start_sweep_to_csv(self):
         if self.sweep_thread is not None and self.sweep_thread.is_alive():
             print("Sweep already running")
@@ -1405,8 +1421,10 @@ class FourSliderGUI:
                     self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, cmd)
                     self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, cmd)
 
+                    # Settle. This must stay longer than POSITION_WINDOW_S: it is
+                    # what guarantees every sample in the averaging window was
+                    # taken after the elevon finished moving.
                     time.sleep(1.0)
-                    self.clear_position_queues()
 
                     left_angle, right_angle = self.wait_for_valid_both_angles(timeout=5.0, poll_s=0.05)
 
@@ -2166,7 +2184,7 @@ class FourSliderGUI:
                 reached = True
             elif target_angle_deg > 0.0 and angle_deg >= target_angle_deg:
                 reached = True
-            elif target_angle_deg == 0.0 and abs(angle_deg) <= 0.5:
+            elif abs(target_angle_deg) < 1e-6 and abs(angle_deg) <= 0.5:
                 reached = True
 
             if reached:

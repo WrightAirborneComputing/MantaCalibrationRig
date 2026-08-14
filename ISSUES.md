@@ -49,7 +49,38 @@ and show a pending state until a `post_to_gui` completion callback re-enables it
 
 ---
 
-## 3. Position samples are destructively consumed — High
+## 3. Position samples are destructively consumed — High — **FIXED**
+
+*Fixed on `fix/issues-round-1`.* This was the cause of the reported **"Zero angle"
+failure**: clicking it usually logged `No data for centering LEFT` and did nothing,
+taking several clicks to land.
+
+`set_center` read through the same popping getter as `update_labels`, which drains both
+queues at 10 Hz against a 10 Hz producer — so the button competed with the label refresh
+for the same single sample and lost most of the time. Measured on the pre-fix code with a
+simulated 10 Hz UI consumer: **26 of 40 centring attempts failed**. Post-fix: **0 of 40**.
+
+Samples are now `(monotonic_timestamp, raw)` pairs in a `maxlen`-bounded deque, and the
+getter *peeks* every sample newer than `POSITION_WINDOW_S` (0.5 s) instead of popping. Any
+number of consumers read concurrently and all see the same data. `None` now means
+"nothing within the window", i.e. genuinely stale, rather than "someone else got there
+first".
+
+Secondary benefit: centring now averages ~5 samples rather than one, so the zero point no
+longer carries the full ADC noise of a single reading — `num_samples = 10` had never
+actually applied, and that attribute is now gone.
+
+`clear_position_queues` and its call in the sweep were deleted: post-fix they would
+destroy the window the UI is concurrently displaying and force the following
+`wait_for_valid_both_angles` to wait a full producer period for nothing. The sweep's 1 s
+settle already guarantees every windowed sample is post-move — a comment there records
+that this invariant is now load-bearing.
+
+Original report follows.
+
+---
+
+## 3a. (original text) Position samples are destructively consumed
 
 **Location:** `get_average_position_nonblocking` at
 [MantaTrimmer.py:932](MantaTrimmer.py#L932) *pops* up to `num_samples` entries;
@@ -149,7 +180,16 @@ rather than block when the lock is contended
 
 ---
 
-## 8. Float equality on a target angle — Low
+## 8. Float equality on a target angle — Low — **FIXED**
+
+*Fixed on `fix/issues-round-1`*, folded into the issue-3 commit since it lives in the same
+function. `target_angle_deg == 0.0` → `abs(target_angle_deg) < 1e-6`.
+
+Original report follows.
+
+---
+
+## 8a. (original text) Float equality on a target angle
 
 **Location:** `target_angle_deg == 0.0` at
 [MantaTrimmer.py:2107](MantaTrimmer.py#L2107).
