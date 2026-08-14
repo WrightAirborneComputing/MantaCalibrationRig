@@ -26,6 +26,8 @@ import serial.tools.list_ports
 import csv
 from datetime import datetime
 
+from manta_theme import PALETTE, apply_theme
+
 from manta_common import (
     APP_DIR,
     IS_LINUX,
@@ -1128,6 +1130,10 @@ class FourSliderGUI:
         self.root = root
         self.root.title("Manta Trimmer")
 
+        # Before any widget is built: the option database is read at widget
+        # creation time, so anything constructed earlier keeps the stock look.
+        apply_theme(self.root)
+
         self.position_reader = position_reader
         self.drone_interface = drone_interface
 
@@ -1350,20 +1356,24 @@ class FourSliderGUI:
         self.left_pwm_label = tk.Label(
             left_group,
             text="PWM exp: --",
-            relief="solid",
-            bd=2,
+            relief="flat",
+            bd=0,
+            bg=PALETTE["panel_alt"],
             width=16,
-            anchor="center"
+            anchor="center",
+            pady=4
         )
         self.left_pwm_label.pack(pady=(10, 4))
 
         self.left_label = tk.Label(
             left_group,
             text="Left: --",
-            relief="solid",
-            bd=2,
+            relief="flat",
+            bd=0,
+            bg=PALETTE["panel_alt"],
             width=16,
-            anchor="center"
+            anchor="center",
+            pady=4
         )
         self.left_label.pack(pady=(0, 10))
 
@@ -1424,20 +1434,24 @@ class FourSliderGUI:
         self.right_pwm_label = tk.Label(
             right_group,
             text="PWM exp: --",
-            relief="solid",
-            bd=2,
+            relief="flat",
+            bd=0,
+            bg=PALETTE["panel_alt"],
             width=16,
-            anchor="center"
+            anchor="center",
+            pady=4
         )
         self.right_pwm_label.pack(pady=(10, 4))
 
         self.right_label = tk.Label(
             right_group,
             text="Right: --",
-            relief="solid",
-            bd=2,
+            relief="flat",
+            bd=0,
+            bg=PALETTE["panel_alt"],
             width=16,
-            anchor="center"
+            anchor="center",
+            pady=4
         )
         self.right_label.pack(pady=(0, 10))
 
@@ -1637,7 +1651,7 @@ class FourSliderGUI:
             entry.pack(side=tk.LEFT)
             entry.bind("<KeyRelease>", lambda event: self.update_range_rate_estimate())
 
-        self.rr_estimate_label = tk.Label(setup, text="", anchor="w", fg="gray25")
+        self.rr_estimate_label = tk.Label(setup, text="", anchor="w", fg=PALETTE["ink_muted"])
         self.rr_estimate_label.pack(anchor="w", pady=(6, 0))
 
         run_group = tk.LabelFrame(left_col, text="Run", padx=8, pady=6)
@@ -1648,7 +1662,7 @@ class FourSliderGUI:
             text="Surfaces move to full deflection.\nThey centre when the test stops.",
             justify="left",
             anchor="w",
-            fg="gray25",
+            fg=PALETTE["ink_muted"],
         ).pack(anchor="w", pady=(0, 6))
 
         button_row = tk.Frame(run_group)
@@ -1686,8 +1700,9 @@ class FourSliderGUI:
         trace_group = tk.LabelFrame(right_col, text="Last transit", padx=6, pady=6)
         trace_group.pack(fill=tk.X)
 
-        self.rr_canvas = tk.Canvas(trace_group, height=210, bg="white",
-                                   highlightthickness=1, highlightbackground="gray70")
+        self.rr_canvas = tk.Canvas(trace_group, height=210, bg=PALETTE["panel"],
+                                   highlightthickness=1,
+                                   highlightbackground=PALETTE["rule"])
         self.rr_canvas.pack(fill=tk.BOTH, expand=True)
         self.rr_canvas.bind("<Configure>", lambda event: self.redraw_range_rate_trace())
 
@@ -1715,7 +1730,7 @@ class FourSliderGUI:
         footer = tk.Frame(right_col)
         footer.pack(fill=tk.X, pady=(6, 0))
 
-        self.rr_note_label = tk.Label(footer, text="", anchor="w", fg="dark orange")
+        self.rr_note_label = tk.Label(footer, text="", anchor="w", fg=PALETTE["warn"])
         self.rr_note_label.pack(side=tk.LEFT)
 
         self.rr_export_btn = tk.Button(
@@ -2184,7 +2199,7 @@ class FourSliderGUI:
         self.drone_combo.pack(side=tk.LEFT, padx=(4, 6))
 
         self.drone_status_label = tk.Label(
-            group, text="not connected", anchor="w", width=30, fg="black")
+            group, text="not connected", anchor="w", width=30, fg=PALETTE["ink"])
         self.drone_status_label.pack(side=tk.LEFT, padx=(0, 14))
 
         tk.Label(group, text="Pico", anchor="w").pack(side=tk.LEFT)
@@ -2192,7 +2207,7 @@ class FourSliderGUI:
         self.pico_combo.pack(side=tk.LEFT, padx=(4, 6))
 
         self.pico_status_label = tk.Label(
-            group, text="not connected", anchor="w", width=28, fg="black")
+            group, text="not connected", anchor="w", width=28, fg=PALETTE["ink"])
         self.pico_status_label.pack(side=tk.LEFT, padx=(0, 14))
 
         tk.Label(group, text="Rate", anchor="w").pack(side=tk.LEFT)
@@ -2201,7 +2216,8 @@ class FourSliderGUI:
         # fast mode, and the Trim tab reads the same stream. Showing it means a
         # surprising angle readout has somewhere to be explained.
         self.pico_rate_label = tk.Label(
-            group, text="--", anchor="center", relief="solid", bd=1, width=8)
+            group, text="--", anchor="center", relief="flat", bd=0,
+            bg=PALETTE["panel_alt"], width=8, pady=2)
         self.pico_rate_label.pack(side=tk.LEFT, padx=(4, 0))
 
         button_row = tk.Frame(group)
@@ -2229,13 +2245,13 @@ class FourSliderGUI:
             return
 
         if not self.position_reader.is_streaming():
-            text, colour = "--", "black"
+            text, colour = "--", PALETTE["ink"]
         else:
             hz = self.position_reader.sample_hz
             text = "%d Hz" % hz
             # Fast mode is a temporary state owned by a running test. Flagging it
             # stops it being mistaken for normal when a test leaves it behind.
-            colour = "dark green" if hz <= SLOW_RATE_HZ else "dark orange"
+            colour = PALETTE["ok"] if hz <= SLOW_RATE_HZ else PALETTE["warn"]
 
         self.pico_rate_label.config(text=text, fg=colour)
     # def
@@ -2253,7 +2269,8 @@ class FourSliderGUI:
 
     def set_conn_status(self, which, text, ok=None):
         label = self.drone_status_label if which == "drone" else self.pico_status_label
-        colour = "black" if ok is None else ("dark green" if ok else "red")
+        colour = PALETTE["ink"] if ok is None else (
+            PALETTE["ok"] if ok else PALETTE["bad"])
         label.config(text=text, fg=colour)
     # def
 

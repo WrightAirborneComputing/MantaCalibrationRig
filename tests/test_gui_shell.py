@@ -101,13 +101,13 @@ def test_rate_indicator_tracks_the_board(app):
     gui, _ = app
 
     assert gui.pico_rate_label.cget("text") == "10 Hz"
-    assert gui.pico_rate_label.cget("fg") == "dark green"
+    assert gui.pico_rate_label.cget("fg") == MT.PALETTE["ok"]
 
     gui.position_reader.set_sample_rate(MT.FAST_RATE_HZ)
     gui.pump(0.5)
 
     assert gui.pico_rate_label.cget("text") == "500 Hz"
-    assert gui.pico_rate_label.cget("fg") == "dark orange"
+    assert gui.pico_rate_label.cget("fg") == MT.PALETTE["warn"]
 # def
 
 
