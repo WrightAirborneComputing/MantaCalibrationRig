@@ -30,9 +30,13 @@ from manta_theme import PALETTE, apply_theme
 
 from manta_common import (
     APP_DIR,
+    DEFAULT_CYCLES,
+    DEFAULT_PHASES,
+    FAST_RATE_HZ,
     IS_LINUX,
     IS_WINDOWS,
     SERIAL_BAUD,
+    SLOW_RATE_HZ,
     PICO_VIDS,
     PICO_VID_PIDS,
     FCU_VID_HINTS,
@@ -58,6 +62,7 @@ from range_test import (
     PHASE_SIDES,
     PRE_ROLL_S,
     analyse_leg,
+    endpoint_stats,
     mean_sd,
     to_series,
 )
@@ -74,22 +79,30 @@ from range_test import (
 POSITION_WINDOW_S = 0.5
 
 # Backlog is sized in *seconds*, not samples, because the Pico's rate is now
-# negotiable. A fixed 200 entries meant 20 s at 10 Hz but only 0.4 s at 500 Hz -
+# negotiable. A fixed 200 entries meant 20 s at 10 Hz but only 0.2 s at 1000 Hz -
 # shorter than the averaging window it has to feed, which would have made
 # POSITION_WINDOW_S quietly stop meaning anything. The floor keeps the 10 Hz
 # case byte-for-byte as it was.
 POSITION_HISTORY_S = 4.0
 MIN_POSITION_HISTORY = 200
 
-# Presets understood by pico/sampler.py.
-SLOW_RATE_HZ = 10
-FAST_RATE_HZ = 500
+# SLOW_RATE_HZ / FAST_RATE_HZ are the pico/sampler.py presets and now live in
+# manta_common, so the GUI, the console test and the monitor cannot disagree
+# about them. They are imported above and re-exported here by that import.
 
 # A capture left running by a crashed worker must not grow without bound.
-# 60000 samples is two minutes at 500 Hz - far longer than any single leg.
+# 60000 samples is a minute at 1000 Hz - far longer than any single leg.
 MAX_CAPTURE_SAMPLES = 60000
 
-# "# ACK F 500" / "# ACK S 10"
+# Samples kept across a whole run so "Save samples" can be pressed *after* the
+# fact - the tab cannot know in advance whether it will be wanted, so it always
+# retains. The default run is 30 cycles x 2 legs x 2 sides x ~2400 samples, i.e.
+# ~290k rows, so this ceiling is ~4x a normal run and exists only to stop a very
+# long or very fast one from eating the machine. Passing it drops later samples
+# and says so rather than silently keeping a partial record.
+MAX_EXPORT_SAMPLES = 1200000
+
+# "# ACK F 1000" / "# ACK S 10"
 ACK_RATE_REGEX = re.compile(r"ACK\s+[SF]\s+(\d+)")
 
 
@@ -1176,6 +1189,9 @@ class FourSliderGUI:
         self.range_test_active = False
         self.rr_results = []
         self.rr_summary_rows = []
+        self.rr_samples = []
+        self.rr_samples_truncated = False
+        self.rr_run_stamp = ""
         self.rr_last_trace = None
 
         self.drone_name_var = tk.StringVar(value="")
@@ -1622,11 +1638,13 @@ class FourSliderGUI:
         setup = tk.LabelFrame(left_col, text="What to run", padx=8, pady=6)
         setup.pack(anchor="w", fill=tk.X)
 
-        # One side at a time, then both, so a difference under load is
-        # attributable to coupling rather than to the servo.
+        # Only BOTH is on by default: driving the servos one at a time was
+        # measured to give the same travel and rate as driving them together, so
+        # LEFT and RIGHT are here to isolate one servo when something looks
+        # wrong, not to be paid for on every run.
         self.rr_phase_vars = {}
         for phase in PHASES:
-            var = tk.IntVar(value=1)
+            var = tk.IntVar(value=1 if phase in DEFAULT_PHASES else 0)
             self.rr_phase_vars[phase] = var
             tk.Checkbutton(
                 setup,
@@ -1637,7 +1655,7 @@ class FourSliderGUI:
                 command=self.update_range_rate_estimate,
             ).pack(anchor="w")
 
-        self.rr_cycles_var = tk.StringVar(value="3")
+        self.rr_cycles_var = tk.StringVar(value=str(DEFAULT_CYCLES))
         self.rr_settle_var = tk.StringVar(value="2.0")
         self.rr_rate_var = tk.StringVar(value=str(FAST_RATE_HZ))
 
@@ -1709,9 +1727,14 @@ class FourSliderGUI:
         results_group = tk.LabelFrame(right_col, text="Results", padx=6, pady=6)
         results_group.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
-        columns = ("phase", "side", "direction", "range", "travel", "transit", "rate", "n")
-        headings = ("Phase", "Side", "Direction", "Range deg", "Travel deg",
-                    "Transit ms", "Rate deg/s", "n")
+        # Max/min are the settled endpoints themselves, with their own spread.
+        # Range is their difference and hides it: two runs can share a range
+        # while one sits several degrees off the other, and only the endpoints
+        # show that.
+        columns = ("phase", "side", "direction", "angle_max", "angle_min",
+                   "range", "travel", "transit", "rate", "n")
+        headings = ("Phase", "Side", "Direction", "Max deg", "Min deg",
+                    "Range deg", "Travel deg", "Transit ms", "Rate deg/s", "n")
 
         self.rr_tree = ttk.Treeview(
             results_group, columns=columns, show="headings", height=8)
@@ -1733,6 +1756,15 @@ class FourSliderGUI:
         self.rr_note_label = tk.Label(footer, text="", anchor="w", fg=PALETTE["warn"])
         self.rr_note_label.pack(side=tk.LEFT)
 
+        # Packed right-to-left, so "Save CSV" ends up leftmost of the pair. The
+        # summary is the usual answer; the sample dump is the one you reach for
+        # when the summary raises a question the aggregate cannot settle - such
+        # as whether scatter is a drift across the run or a few bad cycles.
+        self.rr_samples_btn = tk.Button(
+            footer, text="Save samples", width=12, state="disabled",
+            command=self.export_range_rate_samples_csv)
+        self.rr_samples_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
         self.rr_export_btn = tk.Button(
             footer, text="Save CSV", width=11, state="disabled",
             command=self.export_range_rate_csv)
@@ -1745,7 +1777,7 @@ class FourSliderGUI:
         """Parse the setup fields. Returns (phases, cycles, settle, rate)."""
         phases = [p for p in PHASES if self.rr_phase_vars[p].get()]
 
-        cycles = max(1, self.get_int_var(self.rr_cycles_var, 3))
+        cycles = max(1, self.get_int_var(self.rr_cycles_var, DEFAULT_CYCLES))
         settle = max(0.3, self.get_float_var(self.rr_settle_var, 2.0))
         rate = max(SLOW_RATE_HZ, self.get_int_var(self.rr_rate_var, FAST_RATE_HZ))
 
@@ -1801,10 +1833,16 @@ class FourSliderGUI:
         self.rr_tree.delete(*self.rr_tree.get_children())
         self.rr_results = []
         self.rr_summary_rows = []
+        self.rr_samples = []
+        self.rr_samples_truncated = False
+        # Stamped once here rather than at each button press, so the summary and
+        # the sample dump from one run carry the same name and pair up on disk.
+        self.rr_run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.rr_last_trace = None
         self.rr_canvas.delete("all")
         self.rr_note_label.config(text="")
         self.rr_export_btn.config(state="disabled")
+        self.rr_samples_btn.config(state="disabled")
 
         self.range_test_active = True
         self.rr_run_btn.config(state="disabled")
@@ -1957,9 +1995,35 @@ class FourSliderGUI:
                 "side": side, "dropped": dropped, "truncated": truncated,
             })
             self.rr_results.append(metrics)
+            self._rr_retain_samples(phase, cycle, direction, side, series)
 
             self.post_to_gui(
                 lambda m=metrics, s=series: self._rr_show_leg(m, s))
+    # def
+
+    def _rr_retain_samples(self, phase, cycle, direction, side, series):
+        """Keep one leg's trace for a later "Save samples", up to the ceiling.
+
+        Worker thread only. Formatting to strings here rather than at export
+        keeps the retained rows flat and makes the memory cost predictable, and
+        matches what range_test.py's --samples-csv writes so one set of plotting
+        scripts reads both.
+        """
+        room = MAX_EXPORT_SAMPLES - len(self.rr_samples)
+
+        if room <= 0:
+            self.rr_samples_truncated = True
+            return
+
+        if len(series) > room:
+            series = series[:room]
+            self.rr_samples_truncated = True
+
+        for t_rel, angle in series:
+            self.rr_samples.append([
+                phase, cycle, direction, side,
+                "%.6f" % t_rel, "%.4f" % angle,
+            ])
     # def
 
     def _rr_show_leg(self, metrics, series):
@@ -1992,8 +2056,16 @@ class FourSliderGUI:
         if not series:
             return
 
-        width = canvas.winfo_width() or 520
-        height = canvas.winfo_height() or 210
+        # Tk reports 1, not 0, for a widget it has not laid out yet, so "or" is
+        # not enough - an unrealised canvas would otherwise be drawn into a
+        # 1-pixel box and appear blank.
+        width = canvas.winfo_width()
+        height = canvas.winfo_height()
+
+        if width <= 1:
+            width = 520
+        if height <= 1:
+            height = 210
 
         left, right, top, bottom = 46, 12, 12, 26
         plot_w = max(10, width - left - right)
@@ -2085,8 +2157,12 @@ class FourSliderGUI:
             notes.append("%d legs did not measure (%s)"
                          % (len(failed), failed[0]["reason"]))
 
+        if self.rr_samples_truncated:
+            notes.append("sample record truncated at %d rows" % MAX_EXPORT_SAMPLES)
+
         self.rr_note_label.config(text="; ".join(notes))
         self.rr_export_btn.config(state="normal" if rows else "disabled")
+        self.rr_samples_btn.config(state="normal" if self.rr_samples else "disabled")
 
         self.rr_progress.config(value=100.0 if rows else 0.0)
         self.rr_status_label.config(text="Done" if rows else "No measurements")
@@ -2108,6 +2184,8 @@ class FourSliderGUI:
                 ends = [r["final_deg"] for r in ok]
                 span = max(ends) - min(ends)
 
+                angle_max, angle_min = endpoint_stats(ok)
+
                 for direction in ("neg_to_pos", "pos_to_neg"):
                     legs = [r for r in ok if r["direction"] == direction]
                     if not legs:
@@ -2119,6 +2197,8 @@ class FourSliderGUI:
 
                     rows.append((
                         phase, side, direction,
+                        self.format_mean_sd(angle_max, "%.2f"),
+                        self.format_mean_sd(angle_min, "%.2f"),
                         "%.2f" % span,
                         self.format_mean_sd(travel, "%.2f"),
                         self.format_mean_sd(transit, "%.1f"),
@@ -2144,20 +2224,63 @@ class FourSliderGUI:
             return
 
         try:
-            name = self.make_safe_filename(self.drone_name_var.get().strip() or "elevon")
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = report_path(APP_DIR, "%s_%s_rangerate.csv" % (name, stamp))
+            path = self.rr_report_path("rangerate")
 
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["phase", "side", "direction", "range_deg", "travel_deg",
-                                 "transit_ms", "rate_deg_s", "cycles"])
+                writer.writerow(["phase", "side", "direction",
+                                 "angle_max_deg", "angle_min_deg", "range_deg",
+                                 "travel_deg", "transit_ms", "rate_deg_s", "cycles"])
                 writer.writerows(self.rr_summary_rows)
 
             print("Range/rate summary written to %s" % path)
 
         except Exception as e:
             print("Failed to export range/rate CSV: %s" % str(e))
+    # def
+
+    def rr_report_path(self, suffix):
+        """reports/<name>_<run stamp>_<suffix>.csv for the run just finished.
+
+        The stamp is the run's, not the moment the button was pressed, so the
+        summary and the sample dump share a filename stem however long after the
+        run either is exported.
+        """
+        name = self.make_safe_filename(self.drone_name_var.get().strip() or "elevon")
+        stamp = self.rr_run_stamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+        return report_path(APP_DIR, "%s_%s_%s.csv" % (name, stamp, suffix))
+    # def
+
+    def export_range_rate_samples_csv(self):
+        """Every captured sample, one row each - the aggregate's raw material.
+
+        Same columns and same order as range_test.py --samples-csv, so anything
+        that plots the console's output plots this unchanged. t_rel_s is zeroed
+        on the actuator command, so pre-roll samples are negative.
+        """
+        if not self.rr_samples:
+            print("No samples to export")
+            return
+
+        try:
+            path = self.rr_report_path("rangerate_samples")
+
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["phase", "cycle", "direction", "side",
+                                 "t_rel_s", "angle_deg"])
+                writer.writerows(self.rr_samples)
+
+            print("Range/rate samples written to %s (%d rows)"
+                  % (path, len(self.rr_samples)))
+
+            if self.rr_samples_truncated:
+                print("  NOTE: the run exceeded %d samples - this file is the "
+                      "first %d and the tail is missing."
+                      % (MAX_EXPORT_SAMPLES, len(self.rr_samples)))
+
+        except Exception as e:
+            print("Failed to export range/rate samples CSV: %s" % str(e))
     # def
 
     def create_angle_entry(self, parent, label, text_var, apply_callback):

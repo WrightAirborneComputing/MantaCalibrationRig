@@ -49,6 +49,15 @@ SERVO = {
 
 TRAVEL_DEG = {"LEFT": 66.0, "RIGHT": 64.0}
 
+# The rate these tests *drive* at, deliberately not FAST_RATE_HZ. The fake Pico
+# is a Python thread writing a pty, and asking it for the real 1000 Hz makes it
+# fall behind under full-suite load - a leg then captures nothing and the tab
+# correctly reports "too few samples", failing the test for a reason that says
+# nothing about the tab. 400 Hz still puts ~240 samples in a 0.6 s leg and ~45
+# across the simulated transit, which is what the analysis needs. That the
+# product's default is 1000 Hz is asserted in test_setup_defaults_and_estimate.
+TAB_RATE_HZ = 400
+
 
 class SimulatedRig(object):
     """A fake FC whose commands move a simulated servo the fake Pico reports."""
@@ -186,7 +195,7 @@ def run_test(gui, phases, cycles=1, settle=0.6, timeout=90.0):
 
     thread = threading.Thread(
         target=gui._range_rate_worker,
-        args=(list(phases), cycles, settle, MT.FAST_RATE_HZ),
+        args=(list(phases), cycles, settle, TAB_RATE_HZ),
         daemon=True,
     )
     thread.start()
@@ -205,18 +214,21 @@ def test_setup_defaults_and_estimate(rig):
 
     phases, cycles, settle, rate = gui.read_range_rate_settings()
 
-    assert phases == ["LEFT", "RIGHT", "BOTH"]
-    assert cycles == 3
+    # BOTH alone: the single-servo phases were measured to add nothing, and
+    # dropping them is what makes 30 cycles affordable.
+    assert phases == list(MT.DEFAULT_PHASES)
+    assert cycles == MT.DEFAULT_CYCLES
     assert rate == MT.FAST_RATE_HZ
 
     gui.update_range_rate_estimate()
-    assert "18 hard-overs" in gui.rr_estimate_label.cget("text")
+    assert "60 hard-overs" in gui.rr_estimate_label.cget("text")
 # def
 
 
 def test_estimate_tracks_the_selection(rig):
     gui, _, _ = rig
 
+    gui.rr_phase_vars["LEFT"].set(1)
     gui.rr_phase_vars["RIGHT"].set(0)
     gui.rr_phase_vars["BOTH"].set(0)
     gui.rr_cycles_var.set("2")
@@ -265,12 +277,14 @@ def test_summary_table_is_populated(rig):
     rows = gui.rr_tree.get_children()
     assert rows
 
-    values = gui.rr_tree.item(rows[0], "values")
-    assert values[0] == "LEFT"
-    assert values[1] == "LEFT"
-    assert values[2] in ("neg_to_pos", "pos_to_neg")
-    assert "+/-" in values[4], "mean +/- sd expected with more than one cycle"
-    assert int(values[7]) == 2
+    columns = gui.rr_tree.cget("columns")
+    values = dict(zip(columns, gui.rr_tree.item(rows[0], "values")))
+
+    assert values["phase"] == "LEFT"
+    assert values["side"] == "LEFT"
+    assert values["direction"] in ("neg_to_pos", "pos_to_neg")
+    assert "+/-" in values["travel"], "mean +/- sd expected with more than one cycle"
+    assert int(values["n"]) == 2
 # def
 
 
@@ -306,7 +320,7 @@ def test_stopping_mid_run_still_centres(rig):
 
     gui.range_test_active = True
     thread = threading.Thread(
-        target=gui._range_rate_worker, args=(["LEFT"], 5, 0.6, MT.FAST_RATE_HZ),
+        target=gui._range_rate_worker, args=(["LEFT"], 5, 0.6, TAB_RATE_HZ),
         daemon=True)
     thread.start()
 
@@ -347,6 +361,19 @@ def test_trace_is_drawn(rig):
     run_test(gui, ["LEFT"], cycles=1)
 
     assert gui.rr_last_trace is not None
+
+    # Stated as separate preconditions so a failure says which one broke. This
+    # test used to assert only the canvas, and an empty canvas cannot tell a
+    # layout problem from a leg that never moved.
+    series, metrics = gui.rr_last_trace
+    assert metrics["ok"], metrics.get("reason")
+
+    angles = [a for _, a in series]
+    assert max(angles) - min(angles) > 1.0, "the simulated surface did not move"
+
+    # Tk assigns the canvas its real size on idle; redrawing before that has
+    # happened plots into a 1-pixel box.
+    gui.pump(0.2)
     gui.redraw_range_rate_trace()
 
     assert gui.rr_canvas.find_all(), "nothing drawn on the trace canvas"
@@ -368,4 +395,104 @@ def test_export_writes_a_csv(rig, tmp_path, monkeypatch):
     text = written[0].read_text()
     assert "phase,side,direction" in text
     assert "LEFT" in text
+# def
+
+
+def test_endpoints_are_reported_with_their_spread(rig, tmp_path, monkeypatch):
+    """Max/min settled angle, each with its own sd - range alone hides a shift."""
+    gui, _, _ = rig
+
+    run_test(gui, ["LEFT"], cycles=2)
+
+    row = gui.rr_summary_rows[0]
+    angle_max, angle_min = row[3], row[4]
+
+    # "+/-" present because 2 cycles give a defined sample stdev.
+    assert "+/-" in angle_max and "+/-" in angle_min
+
+    hi = float(angle_max.split()[0])
+    lo = float(angle_min.split()[0])
+
+    assert hi > lo
+    assert hi - lo == pytest.approx(TRAVEL_DEG["LEFT"], abs=3.0)
+
+    # The endpoints must bracket the reported range, not restate it.
+    assert float(row[5]) == pytest.approx(hi - lo, abs=1.0)
+
+    monkeypatch.setattr(MT, "APP_DIR", str(tmp_path))
+    gui.drone_name_var.set("testbird")
+    gui.export_range_rate_csv()
+
+    written = list((tmp_path / "reports").glob("testbird_*_rangerate.csv"))
+    header = written[0].read_text().splitlines()[0]
+
+    assert header.split(",")[3:6] == ["angle_max_deg", "angle_min_deg", "range_deg"]
+# def
+
+
+def test_sample_export_writes_every_sample(rig, tmp_path, monkeypatch):
+    """The raw material behind the summary, in the console tool's schema."""
+    gui, _, _ = rig
+
+    run_test(gui, ["LEFT"], cycles=2)
+    monkeypatch.setattr(MT, "APP_DIR", str(tmp_path))
+
+    assert gui.rr_samples_btn.cget("state") == "normal"
+
+    gui.drone_name_var.set("testbird")
+    gui.export_range_rate_samples_csv()
+
+    written = list((tmp_path / "reports").glob("testbird_*_rangerate_samples.csv"))
+    assert len(written) == 1
+
+    lines = written[0].read_text().strip().splitlines()
+
+    assert lines[0] == "phase,cycle,direction,side,t_rel_s,angle_deg"
+    assert len(lines) - 1 == len(gui.rr_samples)
+
+    # Two cycles x two legs, one side. Every leg must be represented.
+    legs = {tuple(line.split(",")[1:4]) for line in lines[1:]}
+    assert legs == {
+        ("1", "neg_to_pos", "LEFT"), ("1", "pos_to_neg", "LEFT"),
+        ("2", "neg_to_pos", "LEFT"), ("2", "pos_to_neg", "LEFT"),
+    }
+
+    # Pre-roll is captured before the command, so t_rel must go negative - that
+    # is what gives analyse_leg a baseline to measure travel from.
+    times = [float(line.split(",")[4]) for line in lines[1:]]
+    assert min(times) < 0.0
+    assert max(times) > 0.0
+# def
+
+
+def test_both_exports_share_one_filename_stem(rig, tmp_path, monkeypatch):
+    """Summary and samples must pair up on disk however late either is saved."""
+    gui, _, _ = rig
+
+    run_test(gui, ["LEFT"], cycles=1)
+    monkeypatch.setattr(MT, "APP_DIR", str(tmp_path))
+
+    gui.drone_name_var.set("testbird")
+    gui.rr_run_stamp = "20260101_120000"
+
+    gui.export_range_rate_csv()
+    gui.export_range_rate_samples_csv()
+
+    names = sorted(p.name for p in (tmp_path / "reports").glob("*.csv"))
+
+    assert names == ["testbird_20260101_120000_rangerate.csv",
+                     "testbird_20260101_120000_rangerate_samples.csv"]
+# def
+
+
+def test_sample_retention_is_bounded(rig, monkeypatch):
+    """A pathological run must not grow the buffer without limit."""
+    monkeypatch.setattr(MT, "MAX_EXPORT_SAMPLES", 50)
+
+    gui, _, _ = rig
+    run_test(gui, ["LEFT"], cycles=1)
+
+    assert len(gui.rr_samples) == 50
+    assert gui.rr_samples_truncated
+    assert "truncated" in gui.rr_note_label.cget("text")
 # def
