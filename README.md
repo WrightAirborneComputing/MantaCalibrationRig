@@ -65,6 +65,39 @@ The window opens immediately, then scans for hardware in the background. If a
 device is missing, the app stays usable — plug it in, hit **Refresh ports**,
 then **Connect**.
 
+Connection state and the instrumentation log sit outside the tabs, so the link
+and the sample rate stay visible whichever tab you are on.
+
+### Trim tab
+
+The per-side PWM min/max/trim controls, the position sliders, and auto
+calibration. This is the original UI.
+
+### Range & rate tab
+
+Drives each elevon hard over from −1 to +1 and back while capturing at 500 Hz,
+and reports how far it moved and how fast. Pick the phases — one side at a time,
+then both together, so coupling through shared power or linkage shows up as a
+difference — set the cycle count, and press **Run test**. It asks before moving
+anything.
+
+The headline is the 10–90% transit time, with rate derived from it. Endpoints are
+where a servo is slowest and least repeatable, so 10–90% is both the standard
+measure and the stable one. Results are reported as mean ± sample standard
+deviation across the cycles, and **Save CSV** writes the summary.
+
+Watch the trace, not just the table: a servo at its mechanical limit shows a
+rounded start as it accelerates and a settling approach at the end, while a
+slew-limited command tracks a straight line and stops crisply. That difference is
+how you tell whether the autopilot is limiting the surface or the servo is.
+
+The same test is available from the console, which also writes every captured
+sample for plotting:
+
+```bash
+python3 range_test.py --name manta --samples-csv
+```
+
 ## Port detection
 
 The **Connection** panel at the top left shows what was found and lets you

@@ -66,10 +66,12 @@ def app():
 # def
 
 
-def test_trim_tab_is_in_a_notebook(app):
+def test_tabs(app):
     gui, _ = app
 
-    assert [gui.notebook.tab(t, "text").strip() for t in gui.notebook.tabs()] == ["Trim"]
+    tabs = [gui.notebook.tab(t, "text").strip() for t in gui.notebook.tabs()]
+
+    assert tabs == ["Trim", "Range & rate"]
 # def
 
 

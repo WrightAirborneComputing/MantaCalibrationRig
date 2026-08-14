@@ -1,6 +1,6 @@
 try:
     import tkinter as tk
-    from tkinter import ttk
+    from tkinter import messagebox, ttk
 except ImportError:
     raise SystemExit(
         "tkinter is not available.\n"
@@ -42,6 +42,21 @@ from manta_common import (
     list_serial_ports,
     position_to_degrees,
     probe_pico,
+)
+
+# The analysis is shared with the console tool rather than reimplemented here:
+# it is already tested against synthetic servo traces with known answers, and a
+# second copy would be a second thing to get wrong. range_test imports
+# DroneInterface lazily inside main(), so this is not a cycle.
+from pico_monitor import TickTracker
+from range_test import (
+    MIN_TRAVEL_DEG,
+    PHASES,
+    PHASE_SIDES,
+    PRE_ROLL_S,
+    analyse_leg,
+    mean_sd,
+    to_series,
 )
 
 
@@ -1150,6 +1165,12 @@ class FourSliderGUI:
         self.sweep_thread = None
         self.sweep_active = False
 
+        self.range_test_thread = None
+        self.range_test_active = False
+        self.rr_results = []
+        self.rr_summary_rows = []
+        self.rr_last_trace = None
+
         self.drone_name_var = tk.StringVar(value="")
         self.folding_var = tk.StringVar(value="")
 
@@ -1427,6 +1448,10 @@ class FourSliderGUI:
         )
         right_center_btn.pack(pady=(0, 5))
 
+        rr_tab = tk.Frame(self.notebook, padx=6, pady=6)
+        self.notebook.add(rr_tab, text="  Range & rate  ")
+        self.build_range_rate_tab(rr_tab)
+
         # Instrumentation panel
         log_group = tk.LabelFrame(body, text="Instrumentation", padx=10, pady=10)
         log_group.pack(side=tk.LEFT, padx=10, fill=tk.BOTH, expand=True)
@@ -1571,6 +1596,552 @@ class FourSliderGUI:
             print("Sweep to CSV failed: %s" % str(e))
         finally:
             self.sweep_active = False
+    # def
+
+    # ---- Range and rate test -------------------------------------------------
+
+    def build_range_rate_tab(self, parent):
+        left_col = tk.Frame(parent)
+        left_col.pack(side=tk.LEFT, anchor="n", padx=(0, 10))
+
+        setup = tk.LabelFrame(left_col, text="What to run", padx=8, pady=6)
+        setup.pack(anchor="w", fill=tk.X)
+
+        # One side at a time, then both, so a difference under load is
+        # attributable to coupling rather than to the servo.
+        self.rr_phase_vars = {}
+        for phase in PHASES:
+            var = tk.IntVar(value=1)
+            self.rr_phase_vars[phase] = var
+            tk.Checkbutton(
+                setup,
+                text={"LEFT": "Left alone", "RIGHT": "Right alone",
+                      "BOTH": "Both together"}[phase],
+                variable=var,
+                anchor="w",
+                command=self.update_range_rate_estimate,
+            ).pack(anchor="w")
+
+        self.rr_cycles_var = tk.StringVar(value="3")
+        self.rr_settle_var = tk.StringVar(value="2.0")
+        self.rr_rate_var = tk.StringVar(value=str(FAST_RATE_HZ))
+
+        for label, var, width in (("Cycles", self.rr_cycles_var, 5),
+                                  ("Settle s", self.rr_settle_var, 5),
+                                  ("Rate Hz", self.rr_rate_var, 5)):
+            row = tk.Frame(setup)
+            row.pack(anchor="w", pady=(4, 0), fill=tk.X)
+            tk.Label(row, text=label, width=9, anchor="w").pack(side=tk.LEFT)
+            entry = tk.Entry(row, textvariable=var, width=width)
+            entry.pack(side=tk.LEFT)
+            entry.bind("<KeyRelease>", lambda event: self.update_range_rate_estimate())
+
+        self.rr_estimate_label = tk.Label(setup, text="", anchor="w", fg="gray25")
+        self.rr_estimate_label.pack(anchor="w", pady=(6, 0))
+
+        run_group = tk.LabelFrame(left_col, text="Run", padx=8, pady=6)
+        run_group.pack(anchor="w", fill=tk.X, pady=(8, 0))
+
+        tk.Label(
+            run_group,
+            text="Surfaces move to full deflection.\nThey centre when the test stops.",
+            justify="left",
+            anchor="w",
+            fg="gray25",
+        ).pack(anchor="w", pady=(0, 6))
+
+        button_row = tk.Frame(run_group)
+        button_row.pack(anchor="w", fill=tk.X)
+
+        self.rr_run_btn = tk.Button(
+            button_row, text="Run test", width=11, command=self.start_range_rate_test)
+        self.rr_run_btn.pack(side=tk.LEFT)
+
+        self.rr_stop_btn = tk.Button(
+            button_row, text="Stop", width=8, state="disabled",
+            command=self.stop_range_rate_test)
+        self.rr_stop_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        self.rr_progress = ttk.Progressbar(run_group, mode="determinate", maximum=100.0)
+        self.rr_progress.pack(fill=tk.X, pady=(8, 4))
+
+        self.rr_status_label = tk.Label(run_group, text="Idle", anchor="w")
+        self.rr_status_label.pack(anchor="w")
+
+        leg_group = tk.LabelFrame(left_col, text="Last leg", padx=8, pady=6)
+        leg_group.pack(anchor="w", fill=tk.X, pady=(8, 0))
+
+        self.rr_leg_label = tk.Label(
+            leg_group, text="--", anchor="w", justify="left", width=26)
+        self.rr_leg_label.pack(anchor="w")
+
+        right_col = tk.Frame(parent)
+        right_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # The trace is the point of capturing at 500 Hz: a servo at its
+        # mechanical limit shows a rounded start and a settling approach, while a
+        # slew-limited command tracks a straight line and stops crisply. A table
+        # of numbers cannot show that difference.
+        trace_group = tk.LabelFrame(right_col, text="Last transit", padx=6, pady=6)
+        trace_group.pack(fill=tk.X)
+
+        self.rr_canvas = tk.Canvas(trace_group, height=210, bg="white",
+                                   highlightthickness=1, highlightbackground="gray70")
+        self.rr_canvas.pack(fill=tk.BOTH, expand=True)
+        self.rr_canvas.bind("<Configure>", lambda event: self.redraw_range_rate_trace())
+
+        results_group = tk.LabelFrame(right_col, text="Results", padx=6, pady=6)
+        results_group.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        columns = ("phase", "side", "direction", "range", "travel", "transit", "rate", "n")
+        headings = ("Phase", "Side", "Direction", "Range deg", "Travel deg",
+                    "Transit ms", "Rate deg/s", "n")
+
+        self.rr_tree = ttk.Treeview(
+            results_group, columns=columns, show="headings", height=8)
+
+        for column, heading in zip(columns, headings):
+            self.rr_tree.heading(column, text=heading)
+            self.rr_tree.column(column, width=92 if column not in ("n", "side") else 52,
+                                anchor="center")
+
+        self.rr_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        tree_scroll = tk.Scrollbar(results_group, command=self.rr_tree.yview)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.rr_tree.config(yscrollcommand=tree_scroll.set)
+
+        footer = tk.Frame(right_col)
+        footer.pack(fill=tk.X, pady=(6, 0))
+
+        self.rr_note_label = tk.Label(footer, text="", anchor="w", fg="dark orange")
+        self.rr_note_label.pack(side=tk.LEFT)
+
+        self.rr_export_btn = tk.Button(
+            footer, text="Save CSV", width=11, state="disabled",
+            command=self.export_range_rate_csv)
+        self.rr_export_btn.pack(side=tk.RIGHT)
+
+        self.update_range_rate_estimate()
+    # def
+
+    def read_range_rate_settings(self):
+        """Parse the setup fields. Returns (phases, cycles, settle, rate)."""
+        phases = [p for p in PHASES if self.rr_phase_vars[p].get()]
+
+        cycles = max(1, self.get_int_var(self.rr_cycles_var, 3))
+        settle = max(0.3, self.get_float_var(self.rr_settle_var, 2.0))
+        rate = max(SLOW_RATE_HZ, self.get_int_var(self.rr_rate_var, FAST_RATE_HZ))
+
+        return phases, cycles, settle, rate
+    # def
+
+    def update_range_rate_estimate(self):
+        phases, cycles, settle, _rate = self.read_range_rate_settings()
+
+        legs = len(phases) * cycles * 2
+        seconds = len(phases) * settle + legs * (PRE_ROLL_S + settle)
+
+        self.rr_estimate_label.config(
+            text="%d hard-overs, about %d s" % (legs, int(round(seconds))))
+    # def
+
+    def start_range_rate_test(self):
+        if self.range_test_active:
+            print("Range/rate test already running")
+            return
+
+        if self.left_cal_active or self.right_cal_active or self.sweep_active:
+            messagebox.showwarning(
+                "Busy",
+                "Stop the calibration or sweep first - they drive the same actuators.")
+            return
+
+        phases, cycles, settle, rate = self.read_range_rate_settings()
+
+        if not phases:
+            messagebox.showwarning("Nothing to run", "Select at least one phase.")
+            return
+
+        if not self.drone_interface.is_connected():
+            messagebox.showwarning(
+                "No link", "Connect to the flight controller before running the test.")
+            return
+
+        if not self.position_reader.is_streaming():
+            messagebox.showwarning(
+                "No position data", "The Pico is not streaming - nothing would be measured.")
+            return
+
+        legs = len(phases) * cycles * 2
+
+        if not messagebox.askyesno(
+                "The surfaces will move",
+                "%d hard-overs to full deflection across %d phase(s).\n\n"
+                "The first move slams to -1 from rest. Keep hands clear.\n\n"
+                "Run the test?" % (legs, len(phases))):
+            return
+
+        self.rr_tree.delete(*self.rr_tree.get_children())
+        self.rr_results = []
+        self.rr_summary_rows = []
+        self.rr_last_trace = None
+        self.rr_canvas.delete("all")
+        self.rr_note_label.config(text="")
+        self.rr_export_btn.config(state="disabled")
+
+        self.range_test_active = True
+        self.rr_run_btn.config(state="disabled")
+        self.rr_stop_btn.config(state="normal")
+
+        self.range_test_thread = threading.Thread(
+            target=self._range_rate_worker,
+            args=(phases, cycles, settle, rate),
+            daemon=True,
+        )
+        self.range_test_thread.start()
+    # def
+
+    def stop_range_rate_test(self):
+        if self.range_test_active:
+            print("Stopping range/rate test...")
+        self.range_test_active = False
+    # def
+
+    def _rr_status(self, text, fraction=None):
+        def apply():
+            if self._closing:
+                return
+            self.rr_status_label.config(text=text)
+            if fraction is not None:
+                self.rr_progress.config(value=max(0.0, min(100.0, fraction * 100.0)))
+        self.post_to_gui(apply)
+    # def
+
+    def _rr_calibration(self):
+        """The reader's scalers in the shape to_series() expects."""
+        reader = self.position_reader
+        return {
+            "LEFT": {"scaler": reader.left_scaler, "offset": reader.left_offset},
+            "RIGHT": {"scaler": reader.right_scaler, "offset": reader.right_offset},
+        }
+    # def
+
+    def _range_rate_worker(self, phases, cycles, settle, rate):
+        restore_rate = self.position_reader.sample_hz
+
+        try:
+            achieved = self.position_reader.set_sample_rate(rate)
+
+            if achieved is None:
+                self._rr_status("Pico refused the rate - is it running sampler.py?")
+                messagebox_text = (
+                    "The Pico did not accept a rate command, so it is probably running "
+                    "the legacy 10 Hz firmware. That is far too slow to resolve a "
+                    "transit.\n\nUpload pico/sampler.py as main.py and try again.")
+                self.post_to_gui(
+                    lambda: messagebox.showerror("Old firmware", messagebox_text))
+                return
+
+            cal = self._rr_calibration()
+
+            total_legs = len(phases) * cycles * 2
+            done = 0
+
+            for phase in phases:
+                if not self.range_test_active:
+                    break
+
+                sides = PHASE_SIDES[phase]
+
+                self._rr_status("%s: parking at -1" % phase, done / float(total_legs))
+                for side in sides:
+                    self.drone_interface.command_elevon(
+                        self.rr_output_function(side), -1.0)
+                time.sleep(settle)
+
+                for cycle in range(1, cycles + 1):
+                    for direction, target in (("neg_to_pos", 1.0), ("pos_to_neg", -1.0)):
+                        if not self.range_test_active:
+                            break
+
+                        self._rr_status(
+                            "%s: cycle %d/%d, %s" % (phase, cycle, cycles, direction),
+                            done / float(total_legs))
+
+                        self._rr_run_leg(phase, sides, cycle, direction, target,
+                                         settle, cal)
+
+                        done += 1
+                        self._rr_status(
+                            "%s: cycle %d/%d, %s" % (phase, cycle, cycles, direction),
+                            done / float(total_legs))
+
+                for side in sides:
+                    self.drone_interface.command_elevon(self.rr_output_function(side), 0.0)
+
+        except Exception as e:
+            print("Range/rate test failed: %s" % str(e))
+            self._rr_status("Failed: %s" % str(e))
+
+        finally:
+            # Always park the surfaces. MAV_CMD_ACTUATOR_TEST holds its value for
+            # 60 s, so an abandoned test would otherwise leave them hard over.
+            try:
+                self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, 0.0)
+                self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, 0.0)
+            except Exception as e:
+                print("Failed to centre elevons after the test: %s" % str(e))
+
+            if restore_rate <= SLOW_RATE_HZ:
+                self.position_reader.set_sample_rate(SLOW_RATE_HZ)
+
+            self.range_test_active = False
+            self.post_to_gui(self._rr_finish)
+    # def
+
+    def rr_output_function(self, side):
+        return self.LEFT_OUTPUT_FUNCTION if side == "LEFT" else self.RIGHT_OUTPUT_FUNCTION
+    # def
+
+    def _rr_run_leg(self, phase, sides, cycle, direction, target, settle, cal):
+        reader = self.position_reader
+
+        # Pay MicroPython's collector stall now rather than have it land in the
+        # middle of the transit. Before the capture starts, so it is not in it.
+        reader.send_command("G")
+
+        reader.start_capture()
+
+        # Baseline before the command, so t=0 has something to be measured from.
+        time.sleep(PRE_ROLL_S)
+
+        t_cmd = time.monotonic()
+        for side in sides:
+            self.drone_interface.command_elevon(self.rr_output_function(side), target)
+
+        time.sleep(settle)
+
+        samples, truncated = reader.stop_capture()
+
+        tracker = TickTracker()
+        for _host_t, pico_us, _l, _r in samples:
+            if pico_us is not None:
+                tracker.feed(pico_us)
+
+        timing = tracker.report()
+        dropped = timing["dropped"] if timing else 0
+
+        for side in PHASE_SIDES[phase]:
+            series = to_series(samples, t_cmd, cal, side)
+            metrics = analyse_leg(series)
+
+            metrics.update({
+                "phase": phase, "cycle": cycle, "direction": direction,
+                "side": side, "dropped": dropped, "truncated": truncated,
+            })
+            self.rr_results.append(metrics)
+
+            self.post_to_gui(
+                lambda m=metrics, s=series: self._rr_show_leg(m, s))
+    # def
+
+    def _rr_show_leg(self, metrics, series):
+        if self._closing:
+            return
+
+        if metrics["ok"]:
+            text = ("%s %s\ntravel %.2f deg\ntransit %.0f ms\nrate %.0f deg/s\ngaps %d"
+                    % (metrics["side"], metrics["direction"], metrics["travel_deg"],
+                       metrics["transit_s"] * 1000.0, metrics["rate_deg_s"],
+                       metrics["dropped"]))
+        else:
+            text = "%s %s\n%s" % (metrics["side"], metrics["direction"], metrics["reason"])
+
+        self.rr_leg_label.config(text=text)
+
+        self.rr_last_trace = (series, metrics)
+        self.redraw_range_rate_trace()
+    # def
+
+    def redraw_range_rate_trace(self):
+        canvas = self.rr_canvas
+        canvas.delete("all")
+
+        trace = getattr(self, "rr_last_trace", None)
+        if not trace:
+            return
+
+        series, metrics = trace
+        if not series:
+            return
+
+        width = canvas.winfo_width() or 520
+        height = canvas.winfo_height() or 210
+
+        left, right, top, bottom = 46, 12, 12, 26
+        plot_w = max(10, width - left - right)
+        plot_h = max(10, height - top - bottom)
+
+        times = [t for t, _ in series]
+        angles = [a for _, a in series]
+
+        t0, t1 = min(times), max(times)
+        a0, a1 = min(angles), max(angles)
+
+        if t1 - t0 < 1e-6 or a1 - a0 < 1e-6:
+            return
+
+        pad = (a1 - a0) * 0.08
+        a0 -= pad
+        a1 += pad
+
+        def sx(t):
+            return left + ((t - t0) / (t1 - t0)) * plot_w
+
+        def sy(a):
+            return top + (1.0 - ((a - a0) / (a1 - a0))) * plot_h
+
+        canvas.create_line(left, top, left, top + plot_h, fill="gray60")
+        canvas.create_line(left, top + plot_h, left + plot_w, top + plot_h, fill="gray60")
+
+        # Command instant. Everything left of it is pre-roll baseline.
+        if t0 < 0.0 < t1:
+            canvas.create_line(sx(0.0), top, sx(0.0), top + plot_h,
+                               fill="gray50", dash=(2, 3))
+            canvas.create_text(sx(0.0) + 3, top + 6, text="cmd",
+                               anchor="w", fill="gray40")
+
+        if metrics.get("ok"):
+            baseline = metrics["baseline_deg"]
+            travel = metrics["travel_deg"]
+
+            for fraction, label in ((0.10, "10%"), (0.90, "90%")):
+                y = sy(baseline + fraction * travel)
+                canvas.create_line(left, y, left + plot_w, y, fill="gray75", dash=(3, 3))
+                canvas.create_text(left - 4, y, text=label, anchor="e", fill="gray40")
+
+            for key in ("latency_s", "t90_s"):
+                x = sx(metrics[key])
+                canvas.create_line(x, top, x, top + plot_h, fill="gray65", dash=(2, 3))
+
+            canvas.create_text(
+                left + plot_w, top + 6, anchor="e", fill="gray30",
+                text="%.0f ms  %.0f deg/s" % (metrics["transit_s"] * 1000.0,
+                                              metrics["rate_deg_s"]))
+
+        points = []
+        for t, a in series:
+            points.extend((sx(t), sy(a)))
+
+        if len(points) >= 4:
+            canvas.create_line(*points, fill="#1d6fa5", width=2)
+
+        canvas.create_text(left - 4, sy(a1), text="%.0f" % a1, anchor="e", fill="gray40")
+        canvas.create_text(left - 4, sy(a0), text="%.0f" % a0, anchor="e", fill="gray40")
+        canvas.create_text(left, top + plot_h + 12, text="%.2f s" % t0,
+                           anchor="w", fill="gray40")
+        canvas.create_text(left + plot_w, top + plot_h + 12, text="%.2f s" % t1,
+                           anchor="e", fill="gray40")
+    # def
+
+    def _rr_finish(self):
+        if self._closing:
+            return
+
+        self.rr_run_btn.config(state="normal")
+        self.rr_stop_btn.config(state="disabled")
+
+        rows = self.summarise_range_rate()
+        self.rr_summary_rows = rows
+
+        for row in rows:
+            self.rr_tree.insert("", tk.END, values=row)
+
+        notes = []
+
+        dropped = sum(r.get("dropped", 0) for r in self.rr_results)
+        if dropped:
+            notes.append("%d samples missing across the run" % dropped)
+
+        failed = [r for r in self.rr_results if not r["ok"]]
+        if failed:
+            notes.append("%d legs did not measure (%s)"
+                         % (len(failed), failed[0]["reason"]))
+
+        self.rr_note_label.config(text="; ".join(notes))
+        self.rr_export_btn.config(state="normal" if rows else "disabled")
+
+        self.rr_progress.config(value=100.0 if rows else 0.0)
+        self.rr_status_label.config(text="Done" if rows else "No measurements")
+    # def
+
+    def summarise_range_rate(self):
+        """Aggregate the per-leg results into one row per phase/side/direction."""
+        rows = []
+
+        for phase in PHASES:
+            for side in ("LEFT", "RIGHT"):
+                ok = [r for r in self.rr_results
+                      if r["phase"] == phase and r["side"] == side and r["ok"]]
+                if not ok:
+                    continue
+
+                # Range is the span between the settled endpoints, the same
+                # quantity whichever way it was crossed.
+                ends = [r["final_deg"] for r in ok]
+                span = max(ends) - min(ends)
+
+                for direction in ("neg_to_pos", "pos_to_neg"):
+                    legs = [r for r in ok if r["direction"] == direction]
+                    if not legs:
+                        continue
+
+                    travel = mean_sd([abs(r["travel_deg"]) for r in legs])
+                    transit = mean_sd([r["transit_s"] * 1000.0 for r in legs])
+                    rate = mean_sd([r["rate_deg_s"] for r in legs])
+
+                    rows.append((
+                        phase, side, direction,
+                        "%.2f" % span,
+                        self.format_mean_sd(travel, "%.2f"),
+                        self.format_mean_sd(transit, "%.1f"),
+                        self.format_mean_sd(rate, "%.0f"),
+                        len(legs),
+                    ))
+
+        return rows
+    # def
+
+    def format_mean_sd(self, pair, fmt):
+        mean, sd = pair
+        if mean is None:
+            return "-"
+        if sd is None:
+            return fmt % mean
+        return (fmt + " +/- " + fmt) % (mean, sd)
+    # def
+
+    def export_range_rate_csv(self):
+        if not self.rr_summary_rows:
+            print("Nothing to export")
+            return
+
+        try:
+            name = self.make_safe_filename(self.drone_name_var.get().strip() or "elevon")
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(APP_DIR, "%s_%s_rangerate.csv" % (name, stamp))
+
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["phase", "side", "direction", "range_deg", "travel_deg",
+                                 "transit_ms", "rate_deg_s", "cycles"])
+                writer.writerows(self.rr_summary_rows)
+
+            print("Range/rate summary written to %s" % path)
+
+        except Exception as e:
+            print("Failed to export range/rate CSV: %s" % str(e))
     # def
 
     def create_angle_entry(self, parent, label, text_var, apply_callback):
@@ -2852,11 +3423,13 @@ class FourSliderGUI:
             return
 
         try:
-            if not self.left_cal_active and not self.sweep_active:
+            if not self.left_cal_active and not self.sweep_active \
+                    and not self.range_test_active:
                 left_cmd = float(self.left_pos.get())
                 self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, left_cmd)
 
-            if not self.right_cal_active and not self.sweep_active:
+            if not self.right_cal_active and not self.sweep_active \
+                    and not self.range_test_active:
                 right_cmd = float(self.right_pos.get())
                 self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, right_cmd)
 
@@ -2895,8 +3468,10 @@ class FourSliderGUI:
         self.left_cal_active = False
         self.right_cal_active = False
         self.sweep_active = False
+        self.range_test_active = False
 
-        for thread in (self.left_cal_thread, self.right_cal_thread, self.sweep_thread):
+        for thread in (self.left_cal_thread, self.right_cal_thread,
+                       self.sweep_thread, self.range_test_thread):
             if thread is not None and thread.is_alive():
                 thread.join(2.0)
 
