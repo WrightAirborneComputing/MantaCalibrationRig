@@ -596,6 +596,10 @@ class DroneInterface:
         if not self.is_connected():
             return
 
+        # Test escape hatch: exercise the whole app without moving surfaces.
+        if os.environ.get("MANTA_NO_ACTUATE"):
+            return
+
         MAV_CMD_ACTUATOR_TEST = 310
         timeout_s = 60.0
 
@@ -635,7 +639,12 @@ class PositionReader:
         self.last_error = None
         self._last_sample_time = 0.0
 
+        # Serialises every read-modify-write of the settings file. Reentrant
+        # because set_center() mutates and then saves through one lock scope.
+        self._settings_lock = threading.RLock()
+
         self.calibration_file = os.path.join(APP_DIR, "settings.json")
+        self.backup_file = self.calibration_file + ".bak"
 
         self.drone_name = ""
 
@@ -654,6 +663,34 @@ class PositionReader:
         self.angle_trim_degs = -5.0
 
         self.load_calibration()
+    # def
+
+    def _read_settings_file(self):
+        """Return the settings document as a dict. Never raises; {} on any problem."""
+        try:
+            with open(self.calibration_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    # def
+
+    def _write_settings_atomic(self, data, path=None):
+        """Write the whole document via a temp file and an atomic rename.
+
+        os.replace is atomic on Linux and Windows, so a crash or a concurrent
+        reader can never observe a half-written file. The fsync matters because
+        the rig gets powered off abruptly.
+        """
+        path = self.calibration_file if path is None else path
+        tmp = path + ".tmp"
+
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp, path)
     # def
 
     def load_calibration(self):
@@ -704,82 +741,103 @@ class PositionReader:
                 )
             )
 
+            # Keep a known-good copy. If the live file is ever damaged, this is
+            # the difference between a restore and re-calibrating the rig.
+            try:
+                self._write_settings_atomic(data, self.backup_file)
+            except Exception as e:
+                print("Could not write calibration backup %s: %s" % (self.backup_file, str(e)))
+
         except Exception as e:
-            print("Failed to load calibration from %s: %s" % (self.calibration_file, str(e)))
+            print("FAILED TO LOAD CALIBRATION from %s: %s" % (self.calibration_file, str(e)))
+            print("Running on built-in defaults - your rig calibration is NOT loaded.")
+            if os.path.exists(self.backup_file):
+                print("A previous good copy is at %s - copy it over %s and restart."
+                      % (self.backup_file, self.calibration_file))
     # def
 
-    def save_calibration(self):
-        data = {
-            "LEFT": {
-                "scaler": self.left_scaler,
-                "offset": self.left_offset,
-            },
-            "RIGHT": {
-                "scaler": self.right_scaler,
-                "offset": self.right_offset,
-            },
-            "ANGLES": {
+    def _section_payload(self, section):
+        if section == "LEFT":
+            return {"scaler": self.left_scaler, "offset": self.left_offset}
+        if section == "RIGHT":
+            return {"scaler": self.right_scaler, "offset": self.right_offset}
+        if section == "ANGLES":
+            return {
                 "angle_neg_degs": self.angle_neg_degs,
                 "angle_pos_degs": self.angle_pos_degs,
                 "angle_trim_degs": self.angle_trim_degs,
-            },
-            "PORTS": {
-                "pico": self.pico_port,
-                "drone": self.drone_port,
-            },
-        }
-
-        try:
-            with open(self.calibration_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
-
-            print(
-                "Saved calibration to %s: LEFT scaler=%.6f offset=%.6f, RIGHT scaler=%.6f offset=%.6f, angles=(%.2f, %.2f, %.2f)"
-                % (
-                    self.calibration_file,
-                    self.left_scaler,
-                    self.left_offset,
-                    self.right_scaler,
-                    self.right_offset,
-                    self.angle_neg_degs,
-                    self.angle_pos_degs,
-                    self.angle_trim_degs,
-                )
-            )
-
-        except Exception as e:
-            print("Failed to save calibration to %s: %s" % (self.calibration_file, str(e)))
+            }
+        if section == "PORTS":
+            return {"pico": self.pico_port, "drone": self.drone_port}
+        return {}
     # def
 
-    def set_drone_name(self, drone_name):
-        self.drone_name = str(drone_name)
-        self.save_calibration()
+    def save_calibration(self, sections=None):
+        """Merge the named sections into what is on disk, then replace atomically.
+
+        Only the sections the caller actually changed are written. This object is
+        constructed once and never reloads, so writing every section on every save
+        would let an unrelated save - recording a port, say - stamp this instance's
+        stale calibration over newer values written by another instance or by hand.
+
+        sections=None means "all of them", for a deliberate full save.
+        """
+        if sections is None:
+            sections = ("LEFT", "RIGHT", "ANGLES", "PORTS")
+
+        with self._settings_lock:
+            data = self._read_settings_file()
+
+            for section in sections:
+                data.setdefault(section, {}).update(self._section_payload(section))
+
+            try:
+                self._write_settings_atomic(data)
+
+                print(
+                    "Saved calibration to %s: LEFT scaler=%.6f offset=%.6f, RIGHT scaler=%.6f offset=%.6f, angles=(%.2f, %.2f, %.2f)"
+                    % (
+                        self.calibration_file,
+                        self.left_scaler,
+                        self.left_offset,
+                        self.right_scaler,
+                        self.right_offset,
+                        self.angle_neg_degs,
+                        self.angle_pos_degs,
+                        self.angle_trim_degs,
+                    )
+                )
+
+            except Exception as e:
+                print("Failed to save calibration to %s: %s" % (self.calibration_file, str(e)))
     # def
 
     def set_remembered_ports(self, pico_port=None, drone_port=None):
-        changed = False
+        with self._settings_lock:
+            changed = False
 
-        if pico_port is not None and pico_port != self.pico_port:
-            self.pico_port = pico_port
-            changed = True
+            if pico_port is not None and pico_port != self.pico_port:
+                self.pico_port = pico_port
+                changed = True
 
-        if drone_port is not None and drone_port != self.drone_port:
-            self.drone_port = drone_port
-            changed = True
+            if drone_port is not None and drone_port != self.drone_port:
+                self.drone_port = drone_port
+                changed = True
 
-        if changed:
-            self.save_calibration()
+            if changed:
+                self.save_calibration(("PORTS",))
     # def
 
     def set_angle_settings(self, angle_neg_degs=None, angle_pos_degs=None, angle_trim_degs=None):
-        if angle_neg_degs is not None:
-            self.angle_neg_degs = float(angle_neg_degs)
-        if angle_pos_degs is not None:
-            self.angle_pos_degs = float(angle_pos_degs)
-        if angle_trim_degs is not None:
-            self.angle_trim_degs = float(angle_trim_degs)
+        with self._settings_lock:
+            if angle_neg_degs is not None:
+                self.angle_neg_degs = float(angle_neg_degs)
+            if angle_pos_degs is not None:
+                self.angle_pos_degs = float(angle_pos_degs)
+            if angle_trim_degs is not None:
+                self.angle_trim_degs = float(angle_trim_degs)
 
-        self.save_calibration()
+            self.save_calibration(("ANGLES",))
     # def
 
     def position_to_degrees(self, side, raw_position):
@@ -796,35 +854,37 @@ class PositionReader:
             print("No data for centering %s" % side)
             return
 
-        if side == "LEFT":
-            self.left_offset = -(self.left_scaler * raw)
-            print("Left centred. Scaler=%.4f Offset = %.4f" % (self.left_scaler, self.left_offset))
-            self.save_calibration()
+        with self._settings_lock:
+            if side == "LEFT":
+                self.left_offset = -(self.left_scaler * raw)
+                print("Left centred. Scaler=%.4f Offset = %.4f" % (self.left_scaler, self.left_offset))
+                self.save_calibration(("LEFT",))
 
-        elif side == "RIGHT":
-            self.right_offset = (self.right_scaler * raw)
-            print("Right centred. Scaler=%.4f Offset = %.4f" % (self.right_scaler, self.right_offset))
-            self.save_calibration()
+            elif side == "RIGHT":
+                self.right_offset = (self.right_scaler * raw)
+                print("Right centred. Scaler=%.4f Offset = %.4f" % (self.right_scaler, self.right_offset))
+                self.save_calibration(("RIGHT",))
     # def
 
     def set_scaler_and_offset(self, side, scaler=None, offset=None):
-        if side == "LEFT":
-            if scaler is not None:
-                self.left_scaler = float(scaler)
-            if offset is not None:
-                self.left_offset = float(offset)
+        with self._settings_lock:
+            if side == "LEFT":
+                if scaler is not None:
+                    self.left_scaler = float(scaler)
+                if offset is not None:
+                    self.left_offset = float(offset)
 
-            print("LEFT calibration set. Scaler=%.6f Offset=%.6f" % (self.left_scaler, self.left_offset))
-            self.save_calibration()
+                print("LEFT calibration set. Scaler=%.6f Offset=%.6f" % (self.left_scaler, self.left_offset))
+                self.save_calibration(("LEFT",))
 
-        elif side == "RIGHT":
-            if scaler is not None:
-                self.right_scaler = float(scaler)
-            if offset is not None:
-                self.right_offset = float(offset)
+            elif side == "RIGHT":
+                if scaler is not None:
+                    self.right_scaler = float(scaler)
+                if offset is not None:
+                    self.right_offset = float(offset)
 
-            print("RIGHT calibration set. Scaler=%.6f Offset=%.6f" % (self.right_scaler, self.right_offset))
-            self.save_calibration()
+                print("RIGHT calibration set. Scaler=%.6f Offset=%.6f" % (self.right_scaler, self.right_offset))
+                self.save_calibration(("RIGHT",))
     # def
 
     def _position_reader_loop(self):
@@ -1565,9 +1625,11 @@ class FourSliderGUI:
                 print("Connecting MAVLink on %s..." % drone_device)
                 if self.drone_interface.reconnect(drone_device):
                     drone_ok = True
-                    self.refresh_params_from_drone(clear_name=True)
                     drone_text = "Drone: connected (system %s)" % self.drone_interface.master.target_system
+                    # Remember the port before the long param refresh, so a
+                    # mid-refresh failure doesn't lose a known-good port.
                     self.position_reader.set_remembered_ports(drone_port=drone_device)
+                    self.refresh_params_from_drone(clear_name=True)
                 elif self.drone_interface.last_error_kind == "open":
                     drone_text = "Drone: cannot open %s" % drone_device
                 else:

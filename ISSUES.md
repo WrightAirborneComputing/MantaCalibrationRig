@@ -99,7 +99,24 @@ the resulting exception, so full means drop) and trim the widget after each inse
 
 ---
 
-## 6. `set_drone_name` never persists the name — Low
+## 6. `set_drone_name` never persists the name — Low — **FIXED (by removal)**
+
+*Fixed on `fix/issues-round-1`.* The method turned out to have **zero callers** —
+`apply_drone_name` and `refresh_params_from_drone` assign `position_reader.drone_name`
+directly — so adding `drone_name` to the saved dict would have fixed nothing. It was
+deleted instead; its only behaviour was an unnecessary full-file write, i.e. a latent
+instance of issue B below.
+
+Persistence was **deliberately declined**. `refresh_params_from_drone(clear_name=True)`
+clears the name on connect on purpose, and `log_calibration` refusing to write when the
+name is empty is the safety mechanism that stops a calibration being filed under the
+previous airframe. Persisting the name across restarts would remove that check.
+
+Original report follows.
+
+---
+
+## 6a. (original text) `set_drone_name` never persists the name
 
 **Location:** [MantaTrimmer.py:754](MantaTrimmer.py#L754) calls `save_calibration()`,
 but `drone_name` is absent from the dict built at
@@ -155,6 +172,48 @@ each displayed angle is a single unfiltered ADC reading, so the value visibly ji
 **Proposed fix (firmware):** Oversample inside the Pico loop — average e.g. 16
 `read_u16()` calls per transmitted line. This costs nothing at the 10 Hz output rate
 and removes most of the noise before it reaches the host.
+
+---
+
+## B. `save_calibration()` overwrote newer on-disk values — **FIXED**
+
+*Found after `ISSUES.md` was written; fixed on `fix/issues-round-1`.*
+
+`save_calibration()` rebuilt the entire document from instance attributes and
+truncate-wrote it, while `load_calibration()` runs exactly once in `__init__` and never
+reloads. So any save — including `set_remembered_ports()`, called from the connect
+**worker thread** purely to record a port — stamped this instance's possibly-stale
+`LEFT`/`RIGHT`/`ANGLES` over whatever was on disk, silently reverting newer calibration
+written by another instance or by hand.
+
+Fixed by making the save a read-modify-write that merges **only the sections the caller
+actually changed**: `save_calibration(sections)`, with `set_remembered_ports` passing
+`("PORTS",)`, `set_angle_settings` passing `("ANGLES",)`, and the centring/scaler setters
+passing their own side. Section-level merging alone was not enough — the first attempt
+still wrote all four sections every time and still clobbered, which the regression test
+caught.
+
+---
+
+## C. The settings write was unlocked and non-atomic — **FIXED**
+
+*Found after `ISSUES.md` was written; fixed on `fix/issues-round-1`.*
+
+`save_calibration()` could run concurrently on the connect worker thread and the GUI
+thread (`apply_angle_*`, `centre_left`/`centre_right`) with no mutex, and wrote by
+truncating the live file in place. Two writers could interleave inside `open(..., "w")`.
+
+A torn file made `load_calibration` hit its broad `except` and **silently fall back to the
+hardcoded defaults** — the rig's entire calibration gone, with no backup and nothing but
+one quiet line in the instrumentation pane.
+
+Fixed three ways: a reentrant `_settings_lock` around every mutate-and-save; an atomic
+`_write_settings_atomic()` (temp file → `flush` → `fsync` → `os.replace`, atomic on Linux
+and Windows); and `settings.json.bak`, written from the parsed document on every
+successful load. The load-failure message is now loud and names the backup.
+
+Verified with 8 concurrent mutator threads against a continuous reader for 5 s: 4,561
+successful parses, zero torn reads, no `.tmp` litter.
 
 ---
 
