@@ -1161,8 +1161,30 @@ class FourSliderGUI:
         self.angle_pos_var = tk.StringVar(value="%.1f" % self.angle_pos_degs)
         self.angle_trim_var = tk.StringVar(value="%.1f" % self.angle_trim_degs)
 
+        # Shell layout. Two things sit outside the notebook on purpose:
+        #
+        #   connection  - global state every tab depends on, and the thing you
+        #                 most need to see before starting anything
+        #   instrumentation - how you diagnose any tab. Per-tab copies would
+        #                 guarantee the interesting line is on the other one.
+        #
+        # Everything else is tab content.
         main_frame = tk.Frame(root)
-        main_frame.pack(padx=20, pady=20)
+        main_frame.pack(padx=20, pady=20, fill=tk.BOTH, expand=True)
+
+        status_strip = tk.Frame(main_frame)
+        status_strip.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
+
+        self.build_connection_panel(status_strip)
+
+        body = tk.Frame(main_frame)
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.notebook = ttk.Notebook(body)
+        self.notebook.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        trim_tab = tk.Frame(self.notebook, padx=6, pady=6)
+        self.notebook.add(trim_tab, text="  Trim  ")
 
         # Widgets are built from defaults; the real values are fetched by
         # refresh_params_from_drone() once a link is up. Nothing here may block
@@ -1179,10 +1201,8 @@ class FourSliderGUI:
         self.main_rev = 0
 
         # Angle configuration panel
-        angle_group = tk.LabelFrame(main_frame, text="Settings and Control", padx=10, pady=10)
+        angle_group = tk.LabelFrame(trim_tab, text="Settings and Control", padx=10, pady=10)
         angle_group.pack(side=tk.LEFT, padx=10, anchor="n", fill=tk.Y)
-
-        self.build_connection_panel(angle_group)
 
         name_row = tk.Frame(angle_group, bd=1, relief="groove", padx=4, pady=4)
         name_row.pack(anchor="w", pady=3, fill=tk.X)
@@ -1260,7 +1280,7 @@ class FourSliderGUI:
         log_cal_btn.pack(pady=(2, 0), anchor="w")
 
         # LEFT group
-        left_group = tk.LabelFrame(main_frame, text="Left", padx=10, pady=10)
+        left_group = tk.LabelFrame(trim_tab, text="Left", padx=10, pady=10)
         left_group.pack(side=tk.LEFT, padx=10, fill=tk.Y)
 
         left_clear_btn = tk.Button(
@@ -1334,7 +1354,7 @@ class FourSliderGUI:
         left_center_btn.pack(pady=(0, 5))
 
         # RIGHT group
-        right_group = tk.LabelFrame(main_frame, text="Right", padx=10, pady=10)
+        right_group = tk.LabelFrame(trim_tab, text="Right", padx=10, pady=10)
         right_group.pack(side=tk.LEFT, padx=10, fill=tk.Y)
 
         right_clear_btn = tk.Button(
@@ -1408,7 +1428,7 @@ class FourSliderGUI:
         right_center_btn.pack(pady=(0, 5))
 
         # Instrumentation panel
-        log_group = tk.LabelFrame(main_frame, text="Instrumentation", padx=10, pady=10)
+        log_group = tk.LabelFrame(body, text="Instrumentation", padx=10, pady=10)
         log_group.pack(side=tk.LEFT, padx=10, fill=tk.BOTH, expand=True)
 
         self.log_text = tk.Text(
@@ -1571,33 +1591,49 @@ class FourSliderGUI:
     # def
 
     def build_connection_panel(self, parent):
-        group = tk.LabelFrame(parent, text="Connection", padx=6, pady=6)
-        group.pack(anchor="w", pady=(0, 8), fill=tk.X)
+        """Link state, laid out horizontally so it can live above the notebook.
+
+        Deliberately outside the tabs. Which port is connected, and what rate the
+        Pico is running, are global facts that every tab depends on - and a test
+        tab that lets you press Run without noticing the link dropped is a trap.
+        """
+        group = tk.LabelFrame(parent, text="Connection", padx=6, pady=4)
+        group.pack(fill=tk.X)
 
         self.drone_port_var = tk.StringVar(value="")
         self.pico_port_var = tk.StringVar(value="")
         self._port_by_label = {}
 
-        drone_row = tk.Frame(group)
-        drone_row.pack(anchor="w", pady=2, fill=tk.X)
-        tk.Label(drone_row, text="Drone", width=6, anchor="w").pack(side=tk.LEFT)
-        self.drone_combo = ttk.Combobox(drone_row, textvariable=self.drone_port_var, width=30)
-        self.drone_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # One row. Status sits beside its combobox rather than under it, so
+        # moving this out of the left column costs a strip of height rather than
+        # a band of it.
+        tk.Label(group, text="Drone", anchor="w").pack(side=tk.LEFT)
+        self.drone_combo = ttk.Combobox(group, textvariable=self.drone_port_var, width=22)
+        self.drone_combo.pack(side=tk.LEFT, padx=(4, 6))
 
-        self.drone_status_label = tk.Label(group, text="Drone: not connected", anchor="w", fg="black")
-        self.drone_status_label.pack(anchor="w", padx=(46, 0))
+        self.drone_status_label = tk.Label(
+            group, text="not connected", anchor="w", width=30, fg="black")
+        self.drone_status_label.pack(side=tk.LEFT, padx=(0, 14))
 
-        pico_row = tk.Frame(group)
-        pico_row.pack(anchor="w", pady=(6, 2), fill=tk.X)
-        tk.Label(pico_row, text="Pico", width=6, anchor="w").pack(side=tk.LEFT)
-        self.pico_combo = ttk.Combobox(pico_row, textvariable=self.pico_port_var, width=30)
-        self.pico_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(group, text="Pico", anchor="w").pack(side=tk.LEFT)
+        self.pico_combo = ttk.Combobox(group, textvariable=self.pico_port_var, width=22)
+        self.pico_combo.pack(side=tk.LEFT, padx=(4, 6))
 
-        self.pico_status_label = tk.Label(group, text="Pico: not connected", anchor="w", fg="black")
-        self.pico_status_label.pack(anchor="w", padx=(46, 0))
+        self.pico_status_label = tk.Label(
+            group, text="not connected", anchor="w", width=28, fg="black")
+        self.pico_status_label.pack(side=tk.LEFT, padx=(0, 14))
+
+        tk.Label(group, text="Rate", anchor="w").pack(side=tk.LEFT)
+
+        # The rate is now mutable global state - a test can leave the board in
+        # fast mode, and the Trim tab reads the same stream. Showing it means a
+        # surprising angle readout has somewhere to be explained.
+        self.pico_rate_label = tk.Label(
+            group, text="--", anchor="center", relief="solid", bd=1, width=8)
+        self.pico_rate_label.pack(side=tk.LEFT, padx=(4, 0))
 
         button_row = tk.Frame(group)
-        button_row.pack(anchor="w", pady=(8, 0), fill=tk.X)
+        button_row.pack(side=tk.RIGHT)
 
         self.refresh_btn = tk.Button(
             button_row,
@@ -1614,6 +1650,22 @@ class FourSliderGUI:
             command=self.connect_mavlink
         )
         self.connect_btn.pack(side=tk.LEFT, padx=(6, 0))
+    # def
+
+    def update_pico_rate_label(self):
+        if self._closing:
+            return
+
+        if not self.position_reader.is_streaming():
+            text, colour = "--", "black"
+        else:
+            hz = self.position_reader.sample_hz
+            text = "%d Hz" % hz
+            # Fast mode is a temporary state owned by a running test. Flagging it
+            # stops it being mistaken for normal when a test leaves it behind.
+            colour = "dark green" if hz <= SLOW_RATE_HZ else "dark orange"
+
+        self.pico_rate_label.config(text=text, fg=colour)
     # def
 
     def device_from_label(self, label):
@@ -1694,9 +1746,9 @@ class FourSliderGUI:
         self.populate_port_combos(result["ports"], result["drone"], result["pico"])
 
         if result["pico"] is None:
-            self.set_conn_status("pico", "Pico: not found", False)
+            self.set_conn_status("pico", "not found", False)
         if result["drone"] is None:
-            self.set_conn_status("drone", "Drone: no heartbeat found", False)
+            self.set_conn_status("drone", "no heartbeat found", False)
 
         if auto_connect and (result["pico"] or result["drone"]):
             self.connect_mavlink()
@@ -1711,9 +1763,9 @@ class FourSliderGUI:
         self.set_connection_controls_enabled(False)
 
         if drone_device:
-            self.set_conn_status("drone", "Drone: connecting...", None)
+            self.set_conn_status("drone", "connecting...", None)
         if pico_device:
-            self.set_conn_status("pico", "Pico: opening...", None)
+            self.set_conn_status("pico", "opening...", None)
 
         threading.Thread(
             target=self._connect_worker,
@@ -1724,7 +1776,7 @@ class FourSliderGUI:
 
     def _connect_worker(self, drone_device, pico_device):
         """Worker thread: open both links, then report status back to Tk."""
-        drone_text = "Drone: no port selected"
+        drone_text = "no port selected"
         drone_ok = False
 
         try:
@@ -1732,21 +1784,21 @@ class FourSliderGUI:
                 print("Connecting MAVLink on %s..." % drone_device)
                 if self.drone_interface.reconnect(drone_device):
                     drone_ok = True
-                    drone_text = "Drone: connected (system %s)" % self.drone_interface.master.target_system
+                    drone_text = "connected (system %s)" % self.drone_interface.master.target_system
                     # Remember the port before the long param refresh, so a
                     # mid-refresh failure doesn't lose a known-good port.
                     self.position_reader.set_remembered_ports(drone_port=drone_device)
                     self.refresh_params_from_drone(clear_name=True)
                 elif self.drone_interface.last_error_kind == "open":
-                    drone_text = "Drone: cannot open %s" % drone_device
+                    drone_text = "cannot open %s" % drone_device
                 else:
-                    drone_text = "Drone: no heartbeat on %s" % drone_device
+                    drone_text = "no heartbeat on %s" % drone_device
 
         except Exception as e:
-            drone_text = "Drone: connect failed"
+            drone_text = "connect failed"
             print("MAVLink connect failed: %s" % str(e))
 
-        pico_text = "Pico: no port selected"
+        pico_text = "no port selected"
         pico_ok = False
 
         try:
@@ -1761,15 +1813,15 @@ class FourSliderGUI:
 
                 if self.position_reader.is_streaming():
                     pico_ok = True
-                    pico_text = "Pico: streaming on %s" % pico_device
+                    pico_text = "streaming on %s" % pico_device
                     self.position_reader.set_remembered_ports(pico_port=pico_device)
                 elif self.position_reader.last_error is not None:
-                    pico_text = "Pico: cannot open %s" % pico_device
+                    pico_text = "cannot open %s" % pico_device
                 else:
-                    pico_text = "Pico: no data on %s" % pico_device
+                    pico_text = "no data on %s" % pico_device
 
         except Exception as e:
-            pico_text = "Pico: open failed"
+            pico_text = "open failed"
             print("Pico open failed: %s" % str(e))
 
         def finish():
@@ -2758,6 +2810,8 @@ class FourSliderGUI:
             self.right_label.config(text="Right: --")
         else:
             self.right_label.config(text="Right: %.1f deg" % right_val)
+
+        self.update_pico_rate_label()
 
         self.root.after(100, self.update_labels)
     # def
