@@ -43,8 +43,26 @@ FCU_VID_HINTS = {
     0x0483,  # STMicroelectronics
 }
 
-# One line per sample from the Pico: "[<left_u16>/<right_u16>]"
-POSITION_REGEX = re.compile(r"\[(?P<position1>-?\d+)\s*/\s*(?P<position2>-?\d+)\]")
+# One line per sample from the Pico, in one of two formats:
+#
+#   slow mode   "[<left_u16>/<right_u16>]"
+#   fast mode   "[<ticks_us>:<left_u16>/<right_u16>]"
+#
+# The timestamp group is optional so both parse through one path: the legacy
+# firmware (pico/main.py) and the dual-rate firmware's slow preset emit the
+# first, fast mode emits the second. Consumers that do not care about timing can
+# keep reading position1/position2 and ignore t_us entirely.
+POSITION_REGEX = re.compile(
+    r"\[(?:(?P<t_us>\d+):)?(?P<position1>-?\d+)\s*/\s*(?P<position2>-?\d+)\]"
+)
+
+# The dual-rate firmware (pico/sampler.py) prefixes every reply with this. It
+# cannot match POSITION_REGEX, so replies are inert to every sample parser.
+REPLY_PREFIX = "#"
+
+# MicroPython's ticks_us() counter wraps at 2^30 us (~17.9 minutes). Deltas must
+# be taken modulo this or a wrap reads as a colossal backwards jump.
+PICO_TICKS_MODULO = 1 << 30
 
 
 def position_to_degrees(side, raw_position, scaler, offset):
