@@ -42,6 +42,7 @@ from manta_common import (
     list_serial_ports,
     position_to_degrees,
     probe_pico,
+    report_path,
 )
 
 # The analysis is shared with the console tool rather than reimplemented here:
@@ -1525,7 +1526,7 @@ class FourSliderGUI:
         try:
             safe_name = self.make_safe_filename(drone_name)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            csv_filename = os.path.join(APP_DIR, "%s_%s.csv" % (safe_name, timestamp))
+            csv_filename = report_path(APP_DIR, "%s_%s.csv" % (safe_name, timestamp))
 
             print("Starting sweep to CSV: %s" % csv_filename)
 
@@ -2130,7 +2131,7 @@ class FourSliderGUI:
         try:
             name = self.make_safe_filename(self.drone_name_var.get().strip() or "elevon")
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = os.path.join(APP_DIR, "%s_%s_rangerate.csv" % (name, stamp))
+            path = report_path(APP_DIR, "%s_%s_rangerate.csv" % (name, stamp))
 
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)

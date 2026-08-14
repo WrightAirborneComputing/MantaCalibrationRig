@@ -362,7 +362,7 @@ def test_export_writes_a_csv(rig, tmp_path, monkeypatch):
     gui.drone_name_var.set("testbird")
     gui.export_range_rate_csv()
 
-    written = list(tmp_path.glob("testbird_*_rangerate.csv"))
+    written = list((tmp_path / "reports").glob("testbird_*_rangerate.csv"))
     assert len(written) == 1
 
     text = written[0].read_text()

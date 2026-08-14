@@ -22,6 +22,26 @@ import serial.tools.list_ports
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
+REPORTS_DIRNAME = "reports"
+
+
+def report_path(base_dir, filename):
+    """Path for a per-run artefact, creating base_dir/reports/ if needed.
+
+    Every CSV a run produces goes here so the repo root stays source-only, and
+    so .gitignore needs one entry rather than a glob per output kind.
+    calibration_log.csv is deliberately not one of these - it is the tracked,
+    append-only record and stays at the top level.
+
+    base_dir is a parameter rather than APP_DIR closed over here so callers
+    resolve their own module-level APP_DIR at call time, which is what lets the
+    tests redirect the output.
+    """
+    directory = os.path.join(base_dir, REPORTS_DIRNAME)
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, filename)
+
+
 IS_LINUX = sys.platform.startswith("linux")
 IS_WINDOWS = sys.platform.startswith("win")
 

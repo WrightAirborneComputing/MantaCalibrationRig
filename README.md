@@ -17,10 +17,12 @@ ports are detected automatically — see [Port detection](#port-detection).
 | `MantaTrimmer.py` | The desktop GUI. This is the tool you run. |
 | `manta_common.py` | Shared constants and helpers (wire format, USB IDs, port discovery, angle maths). No tkinter or pymavlink, so it imports on a headless box. |
 | `pico_monitor.py` | CLI diagnostic: streams the Pico's raw pot data with the conversion shown at every stage. |
+| `range_test.py` | The range & rate test from the console. Also the analysis the GUI tab imports. |
 | `pico/sampler.py` | MicroPython firmware, dual-rate (10 Hz / 500 Hz). Copy to the Pico as `main.py`. |
 | `pico/main.py` | The legacy 10 Hz-only firmware, kept as a fallback. |
 | `settings.json` | Persisted pot scalers/offsets, target angles, and last-used ports. |
-| `calibration_log.csv` | Append-only record of every logged calibration. |
+| `calibration_log.csv` | Append-only record of every logged calibration. Tracked on purpose, so it stays at the top level rather than in `reports/`. |
+| `reports/` | Per-run CSV artefacts: sweep captures, range/rate summaries and sample dumps. Gitignored — clear it out whenever you like. |
 | `tests/` | Host-side tests. No hardware needed: `python3 -m pytest tests/`. |
 | `ISSUES.md` | Known defects with proposed fixes. |
 
@@ -84,7 +86,7 @@ anything.
 The headline is the 10–90% transit time, with rate derived from it. Endpoints are
 where a servo is slowest and least repeatable, so 10–90% is both the standard
 measure and the stable one. Results are reported as mean ± sample standard
-deviation across the cycles, and **Save CSV** writes the summary.
+deviation across the cycles, and **Save CSV** writes the summary to `reports/`.
 
 Watch the trace, not just the table: a servo at its mechanical limit shows a
 rounded start as it accelerates and a settling approach at the end, while a
@@ -92,7 +94,7 @@ slew-limited command tracks a straight line and stops crisply. That difference i
 how you tell whether the autopilot is limiting the surface or the servo is.
 
 The same test is available from the console, which also writes every captured
-sample for plotting:
+sample for plotting. Both files land in `reports/`:
 
 ```bash
 python3 range_test.py --name manta --samples-csv

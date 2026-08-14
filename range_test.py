@@ -52,6 +52,7 @@ from manta_common import (
     SERIAL_BAUD,
     describe_serial_error,
     find_pico_port,
+    report_path,
 )
 from pico_monitor import (
     SERIAL_SETTLE_S,
@@ -514,7 +515,7 @@ def main():
 
     print("\nWritten:")
     write_csv(
-        os.path.join(APP_DIR, "%s_%s_rangerate.csv" % (label, stamp)),
+        report_path(APP_DIR, "%s_%s_rangerate.csv" % (label, stamp)),
         ["phase", "side", "direction", "cycles", "range_deg",
          "travel_deg", "travel_sd", "transit_ms", "transit_sd",
          "rate_deg_s", "rate_sd", "latency_ms", "latency_sd"],
@@ -523,7 +524,7 @@ def main():
 
     if args.samples_csv:
         write_csv(
-            os.path.join(APP_DIR, "%s_%s_rangerate_samples.csv" % (label, stamp)),
+            report_path(APP_DIR, "%s_%s_rangerate_samples.csv" % (label, stamp)),
             ["phase", "cycle", "direction", "side", "t_rel_s", "angle_deg"],
             test.raw_rows,
         )

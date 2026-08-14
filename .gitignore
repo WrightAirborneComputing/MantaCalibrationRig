@@ -1,11 +1,12 @@
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # Local rig state written by the atomic settings save
 settings.json.bak
 settings.json.tmp
 
-# Range/rate test output. calibration_log.csv is tracked on purpose - it is the
-# append-only record - but per-run captures are rig artefacts.
-*_rangerate.csv
-*_rangerate_samples.csv
+# Per-run rig artefacts: sweep captures, range/rate summaries and sample dumps.
+# One directory rather than a glob per output kind. calibration_log.csv stays at
+# the top level and tracked on purpose - it is the append-only record.
+reports/
