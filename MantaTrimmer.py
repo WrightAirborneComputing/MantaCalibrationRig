@@ -103,6 +103,13 @@ DEFAULT_CREEP_POINTS = 21
 # look like a clean result rather than an error.
 CREEP_SAMPLE_DWELL_S = POSITION_WINDOW_S + 0.3
 
+# MAV_CMD_ACTUATOR_TEST asks for a 60 s timeout and does not get it: measured on
+# this board the FC drops the override after about 2 s and drives the surfaces
+# itself again. Anything that waits longer than this between commands has to
+# re-send, or the surface wanders off mid-measurement and is yanked back by the
+# next command.
+MEASURE_REFRESH_S = 0.5
+
 # Named once so the writer and any reader cannot drift apart - the mismatch that
 # ISSUES.md #4 records against calibration_log.csv.
 CREEP_CURVE_COLUMNS = ("phase", "side", "direction", "rep", "cmd", "pwm_us",
@@ -2113,23 +2120,46 @@ class FourSliderGUI:
         self.measure_active = False
     # def
 
-    def _measure_settled(self, phase, dwell_s, cal):
-        """Hold still for dwell_s and return {side: settled angle}.
+    def _hold(self, sides, command, duration_s):
+        """Sleep, re-sending the actuator test so the FC cannot take over.
+
+        The surfaces are held by an override that lapses after about 2 s, so any
+        wait longer than that is not a wait at all - it is the FC quietly
+        resuming control part way through a measurement.
+        """
+        deadline = time.monotonic() + duration_s
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return
+            time.sleep(min(MEASURE_REFRESH_S, remaining))
+            for side in sides:
+                self.drone_interface.command_elevon(
+                    self.rr_output_function(side), command)
+    # def
+
+    def _measure_settled(self, phase, sides, command, dwell_s, cal):
+        """Hold at `command` for dwell_s and return {side: settled angle}.
 
         One estimator for every static reading this tab takes - curve samples
         and end stop arrivals alike. Differencing two angles measured different
         ways would mean nothing, and the curve has to join up with the endpoint
         value it ends at.
+
+        No collect-garbage first: that exists to keep MicroPython's stall out of
+        a 1000 Hz transit capture, and a static reading does not care. It is a
+        blocking serial round trip that retries for up to 4.5 s, which is long
+        enough on its own to lose the actuator override.
         """
         reader = self.position_reader
-        reader.send_command("G")
         reader.start_capture()
 
         # Anchor before the wait, not after: to_series() zeroes on the first
         # sample at or after the timestamp it is given, so a post-capture time
         # would match nothing and return an empty series.
         t_start = time.monotonic()
-        time.sleep(dwell_s)
+        self._hold(sides, command, dwell_s)
         samples, _truncated = reader.stop_capture()
 
         angles = {}
@@ -2141,7 +2171,8 @@ class FourSliderGUI:
 
     def _stiction_capture_settled(self, phase, sides, kind, rep, target, settle, cal):
         """The end stop arrival: what the stiction comparison is built from."""
-        for side, angle in self._measure_settled(phase, settle, cal).items():
+        for side, angle in self._measure_settled(
+                phase, sides, target, settle, cal).items():
             record = {
                 "phase": phase, "side": side, "kind": kind, "rep": rep,
                 "target": target, "final_deg": angle,
@@ -2152,7 +2183,7 @@ class FourSliderGUI:
             self.post_to_gui(lambda r=record: self._st_show_leg(r))
     # def
 
-    def _sample_creep_point(self, phase, rep, target, command, cal, pwm_map):
+    def _sample_creep_point(self, phase, sides, rep, target, command, cal, pwm_map):
         """One dwelled sample part way along a creep.
 
         Stored raw and separately from the stiction results: these are curve
@@ -2162,7 +2193,7 @@ class FourSliderGUI:
         direction = 1.0 if target > 0.0 else -1.0
 
         for side, angle in self._measure_settled(
-                phase, CREEP_SAMPLE_DWELL_S, cal).items():
+                phase, sides, command, CREEP_SAMPLE_DWELL_S, cal).items():
             if angle is None:
                 continue
 
@@ -2201,7 +2232,7 @@ class FourSliderGUI:
 
         for side in sides:
             self.drone_interface.command_elevon(self.rr_output_function(side), origin)
-        time.sleep(settle)
+        self._hold(sides, origin, settle)
 
         grid = creep_grid(origin, target, points)
         next_sample = 0
@@ -2218,7 +2249,8 @@ class FourSliderGUI:
             # is already longer than the period.
             if next_sample < len(grid) and \
                     abs(command - grid[next_sample]) <= step / 2.0:
-                self._sample_creep_point(phase, rep, target, command, cal, pwm_map)
+                self._sample_creep_point(phase, sides, rep, target, command,
+                                         cal, pwm_map)
                 next_sample += 1
             else:
                 time.sleep(period)
@@ -2416,7 +2448,7 @@ class FourSliderGUI:
                 for side in sides:
                     self.drone_interface.command_elevon(
                         self.rr_output_function(side), -1.0)
-                time.sleep(settle)
+                self._hold(sides, -1.0, settle)
 
                 for cycle in range(1, settings["cycles"] + 1):
                     for direction, target in (("neg_to_pos", 1.0),
@@ -2475,6 +2507,15 @@ class FourSliderGUI:
 
         reader.start_capture()
 
+        # Refresh the parked hold before the baseline. send_command() above is a
+        # blocking serial round trip that retries for up to 4.5 s, which is long
+        # enough for the actuator override to lapse and the surface to drift off
+        # the very position the pre-roll is about to measure as the baseline.
+        # The surface is already here - a leg is always entered parked at the far
+        # end - so this moves nothing.
+        for side in sides:
+            self.drone_interface.command_elevon(self.rr_output_function(side), -target)
+
         # Baseline before the command, so t=0 has something to be measured from.
         time.sleep(PRE_ROLL_S)
 
@@ -2482,7 +2523,11 @@ class FourSliderGUI:
         for side in sides:
             self.drone_interface.command_elevon(self.rr_output_function(side), target)
 
-        time.sleep(settle)
+        # Held, not slept: the settle is longer than the override lasts, so the
+        # FC would take the surface back before the trace had finished settling
+        # and the last fifth - which is what final_deg is measured from - would
+        # be of a surface on its way somewhere else.
+        self._hold(sides, target, settle)
 
         samples, truncated = reader.stop_capture()
 

@@ -882,3 +882,40 @@ def test_creep_curve_exports_every_point(rig, tmp_path, monkeypatch):
     assert len(rows) - 1 == len(gui.creep_points)
     assert all(len(row) == len(MT.CREEP_CURVE_COLUMNS) for row in rows)
 # def
+
+
+def test_long_waits_keep_the_actuator_override_alive(rig):
+    """The FC drops the override after ~2 s. A dwell that does not re-send is
+    not a dwell - it is the FC quietly taking the surface back mid-measurement."""
+    gui, drone, _ = rig
+
+    before = len(drone.commands)
+    gui._hold(["LEFT"], -1.0, MT.MEASURE_REFRESH_S * 4)
+    sent = drone.commands[before:]
+
+    assert len(sent) >= 3, "refreshed several times across the wait"
+    assert all(side == "LEFT" and value == pytest.approx(-1.0)
+               for side, value in sent), "and never moved the surface"
+# def
+
+
+def test_no_gap_longer_than_the_override_during_a_creep(rig):
+    """The whole run, checked end to end: no silence long enough to lose it."""
+    gui, drone, _ = rig
+
+    stamps = []
+    original = drone.command_elevon
+
+    def timestamped(function, value, **kwargs):
+        stamps.append(time.monotonic())
+        return original(function, value, **kwargs)
+
+    drone.command_elevon = timestamped
+    try:
+        run_stiction(gui, ["LEFT"], reps=1, cycles=1, points=5)
+    finally:
+        drone.command_elevon = original
+
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    assert max(gaps) < 2.0, "longest silence was %.2f s" % max(gaps)
+# def
