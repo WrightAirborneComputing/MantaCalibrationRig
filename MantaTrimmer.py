@@ -3980,6 +3980,44 @@ class FourSliderGUI:
             self.right_cal_active = active
     # def
 
+    def _cal_write_param(self, side, output_function, param_name, py_type,
+                         value, hold_command):
+        """Write a parameter, then put the surface back where it belongs.
+
+        A write is a set plus its verify plus three readback round trips, which
+        takes longer than the ~2 s the actuator override survives, so the FC
+        reclaims the outputs part way through and parks the surface. Nothing can
+        hold it across a blocking write, but re-commanding immediately
+        afterwards means the next move starts from a known place instead of
+        wherever the FC left it.
+        """
+        ok = self.set_side_param_and_refresh(side, param_name, py_type, value)
+        self.drone_interface.command_elevon(output_function, hold_command)
+        return ok
+    # def
+
+    def _cal_approach(self, side, output_function, which, rev,
+                      dwell_s=ENDPOINT_DWELL_S):
+        """Park at the far end, then drive to `which` in one move and measure.
+
+        Self-contained deliberately. How far a surface travelled to reach an end
+        stop changes where it settles - by 1.7 deg on one airframe and about
+        5 deg on another - so two measurements taken after different run-ups are
+        not comparable, and a calibration that mixes them will accept one and be
+        contradicted by the next.
+
+        Parking here rather than relying on the caller's sequencing means every
+        measurement in the procedure - refinement and verification alike - is
+        taken the same way, whatever order the calibration happens to visit the
+        ends in.
+        """
+        far = "MIN" if which == "MAX" else "MAX"
+        self._cal_measure(side, output_function, endpoint_command(far, rev),
+                          dwell_s)
+        return self._cal_measure(side, output_function,
+                                 endpoint_command(which, rev), dwell_s)
+    # def
+
     def _cal_measure(self, side, output_function, command,
                      dwell_s=ENDPOINT_DWELL_S):
         """Drive to a command in one motion, hold, and read the settled angle.
@@ -4038,7 +4076,7 @@ class FourSliderGUI:
         target_deg = targets[which]
         other_deg = targets["MIN" if which == "MAX" else "MAX"]
 
-        angle = self._cal_measure(side, output_function, command)
+        angle = self._cal_approach(side, output_function, which, rev)
         if angle is None:
             print("%s calibration: no angle at the %s end stop" % (side, which))
             return None
@@ -4153,7 +4191,8 @@ class FourSliderGUI:
 
             pwm[which] = result["new_pwm"]
             param = max_param if which == "MAX" else min_param
-            if not self.set_side_param_and_refresh(side, param, int, pwm[which]):
+            if not self._cal_write_param(side, output_function, param, int,
+                                         pwm[which], endpoint_command(which, rev)):
                 return None
 
         if not (accepted["MAX"] and accepted["MIN"]):
@@ -4173,18 +4212,10 @@ class FourSliderGUI:
         print("%s calibration: verifying" % side)
         worst = 0.0
 
-        # Primed like the refinement, and for the same reason: the refinement
-        # leaves the surface next to whichever end it finished on, so an
-        # unprimed verify would measure that one after a few tens of
-        # microseconds of travel instead of a full-span run-up, and read it
-        # short by the stiction it is supposed to be checking for.
-        self._cal_measure(side, output_function, endpoint_command("MIN", rev))
-
         for which in ("MAX", "MIN"):
             if not self.is_calibration_active(side):
                 return None
-            angle = self._cal_measure(side, output_function,
-                                      endpoint_command(which, rev))
+            angle = self._cal_approach(side, output_function, which, rev)
             if angle is None:
                 print("%s verify: no angle at %s" % (side, which))
                 return None
@@ -4220,11 +4251,14 @@ class FourSliderGUI:
         try:
             print("%s automatic calibration started" % side)
 
-            if not self.set_side_param_and_refresh(side, min_param, int, COARSE_MIN):
+            if not self._cal_write_param(side, output_function, min_param, int,
+                                         COARSE_MIN, 0.0):
                 return
-            if not self.set_side_param_and_refresh(side, max_param, int, COARSE_MAX):
+            if not self._cal_write_param(side, output_function, max_param, int,
+                                         COARSE_MAX, 0.0):
                 return
-            if not self.set_side_param_and_refresh(side, trim_param, float, 0.0):
+            if not self._cal_write_param(side, output_function, trim_param, float,
+                                         0.0, 0.0):
                 return
 
             if not self.is_calibration_active(side):

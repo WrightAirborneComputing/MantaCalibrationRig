@@ -104,9 +104,10 @@ Then, repeatedly:
    properly. Otherwise back the output off inward in 10 µs steps, waiting one
    dwell after each, until the elevon moves by at least 0.25° — comfortably
    above the 0.23–0.27° noise floor measured during steady holds.
-4. **Correct**, then evaluate **the opposite end**. The traverse across to it is
-   itself the next rapid approach, so alternating MAX, MIN, MAX, MIN costs
-   nothing.
+4. **Correct**, re-command the surface (a parameter write takes longer than the
+   actuator override survives, so the FC parks the surface part way through and
+   the next move must not start from wherever it left it), then evaluate **the
+   opposite end**.
 
 ### Acceptance
 

@@ -331,8 +331,9 @@ def test_an_end_stop_far_past_target_skips_the_stop_check(rig, capsys):
     assert result["breakaway_us"] is None
     assert result["new_pwm"] > drone.params["PWM_MAIN_MIN5"], "pulled inward"
 
-    # Only the one measurement: no back-off cycle was run.
-    assert len(set(drives)) == 1, "the probe would have used several PWM values"
+    # Park at the far end and one traverse to the end stop, and nothing else:
+    # no back-off cycle was run.
+    assert len(set(drives)) == 2, "the probe would have used several more"
     assert "without a stop check" in capsys.readouterr().out
 
 
@@ -351,4 +352,97 @@ def test_an_end_stop_near_target_still_gets_checked(rig):
         (drone.params["PWM_MAIN_MIN5"], drone.params["PWM_MAIN_MAX5"]), False)
 
     assert result["probed"] is True
-    assert len(set(drives)) > 1, "the back-off probe ran"
+    assert len(set(drives)) > 2, "the back-off probe ran"
+
+
+def _drive_path(servo):
+    """Distinct PWM values the surface was driven through, in order."""
+    path = []
+    original = servo.drive
+
+    def record(pwm):
+        if not path or path[-1] != pwm:
+            path.append(pwm)
+        return original(pwm)
+
+    servo.drive = record
+    return path
+# def
+
+
+def test_every_evaluation_approaches_from_the_far_end(rig):
+    """The invariant the whole procedure rests on.
+
+    How far a surface travelled to reach an end stop changes where it settles,
+    so a measurement is only comparable with another taken after the same
+    run-up. Before this, once one end was accepted the loop stopped visiting it
+    and the surviving end was measured from wherever its own back-off probe had
+    left it - a few tens of microseconds away. On one airframe that read 5 deg
+    different from the same PWM approached properly: accepted on one condition,
+    then contradicted by the verify on another.
+    """
+    gui, drone, servo = rig
+    gui.left_cal_active = True
+
+    targets = {"MAX": 38.0, "MIN": -38.0}
+    span = (drone.params["PWM_MAIN_MIN5"], drone.params["PWM_MAIN_MAX5"])
+    path = _drive_path(servo)
+
+    gui._cal_evaluate_endpoint("LEFT", gui.LEFT_OUTPUT_FUNCTION, "MAX",
+                               drone.params["PWM_MAIN_MAX5"], targets, span,
+                               False)
+
+    assert path[0] == drone.params["PWM_MAIN_MIN5"], "parked at the far end"
+    assert path[1] == drone.params["PWM_MAIN_MAX5"], "then a full-span traverse"
+
+
+def test_evaluating_the_other_end_also_starts_from_its_far_end(rig):
+    gui, drone, servo = rig
+    gui.left_cal_active = True
+
+    targets = {"MAX": 38.0, "MIN": -38.0}
+    span = (drone.params["PWM_MAIN_MIN5"], drone.params["PWM_MAIN_MAX5"])
+    path = _drive_path(servo)
+
+    gui._cal_evaluate_endpoint("LEFT", gui.LEFT_OUTPUT_FUNCTION, "MIN",
+                               drone.params["PWM_MAIN_MIN5"], targets, span,
+                               False)
+
+    assert path[0] == drone.params["PWM_MAIN_MAX5"]
+    assert path[1] == drone.params["PWM_MAIN_MIN5"]
+
+
+def test_verification_approaches_each_end_the_same_way(rig):
+    """The verify has to measure under the conditions the refinement accepted
+    under, or the two can only disagree."""
+    gui, drone, servo = rig
+    gui.left_cal_active = True
+    path = _drive_path(servo)
+
+    gui._cal_verify_endpoints(
+        "LEFT", gui.LEFT_OUTPUT_FUNCTION,
+        {"MAX": drone.params["PWM_MAIN_MAX5"], "MIN": drone.params["PWM_MAIN_MIN5"]},
+        {"MAX": 38.0, "MIN": -38.0}, False)
+
+    low, high = drone.params["PWM_MAIN_MIN5"], drone.params["PWM_MAIN_MAX5"]
+
+    # MAX is checked first, so: park low, traverse high. Then MIN: park high,
+    # traverse low. Each end measured after its own full-span run-up.
+    assert path == [low, high, low]
+
+
+def test_a_parameter_write_leaves_the_surface_where_it_was_told(rig):
+    """The FC reclaims the outputs during a write, so the next move must not
+    start from wherever it parked the surface."""
+    gui, drone, servo = rig
+
+    commands = []
+    original = drone.command_elevon
+    drone.command_elevon = lambda fn, value, **kw: (
+        commands.append(value), original(fn, value, **kw))[1]
+
+    gui._cal_write_param("LEFT", gui.LEFT_OUTPUT_FUNCTION, "PWM_MAIN_MAX5",
+                         int, 1900, -1.0)
+
+    assert commands[-1] == pytest.approx(-1.0), "re-commanded after the write"
+    assert drone.params["PWM_MAIN_MAX5"] == 1900
