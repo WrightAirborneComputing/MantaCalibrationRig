@@ -21,7 +21,7 @@ HARD_STOP_LIMIT_US = 50.0          # breakaway beyond this counts as a hard stop
 HARD_STOP_MARGIN_US = 10.0         # pull in by breakaway + this
 BACKOFF_CEILING_US = 200.0         # give up looking for breakaway past here
 ENDPOINT_DWELL_S = 0.8             # one 0.5 s averaging window plus margin
-MAX_ATTEMPTS = 5
+MAX_ATTEMPTS = 10
 
 # The wide-open range the coarse creep crosses.
 COARSE_MIN = 900

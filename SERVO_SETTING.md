@@ -132,7 +132,7 @@ the sign is not forced: an end stop that falls short is pushed outward instead.
 
 ### Failure
 
-Five attempts per end. Beyond that the procedure stops, reports the error, and
+Ten attempts per end. Beyond that the procedure stops, reports the error, and
 **restores the `MIN`, `MAX` and trim it started with**. A partially corrected
 pair is worse than the values you began with, because it looks calibrated.
 
@@ -167,7 +167,7 @@ Two cautions when reading its output:
 | hard stop threshold | 50 µs | |
 | hard stop pull-in | breakaway + 10 µs | |
 | endpoint dwell | 0.8 s | one 0.5 s averaging window plus margin |
-| attempts per end | 5 | |
+| attempts per end | 10 | |
 | coarse range | 900–2100 µs | wide enough to bracket any endpoint |
 | coarse creep step | 6 µs | matches the existing calibration |
 
