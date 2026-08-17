@@ -71,7 +71,7 @@ def test_tabs(app):
 
     tabs = [gui.notebook.tab(t, "text").strip() for t in gui.notebook.tabs()]
 
-    assert tabs == ["Trim", "Range & rate"]
+    assert tabs == ["Trim", "Measure"]
 # def
 
 

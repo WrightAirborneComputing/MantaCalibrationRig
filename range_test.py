@@ -43,6 +43,7 @@ all of that, being differences between two Pico-stamped samples.
 
 import argparse
 import csv
+import math
 import os
 import statistics
 import sys
@@ -198,6 +199,23 @@ def crossing_time(series, baseline, travel, fraction):
 # def
 
 
+def settled_angle(values):
+    """Where a trace ends up: the median of its last fifth, at least 5 samples.
+
+    Shared by the swing analysis and the creep measurement so the two are
+    estimated identically - their difference is the stiction number, and it
+    would be meaningless if each end of the subtraction were computed a
+    different way. Median, not mean, so one ADC outlier cannot define an
+    endpoint.
+    """
+    values = list(values)
+    if not values:
+        return None
+    tail = max(5, len(values) // 5)
+    return statistics.median(values[-tail:])
+# def
+
+
 def analyse_leg(series):
     """Travel and transit metrics for one hard-over, or a 'did not move' result."""
     pre = [a for t, a in series if t < 0.0]
@@ -210,8 +228,7 @@ def analyse_leg(series):
     baseline = statistics.median(pre) if len(pre) >= 3 else \
         statistics.median([a for _, a in post[:5]])
 
-    tail = max(5, len(post) // 5)
-    final = statistics.median([a for _, a in post[-tail:]])
+    final = settled_angle([a for _, a in post])
 
     travel = final - baseline
 
@@ -278,6 +295,74 @@ def endpoint_stats(legs):
 
     clusters.sort(key=lambda pair: pair[0])
     return (clusters[-1], clusters[0])
+# def
+
+
+def creep_commands(start, target, step):
+    """The command sequence a creep walks through, start exclusive, target last.
+
+    Mirrors the step logic the trim calibration uses - a fixed increment at a
+    fixed period - but walks to a *command* rather than to an angle, because the
+    end stop is where the command runs out, not where a target angle is crossed.
+    The final entry is always exactly the target: a creep that stopped one step
+    short would be measuring a different PWM than the swing it is compared with,
+    and the whole point is that the two arrive at the same place.
+    """
+    step = abs(float(step))
+    if step <= 0.0:
+        raise ValueError("creep step must be positive")
+
+    start = float(start)
+    target = float(target)
+    direction = 1.0 if target > start else -1.0
+
+    commands = []
+    value = start
+    while abs(target - value) > step:
+        value += direction * step
+        commands.append(round(value, 6))
+
+    commands.append(target)
+    return commands
+# def
+
+
+def stiction_stats(creep_values, swing_values):
+    """Compare crept-to and swung-to settled angles at the same end stop.
+
+    The difference is the stiction estimate: how much further the surface
+    travels when it arrives with momentum than when it is walked in.
+
+    The two sets are measured in separate phases, so there is no meaningful
+    pairing between an individual creep and an individual swing - a per-rep
+    difference would be an artefact of the order they happened to run in. The
+    estimate is therefore the difference of the means, and its spread is the
+    two sample deviations added in quadrature, which is the scatter a single
+    paired comparison would show. `stiction_se` is the standard error of the
+    difference of the means, and is the one to read when asking whether the
+    difference is real rather than how much it varies.
+    """
+    creep_mean, creep_sd = mean_sd(list(creep_values))
+    swing_mean, swing_sd = mean_sd(list(swing_values))
+
+    result = {
+        "creep_mean": creep_mean, "creep_sd": creep_sd, "creep_n": len(creep_values),
+        "swing_mean": swing_mean, "swing_sd": swing_sd, "swing_n": len(swing_values),
+        "stiction": None, "stiction_sd": None, "stiction_se": None,
+    }
+
+    if creep_mean is None or swing_mean is None:
+        return result
+
+    result["stiction"] = swing_mean - creep_mean
+
+    if creep_sd is None or swing_sd is None:
+        return result
+
+    result["stiction_sd"] = math.sqrt((creep_sd ** 2) + (swing_sd ** 2))
+    result["stiction_se"] = math.sqrt((creep_sd ** 2) / len(creep_values)
+                                      + (swing_sd ** 2) / len(swing_values))
+    return result
 # def
 
 

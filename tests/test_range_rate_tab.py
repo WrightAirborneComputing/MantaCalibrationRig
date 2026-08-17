@@ -73,9 +73,31 @@ class SimulatedRig(object):
         self._commanded_at = {"LEFT": 0.0, "RIGHT": 0.0}
         self._start = {"LEFT": -1.0, "RIGHT": -1.0}
 
+        # Stiction, off by default so the range/rate tests see a clean servo.
+        # Modelled as a shortfall that applies only when the commanded change is
+        # small: a creep step leaves the surface lagging the command by this
+        # much, while a hard-over arrives exactly on it. That is the effect the
+        # rig actually shows, and differencing the two is what recovers it.
+        self.stiction_deg = {"LEFT": 0.0, "RIGHT": 0.0}
+        self.creep_change_max = 0.15
+
+        self._last_change = {"LEFT": 2.0, "RIGHT": 2.0}
+
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._integrate, daemon=True)
         self._thread.start()
+    # def
+
+    def _effective_target(self, side):
+        """Where the servo will actually stop, given how big the last step was."""
+        target = self._target[side]
+        stiction = self.stiction_deg[side] / (TRAVEL_DEG[side] / 2.0)
+
+        if stiction and self._last_change[side] <= self.creep_change_max:
+            direction = 1.0 if target >= self._start[side] else -1.0
+            target -= direction * stiction
+
+        return target
     # def
 
     def is_connected(self):
@@ -93,6 +115,7 @@ class SimulatedRig(object):
         with self._lock:
             self.commands.append((side, float(value)))
             if abs(self._target[side] - float(value)) > 1e-9:
+                self._last_change[side] = abs(self._target[side] - float(value))
                 self._target[side] = float(value)
                 self._start[side] = self._position[side]
                 self._commanded_at[side] = time.monotonic()
@@ -110,14 +133,15 @@ class SimulatedRig(object):
                     # Command units per second, from the servo's deg/s.
                     units_s = spec["rate_deg_s"] / (TRAVEL_DEG[side] / 2.0)
                     elapsed = now - self._commanded_at[side] - spec["dead_s"]
+                    effective = self._effective_target(side)
 
                     if elapsed <= 0:
                         position = self._start[side]
                     else:
-                        span = self._target[side] - self._start[side]
+                        span = effective - self._start[side]
                         step = units_s * elapsed
                         if abs(span) <= step:
-                            position = self._target[side]
+                            position = effective
                         else:
                             position = self._start[side] + (1 if span > 0 else -1) * step
 
@@ -168,7 +192,7 @@ def rig():
     try:
         yield gui, drone, pico
     finally:
-        gui.range_test_active = False
+        gui.measure_active = False
         try:
             gui._closing = True
             reader.stop()
@@ -190,16 +214,19 @@ def run_test(gui, phases, cycles=1, settle=0.6, timeout=90.0):
 
     gui.rr_cycles_var.set(str(cycles))
     gui.rr_settle_var.set(str(settle))
+    gui.m_range_rate_var.set(1)
+    gui.m_stiction_var.set(0)
 
-    gui.range_test_active = True
+    settings = gui.read_measure_settings()
+    settings.update({"phases": list(phases), "cycles": cycles,
+                     "settle": settle, "rate": TAB_RATE_HZ})
+
+    gui.measure_active = True
     gui.rr_run_btn.config(state="disabled")
     gui.rr_stop_btn.config(state="normal")
 
     thread = threading.Thread(
-        target=gui._range_rate_worker,
-        args=(list(phases), cycles, settle, TAB_RATE_HZ),
-        daemon=True,
-    )
+        target=gui._measure_worker, args=(settings,), daemon=True)
     thread.start()
 
     deadline = time.time() + timeout
@@ -214,15 +241,17 @@ def run_test(gui, phases, cycles=1, settle=0.6, timeout=90.0):
 def test_setup_defaults_and_estimate(rig):
     gui, _, _ = rig
 
-    phases, cycles, settle, rate = gui.read_range_rate_settings()
+    settings = gui.read_measure_settings()
 
-    # BOTH alone: the single-servo phases were measured to add nothing, and
-    # dropping them is what makes 30 cycles affordable.
-    assert phases == list(MT.DEFAULT_PHASES)
-    assert cycles == MT.DEFAULT_CYCLES
-    assert rate == MT.FAST_RATE_HZ
+    # Range and rate on, stiction off: the creeps cost minutes, so they are
+    # opt-in. BOTH alone among the phases, since the single-servo phases were
+    # measured to add nothing and dropping them is what makes 30 cycles affordable.
+    assert settings["range_rate"] and not settings["stiction"]
+    assert settings["phases"] == list(MT.DEFAULT_PHASES)
+    assert settings["cycles"] == MT.DEFAULT_CYCLES
+    assert settings["rate"] == MT.FAST_RATE_HZ
 
-    gui.update_range_rate_estimate()
+    gui.update_measure_estimate()
     assert "60 hard-overs" in gui.rr_estimate_label.cget("text")
 # def
 
@@ -234,9 +263,55 @@ def test_estimate_tracks_the_selection(rig):
     gui.rr_phase_vars["RIGHT"].set(0)
     gui.rr_phase_vars["BOTH"].set(0)
     gui.rr_cycles_var.set("2")
-    gui.update_range_rate_estimate()
+    gui.update_measure_estimate()
 
     assert "4 hard-overs" in gui.rr_estimate_label.cget("text")
+# def
+
+
+def test_selecting_stiction_adds_creeps_but_not_hard_overs(rig):
+    """Combining the two must not change what range and rate costs."""
+    gui, _, _ = rig
+
+    gui.rr_phase_vars["LEFT"].set(1)
+    gui.rr_phase_vars["BOTH"].set(0)
+    gui.rr_cycles_var.set("2")
+    gui.st_reps_var.set("3")
+
+    gui.m_stiction_var.set(0)
+    swings_alone, creeps_alone = gui.measure_plan(gui.read_measure_settings())
+    assert (swings_alone, creeps_alone) == (4, 0)
+
+    gui.m_stiction_var.set(1)
+    swings_both, creeps_both = gui.measure_plan(gui.read_measure_settings())
+    assert swings_both == swings_alone, "the hard-overs are shared, not doubled"
+    assert creeps_both == 6
+# def
+
+
+def test_stiction_alone_still_plans_the_swings(rig):
+    gui, _, _ = rig
+
+    gui.rr_phase_vars["LEFT"].set(1)
+    gui.rr_phase_vars["BOTH"].set(0)
+    gui.rr_cycles_var.set("2")
+    gui.m_range_rate_var.set(0)
+    gui.m_stiction_var.set(1)
+
+    swings, creeps = gui.measure_plan(gui.read_measure_settings())
+    assert swings == 4 and creeps == 6
+# def
+
+
+def test_nothing_selected_plans_nothing(rig):
+    gui, _, _ = rig
+
+    gui.m_range_rate_var.set(0)
+    gui.m_stiction_var.set(0)
+    assert gui.measure_plan(gui.read_measure_settings()) == (0, 0)
+
+    gui.update_measure_estimate()
+    assert "Nothing selected" in gui.rr_estimate_label.cget("text")
 # def
 
 
@@ -320,14 +395,19 @@ def test_stopping_mid_run_still_centres(rig):
     gui.rr_cycles_var.set("5")
     gui.rr_settle_var.set("0.6")
 
-    gui.range_test_active = True
+    gui.m_range_rate_var.set(1)
+    gui.m_stiction_var.set(0)
+    settings = gui.read_measure_settings()
+    settings.update({"phases": ["LEFT"], "cycles": 5, "settle": 0.6,
+                     "rate": TAB_RATE_HZ})
+
+    gui.measure_active = True
     thread = threading.Thread(
-        target=gui._range_rate_worker, args=(["LEFT"], 5, 0.6, TAB_RATE_HZ),
-        daemon=True)
+        target=gui._measure_worker, args=(settings,), daemon=True)
     thread.start()
 
     gui.pump(1.5)
-    gui.stop_range_rate_test()
+    gui.stop_measure()
 
     deadline = time.time() + 30.0
     while thread.is_alive() and time.time() < deadline:
@@ -335,7 +415,7 @@ def test_stopping_mid_run_still_centres(rig):
 
     assert not thread.is_alive()
     assert drone.commands[-1][1] == 0.0
-    assert not gui.range_test_active
+    assert not gui.measure_active
 # def
 
 
@@ -344,14 +424,14 @@ def test_actuator_tick_yields_while_the_test_runs(rig):
     gui, drone, _ = rig
 
     gui.left_pos.set(0.75)
-    gui.range_test_active = True
+    gui.measure_active = True
 
     before = len(drone.commands)
     gui.update_actuators()
     gui.pump(0.35)
     during = [c for c in drone.commands[before:] if abs(c[1] - 0.75) < 1e-9]
 
-    gui.range_test_active = False
+    gui.measure_active = False
 
     assert during == [], "slider tick commanded actuators during the test"
 # def
@@ -497,4 +577,202 @@ def test_sample_retention_is_bounded(rig, monkeypatch):
     assert len(gui.rr_samples) == 50
     assert gui.rr_samples_truncated
     assert "truncated" in gui.rr_note_label.cget("text")
+# def
+
+
+# ---- stiction ----
+
+# Distinct per side, so a left/right mix-up in the new code cannot pass by
+# symmetry. Both are far above the analysis noise and far below full travel.
+STICTION_DEG = {"LEFT": 3.3, "RIGHT": 4.8}
+
+
+def run_stiction(gui, phases, reps=2, cycles=2, step=0.1, period=0.02, start=0.0,
+                 settle=0.4, range_rate=True, timeout=120.0):
+    """Drive one stiction run synchronously, pumping Tk so callbacks land."""
+    for phase, var in gui.rr_phase_vars.items():
+        var.set(1 if phase in phases else 0)
+
+    gui.rr_settle_var.set(str(settle))
+    gui.st_reps_var.set(str(reps))
+    gui.st_step_var.set(str(step))
+    gui.st_period_var.set(str(period))
+    gui.st_start_var.set(str(start))
+    gui.m_range_rate_var.set(1 if range_rate else 0)
+    gui.m_stiction_var.set(1)
+
+    settings = gui.read_measure_settings()
+    settings.update({"phases": list(phases), "creep_reps": reps,
+                     "cycles": cycles, "settle": settle, "rate": TAB_RATE_HZ,
+                     "creep_step": step, "creep_period": period,
+                     "creep_start": start})
+
+    gui.measure_active = True
+    gui.rr_results = []
+    gui.stiction_results = []
+
+    thread = threading.Thread(
+        target=gui._measure_worker, args=(settings,), daemon=True)
+    thread.start()
+
+    deadline = time.time() + timeout
+    while thread.is_alive() and time.time() < deadline:
+        gui.pump(0.05)
+
+    gui.pump(0.4)
+    assert not thread.is_alive(), "measure worker did not finish"
+# def
+
+
+def test_stiction_recovers_a_known_creep_swing_gap(rig):
+    """The point of the whole feature: a servo with 3.3 deg of stiction must
+    read as 3.3 deg, not as noise and not as travel."""
+    gui, drone, _ = rig
+    drone.stiction_deg["LEFT"] = STICTION_DEG["LEFT"]
+
+    run_stiction(gui, ["LEFT"], reps=2)
+
+    creeps = [r for r in gui.stiction_results if r["kind"] == "creep" and r["ok"]]
+    swings = [r for r in gui.rr_results if r["ok"]]
+    assert len(creeps) == 4, "two reps at each end"
+    assert len(swings) == 4, "the range/rate legs are the swings"
+
+    arrival = {"neg_to_pos": 1.0, "pos_to_neg": -1.0}
+
+    for target in (1.0, -1.0):
+        stats = MT.stiction_stats(
+            [r["final_deg"] for r in creeps if r["target"] == target],
+            [r["final_deg"] for r in swings if arrival[r["direction"]] == target])
+        assert abs(stats["stiction"]) == pytest.approx(STICTION_DEG["LEFT"], abs=1.2)
+        # The swing always lands further out than the creep, whichever end.
+        assert (stats["stiction"] > 0) == (target > 0)
+# def
+
+
+def test_a_servo_without_stiction_reads_near_zero(rig):
+    """A measurement that invents stiction where there is none is worthless."""
+    gui, drone, _ = rig
+    assert drone.stiction_deg["LEFT"] == 0.0
+
+    run_stiction(gui, ["LEFT"], reps=2)
+
+    creeps = [r["final_deg"] for r in gui.stiction_results
+              if r["kind"] == "creep" and r["ok"] and r["target"] == 1.0]
+    swings = [r["final_deg"] for r in gui.rr_results
+              if r["ok"] and r["direction"] == "neg_to_pos"]
+
+    stats = MT.stiction_stats(creeps, swings)
+    assert abs(stats["stiction"]) < 1.0
+# def
+
+
+def test_stiction_left_and_right_are_not_swapped(rig):
+    """Each side has its own stiction, so a mix-up shows as a wrong number."""
+    gui, drone, _ = rig
+    drone.stiction_deg["LEFT"] = STICTION_DEG["LEFT"]
+    drone.stiction_deg["RIGHT"] = STICTION_DEG["RIGHT"]
+
+    run_stiction(gui, ["BOTH"], reps=2)
+
+    for side in ("LEFT", "RIGHT"):
+        creeps = [r["final_deg"] for r in gui.stiction_results
+                  if r["kind"] == "creep" and r["ok"]
+                  and r["side"] == side and r["target"] == 1.0]
+        swings = [r["final_deg"] for r in gui.rr_results
+                  if r["ok"] and r["side"] == side
+                  and r["direction"] == "neg_to_pos"]
+
+        stats = MT.stiction_stats(creeps, swings)
+        assert stats["stiction"] == pytest.approx(STICTION_DEG[side], abs=1.2)
+# def
+
+
+def test_swings_report_a_rate_and_creeps_do_not(rig):
+    """Rate only means something for a hard-over; a creep has no transit."""
+    gui, drone, _ = rig
+    drone.stiction_deg["LEFT"] = STICTION_DEG["LEFT"]
+
+    run_stiction(gui, ["LEFT"], reps=2)
+
+    for record in gui.stiction_results:
+        assert record["kind"] == "creep"
+        assert record["rate_deg_s"] is None
+
+    for leg in gui.rr_results:
+        if leg["ok"]:
+            assert leg["rate_deg_s"] == pytest.approx(
+                SERVO["LEFT"]["rate_deg_s"], rel=0.2)
+# def
+
+
+def test_the_two_measurements_share_one_set_of_hard_overs(rig):
+    """The whole reason they were combined: selecting both must not double the
+    swinging, and both summaries must quote the same legs."""
+    gui, drone, _ = rig
+    drone.stiction_deg["LEFT"] = STICTION_DEG["LEFT"]
+
+    run_stiction(gui, ["LEFT"], reps=2, cycles=3, range_rate=True)
+
+    # 3 cycles x 2 directions, and not one leg more.
+    assert len([r for r in gui.rr_results if r["ok"]]) == 6
+    assert all(r["kind"] == "creep" for r in gui.stiction_results)
+
+    swing_cell = gui.st_tree.item(gui.st_tree.get_children()[0])["values"][4]
+    assert swing_cell != "-"
+# def
+
+
+def test_stiction_alone_still_runs_the_swings_it_needs(rig):
+    """Deselecting range and rate hides its table but cannot skip the swings -
+    the comparison has no second half without them."""
+    gui, drone, _ = rig
+    drone.stiction_deg["LEFT"] = STICTION_DEG["LEFT"]
+
+    run_stiction(gui, ["LEFT"], reps=2, cycles=2, range_rate=False)
+
+    assert len([r for r in gui.rr_results if r["ok"]]) == 4
+    assert gui.st_tree.get_children(), "stiction table populated"
+    assert not gui.rr_tree.get_children(), "range/rate table left empty"
+# def
+
+
+def test_stiction_summary_table_is_populated(rig):
+    gui, drone, _ = rig
+    drone.stiction_deg["LEFT"] = STICTION_DEG["LEFT"]
+
+    # The worker posts _measure_finish() itself; run_stiction pumps it through.
+    run_stiction(gui, ["LEFT"], reps=2)
+
+    rows = gui.st_tree.get_children()
+    assert len(rows) == 2, "one row per end stop"
+
+    values = gui.st_tree.item(rows[0])["values"]
+    assert values[0] == "LEFT" and values[1] == "LEFT"
+    # creep, swing and stiction all carry a spread from 2 repetitions.
+    assert "+/-" in str(values[3]) and "+/-" in str(values[5])
+# def
+
+
+def test_stiction_run_centres_the_elevons(rig):
+    gui, drone, _ = rig
+
+    run_stiction(gui, ["LEFT"], reps=2)
+
+    assert drone.commands[-1][1] == pytest.approx(0.0)
+    assert not gui.measure_active
+# def
+
+
+def test_actuator_tick_yields_while_the_stiction_test_runs(rig):
+    """The 10 Hz slider tick must not fight the test for the same actuators."""
+    gui, drone, _ = rig
+
+    gui.measure_active = True
+    try:
+        before = len(drone.commands)
+        gui.update_actuators()
+        gui.pump(0.3)
+        assert len(drone.commands) == before
+    finally:
+        gui.measure_active = False
 # def

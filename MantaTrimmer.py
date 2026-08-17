@@ -62,8 +62,11 @@ from range_test import (
     PHASE_SIDES,
     PRE_ROLL_S,
     analyse_leg,
+    creep_commands,
     endpoint_stats,
     mean_sd,
+    settled_angle,
+    stiction_stats,
     to_series,
 )
 
@@ -77,6 +80,14 @@ from range_test import (
 # cannot disagree. 0.5 s gives ~5 samples (about 2.2x noise reduction) for 250 ms
 # of group delay, which is well inside the calibration mover's 250 ms step cadence.
 POSITION_WINDOW_S = 0.5
+
+# The stiction test's creep, matching the trim calibration's own step logic so
+# the two arrive at an end stop the same way. Repetitions default low because a
+# single creep from centre is 100 steps - a couple of minutes of wall clock per
+# end before the swings are even started.
+CREEP_STEP_CMD = 0.01
+CREEP_PERIOD_S = 0.25
+DEFAULT_STICTION_REPS = 3
 
 # Backlog is sized in *seconds*, not samples, because the Pico's rate is now
 # negotiable. A fixed 200 entries meant 20 s at 10 Hz but only 0.2 s at 1000 Hz -
@@ -1242,8 +1253,11 @@ class FourSliderGUI:
         self.sweep_thread = None
         self.sweep_active = False
 
-        self.range_test_thread = None
-        self.range_test_active = False
+        self.measure_thread = None
+        self.measure_active = False
+
+        self.stiction_results = []
+        self.stiction_summary_rows = []
         self.rr_results = []
         self.rr_summary_rows = []
         self.rr_samples = []
@@ -1537,8 +1551,8 @@ class FourSliderGUI:
         right_center_btn.pack(pady=(0, 5))
 
         rr_tab = tk.Frame(self.notebook, padx=6, pady=6)
-        self.notebook.add(rr_tab, text="  Range & rate  ")
-        self.build_range_rate_tab(rr_tab)
+        self.notebook.add(rr_tab, text="  Measure  ")
+        self.build_measure_tab(rr_tab)
 
         # Instrumentation panel
         log_group = tk.LabelFrame(body, text="Instrumentation", padx=10, pady=10)
@@ -1688,12 +1702,28 @@ class FourSliderGUI:
 
     # ---- Range and rate test -------------------------------------------------
 
-    def build_range_rate_tab(self, parent):
+    def build_measure_tab(self, parent):
         left_col = tk.Frame(parent)
         left_col.pack(side=tk.LEFT, anchor="n", padx=(0, 10))
 
-        setup = tk.LabelFrame(left_col, text="What to run", padx=8, pady=6)
+        setup = tk.LabelFrame(left_col, text="What to measure", padx=8, pady=6)
         setup.pack(anchor="w", fill=tk.X)
+
+        # The two measurements share their hard-overs: a range/rate cycle already
+        # drives the surface full span to each end stop, which is exactly the
+        # swing half of the stiction comparison. Running them together therefore
+        # costs only the creeps, and the swing numbers both tests quote are then
+        # literally the same measurements rather than two runs that have to be
+        # taken on trust as comparable.
+        self.m_range_rate_var = tk.IntVar(value=1)
+        self.m_stiction_var = tk.IntVar(value=0)
+
+        for text, var in (("Range and rate", self.m_range_rate_var),
+                          ("Stiction (creep vs swing)", self.m_stiction_var)):
+            tk.Checkbutton(setup, text=text, variable=var, anchor="w",
+                           command=self.update_measure_estimate).pack(anchor="w")
+
+        tk.Frame(setup, height=1, bg=PALETTE["rule"]).pack(fill=tk.X, pady=6)
 
         # Only BOTH is on by default: driving the servos one at a time was
         # measured to give the same travel and rate as driving them together, so
@@ -1709,24 +1739,39 @@ class FourSliderGUI:
                       "BOTH": "Both together"}[phase],
                 variable=var,
                 anchor="w",
-                command=self.update_range_rate_estimate,
+                command=self.update_measure_estimate,
             ).pack(anchor="w")
 
+        tk.Frame(setup, height=1, bg=PALETTE["rule"]).pack(fill=tk.X, pady=6)
+
         self.rr_cycles_var = tk.StringVar(value=str(DEFAULT_CYCLES))
+        self.st_reps_var = tk.StringVar(value=str(DEFAULT_STICTION_REPS))
         self.rr_settle_var = tk.StringVar(value="2.0")
         self.rr_rate_var = tk.StringVar(value=str(FAST_RATE_HZ))
+        self.st_step_var = tk.StringVar(value="%.3f" % CREEP_STEP_CMD)
+        self.st_period_var = tk.StringVar(value="%.2f" % CREEP_PERIOD_S)
+        self.st_start_var = tk.StringVar(value="0.00")
 
-        for label, var, width in (("Cycles", self.rr_cycles_var, 5),
-                                  ("Settle s", self.rr_settle_var, 5),
-                                  ("Rate Hz", self.rr_rate_var, 5)):
+        # Swing cycles and creep reps are separate counts on purpose: a swing is
+        # a couple of seconds and a creep from centre is a hundred steps, so
+        # tying them together would price the cheap measurement at the expensive
+        # one's rate.
+        for label, var in (("Swing cycles", self.rr_cycles_var),
+                           ("Creep reps", self.st_reps_var),
+                           ("Settle s", self.rr_settle_var),
+                           ("Rate Hz", self.rr_rate_var),
+                           ("Creep step", self.st_step_var),
+                           ("Creep s", self.st_period_var),
+                           ("Creep from", self.st_start_var)):
             row = tk.Frame(setup)
-            row.pack(anchor="w", pady=(4, 0), fill=tk.X)
-            tk.Label(row, text=label, width=9, anchor="w").pack(side=tk.LEFT)
-            entry = tk.Entry(row, textvariable=var, width=width)
+            row.pack(anchor="w", pady=(2, 0), fill=tk.X)
+            tk.Label(row, text=label, width=11, anchor="w").pack(side=tk.LEFT)
+            entry = tk.Entry(row, textvariable=var, width=6)
             entry.pack(side=tk.LEFT)
-            entry.bind("<KeyRelease>", lambda event: self.update_range_rate_estimate())
+            entry.bind("<KeyRelease>", lambda event: self.update_measure_estimate())
 
-        self.rr_estimate_label = tk.Label(setup, text="", anchor="w", fg=PALETTE["ink_muted"])
+        self.rr_estimate_label = tk.Label(
+            setup, text="", anchor="w", justify="left", fg=PALETTE["ink_muted"])
         self.rr_estimate_label.pack(anchor="w", pady=(6, 0))
 
         run_group = tk.LabelFrame(left_col, text="Run", padx=8, pady=6)
@@ -1744,12 +1789,12 @@ class FourSliderGUI:
         button_row.pack(anchor="w", fill=tk.X)
 
         self.rr_run_btn = tk.Button(
-            button_row, text="Run test", width=11, command=self.start_range_rate_test)
+            button_row, text="Run", width=11, command=self.start_measure)
         self.rr_run_btn.pack(side=tk.LEFT)
 
         self.rr_stop_btn = tk.Button(
             button_row, text="Stop", width=8, state="disabled",
-            command=self.stop_range_rate_test)
+            command=self.stop_measure)
         self.rr_stop_btn.pack(side=tk.LEFT, padx=(6, 0))
 
         self.rr_progress = ttk.Progressbar(run_group, mode="determinate", maximum=100.0)
@@ -1781,8 +1826,15 @@ class FourSliderGUI:
         self.rr_canvas.pack(fill=tk.BOTH, expand=True)
         self.rr_canvas.bind("<Configure>", lambda event: self.redraw_range_rate_trace())
 
-        results_group = tk.LabelFrame(right_col, text="Results", padx=6, pady=6)
+        # Titled for its contents, not "Results": there are two tables now, and
+        # each one's Save button lives with it. A shared footer of three buttons
+        # made the reader work out which of them wrote which table.
+        results_group = tk.LabelFrame(right_col, text="Range and rate",
+                                      padx=6, pady=6)
         results_group.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        results_body = tk.Frame(results_group)
+        results_body.pack(fill=tk.BOTH, expand=True)
 
         # Max/min are the settled endpoints themselves, with their own spread.
         # Range is their difference and hides it: two runs can share a range
@@ -1794,7 +1846,7 @@ class FourSliderGUI:
                     "Range deg", "Travel deg", "Transit ms", "Rate deg/s", "n")
 
         self.rr_tree = ttk.Treeview(
-            results_group, columns=columns, show="headings", height=8)
+            results_body, columns=columns, show="headings", height=8)
 
         for column, heading in zip(columns, headings):
             self.rr_tree.heading(column, text=heading)
@@ -1803,9 +1855,16 @@ class FourSliderGUI:
 
         self.rr_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        tree_scroll = tk.Scrollbar(results_group, command=self.rr_tree.yview)
+        tree_scroll = tk.Scrollbar(results_body, command=self.rr_tree.yview)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.rr_tree.config(yscrollcommand=tree_scroll.set)
+
+        self.rr_export_btn = tk.Button(
+            results_group, text="Save this table", width=14, state="disabled",
+            command=self.export_range_rate_csv)
+        self.rr_export_btn.pack(anchor="e", pady=(6, 0))
+
+        self.build_stiction_results(right_col)
 
         footer = tk.Frame(right_col)
         footer.pack(fill=tk.X, pady=(6, 0))
@@ -1813,47 +1872,122 @@ class FourSliderGUI:
         self.rr_note_label = tk.Label(footer, text="", anchor="w", fg=PALETTE["warn"])
         self.rr_note_label.pack(side=tk.LEFT)
 
-        # Packed right-to-left, so "Save CSV" ends up leftmost of the pair. The
-        # summary is the usual answer; the sample dump is the one you reach for
-        # when the summary raises a question the aggregate cannot settle - such
-        # as whether scatter is a drift across the run or a few bad cycles.
+        # Neither table's raw material, but both tables' - every captured sample
+        # from the run. The one to reach for when a summary raises a question the
+        # aggregate cannot settle, such as whether scatter is a drift across the
+        # run or a few bad cycles. Hence the footer rather than either group.
         self.rr_samples_btn = tk.Button(
-            footer, text="Save samples", width=12, state="disabled",
+            footer, text="Save every sample", width=16, state="disabled",
             command=self.export_range_rate_samples_csv)
-        self.rr_samples_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        self.rr_samples_btn.pack(side=tk.RIGHT)
 
-        self.rr_export_btn = tk.Button(
-            footer, text="Save CSV", width=11, state="disabled",
-            command=self.export_range_rate_csv)
-        self.rr_export_btn.pack(side=tk.RIGHT)
-
-        self.update_range_rate_estimate()
+        self.update_measure_estimate()
     # def
 
-    def read_range_rate_settings(self):
-        """Parse the setup fields. Returns (phases, cycles, settle, rate)."""
-        phases = [p for p in PHASES if self.rr_phase_vars[p].get()]
+    def build_stiction_results(self, parent):
+        group = tk.LabelFrame(parent, text="Stiction", padx=6, pady=6)
+        group.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
-        cycles = max(1, self.get_int_var(self.rr_cycles_var, DEFAULT_CYCLES))
-        settle = max(0.3, self.get_float_var(self.rr_settle_var, 2.0))
-        rate = max(SLOW_RATE_HZ, self.get_int_var(self.rr_rate_var, FAST_RATE_HZ))
+        body = tk.Frame(group)
+        body.pack(fill=tk.BOTH, expand=True)
 
-        return phases, cycles, settle, rate
+        columns = ("phase", "side", "target", "creep", "swing", "stiction",
+                   "transit", "rate", "n")
+        headings = ("Phase", "Side", "Cmd", "Creep deg", "Swing deg",
+                    "Stiction deg", "Transit ms", "Rate deg/s", "n")
+
+        self.st_tree = ttk.Treeview(body, columns=columns, show="headings", height=6)
+
+        for column, heading in zip(columns, headings):
+            self.st_tree.heading(column, text=heading)
+            self.st_tree.column(
+                column, width=92 if column not in ("n", "side", "target") else 54,
+                anchor="center")
+
+        self.st_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scroll = tk.Scrollbar(body, command=self.st_tree.yview)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.st_tree.config(yscrollcommand=scroll.set)
+
+        self.st_export_btn = tk.Button(
+            group, text="Save this table", width=14, state="disabled",
+            command=self.export_stiction_csv)
+        self.st_export_btn.pack(anchor="e", pady=(6, 0))
     # def
 
-    def update_range_rate_estimate(self):
-        phases, cycles, settle, _rate = self.read_range_rate_settings()
-
-        legs = len(phases) * cycles * 2
-        seconds = len(phases) * settle + legs * (PRE_ROLL_S + settle)
-
-        self.rr_estimate_label.config(
-            text="%d hard-overs, about %d s" % (legs, int(round(seconds))))
+    def read_measure_settings(self):
+        """Everything the run needs, parsed from the setup group."""
+        return {
+            "phases": [p for p in PHASES if self.rr_phase_vars[p].get()],
+            "range_rate": bool(self.m_range_rate_var.get()),
+            "stiction": bool(self.m_stiction_var.get()),
+            "cycles": max(1, self.get_int_var(self.rr_cycles_var, DEFAULT_CYCLES)),
+            "creep_reps": max(1, self.get_int_var(self.st_reps_var,
+                                                  DEFAULT_STICTION_REPS)),
+            "settle": max(0.3, self.get_float_var(self.rr_settle_var, 2.0)),
+            "rate": max(SLOW_RATE_HZ, self.get_int_var(self.rr_rate_var,
+                                                       FAST_RATE_HZ)),
+            "creep_step": max(0.001, self.get_float_var(self.st_step_var,
+                                                        CREEP_STEP_CMD)),
+            "creep_period": max(0.05, self.get_float_var(self.st_period_var,
+                                                         CREEP_PERIOD_S)),
+            "creep_start": self.clamp(
+                self.get_float_var(self.st_start_var, 0.0), -1.0, 1.0),
+        }
     # def
 
-    def start_range_rate_test(self):
-        if self.range_test_active:
-            print("Range/rate test already running")
+    def measure_plan(self, settings):
+        """(swing legs, creep legs) the settings imply.
+
+        Swings run whenever either measurement is selected - the stiction
+        comparison needs them for its swing half, and they are the whole of the
+        range/rate test. Selecting both therefore adds creeps, not swings.
+        """
+        phases = len(settings["phases"])
+        if not phases or not (settings["range_rate"] or settings["stiction"]):
+            return 0, 0
+
+        swings = phases * settings["cycles"] * 2
+        creeps = phases * settings["creep_reps"] * 2 if settings["stiction"] else 0
+        return swings, creeps
+    # def
+
+    def update_measure_estimate(self):
+        settings = self.read_measure_settings()
+        swings, creeps = self.measure_plan(settings)
+
+        if not swings and not creeps:
+            self.rr_estimate_label.config(text="Nothing selected")
+            return
+
+        settle = settings["settle"]
+        seconds = len(settings["phases"]) * settle
+        seconds += swings * (PRE_ROLL_S + settle)
+
+        if creeps:
+            walk = len(creep_commands(settings["creep_start"], 1.0,
+                                      settings["creep_step"]))
+            seconds += creeps * (settle + walk * settings["creep_period"] + settle)
+
+        text = "%d hard-overs" % swings
+        if creeps:
+            text += ", %d creeps" % creeps
+        text += "\nabout %s" % self.format_duration(seconds)
+
+        self.rr_estimate_label.config(text=text)
+    # def
+
+    def format_duration(self, seconds):
+        seconds = int(round(seconds))
+        if seconds < 90:
+            return "%d s" % seconds
+        return "%d min" % int(round(seconds / 60.0))
+    # def
+
+    def start_measure(self):
+        if self.measure_active:
+            print("A measurement is already running")
             return
 
         if self.left_cal_active or self.right_cal_active or self.sweep_active:
@@ -1862,61 +1996,211 @@ class FourSliderGUI:
                 "Stop the calibration or sweep first - they drive the same actuators.")
             return
 
-        phases, cycles, settle, rate = self.read_range_rate_settings()
+        settings = self.read_measure_settings()
 
-        if not phases:
+        if not (settings["range_rate"] or settings["stiction"]):
+            messagebox.showwarning(
+                "Nothing to run", "Select range and rate, stiction, or both.")
+            return
+
+        if not settings["phases"]:
             messagebox.showwarning("Nothing to run", "Select at least one phase.")
             return
 
         if not self.drone_interface.is_connected():
             messagebox.showwarning(
-                "No link", "Connect to the flight controller before running the test.")
+                "No link", "Connect to the flight controller before measuring.")
             return
 
         if not self.position_reader.is_streaming():
             messagebox.showwarning(
-                "No position data", "The Pico is not streaming - nothing would be measured.")
+                "No position data",
+                "The Pico is not streaming - nothing would be measured.")
             return
 
-        legs = len(phases) * cycles * 2
+        swings, creeps = self.measure_plan(settings)
+
+        detail = "%d hard-overs to full deflection" % swings
+        if creeps:
+            detail += ", and %d creeps to the end stops" % creeps
 
         if not messagebox.askyesno(
                 "The surfaces will move",
-                "%d hard-overs to full deflection across %d phase(s).\n\n"
+                "%s across %d phase(s).\n\n"
                 "The first move slams to -1 from rest. Keep hands clear.\n\n"
-                "Run the test?" % (legs, len(phases))):
+                "Run the measurement?" % (detail, len(settings["phases"]))):
             return
 
         self.rr_tree.delete(*self.rr_tree.get_children())
+        self.st_tree.delete(*self.st_tree.get_children())
         self.rr_results = []
+        self.stiction_results = []
         self.rr_summary_rows = []
+        self.stiction_summary_rows = []
         self.rr_samples = []
         self.rr_samples_truncated = False
-        # Stamped once here rather than at each button press, so the summary and
-        # the sample dump from one run carry the same name and pair up on disk.
+        # Stamped once here rather than at each button press, so every export
+        # from one run carries the same name and they pair up on disk.
         self.rr_run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.rr_last_trace = None
         self.rr_canvas.delete("all")
         self.rr_note_label.config(text="")
         self.rr_export_btn.config(state="disabled")
         self.rr_samples_btn.config(state="disabled")
+        self.st_export_btn.config(state="disabled")
 
-        self.range_test_active = True
+        self.measure_active = True
         self.rr_run_btn.config(state="disabled")
         self.rr_stop_btn.config(state="normal")
 
-        self.range_test_thread = threading.Thread(
-            target=self._range_rate_worker,
-            args=(phases, cycles, settle, rate),
-            daemon=True,
-        )
-        self.range_test_thread.start()
+        self.measure_thread = threading.Thread(
+            target=self._measure_worker, args=(settings,), daemon=True)
+        self.measure_thread.start()
     # def
 
-    def stop_range_rate_test(self):
-        if self.range_test_active:
-            print("Stopping range/rate test...")
-        self.range_test_active = False
+    def stop_measure(self):
+        if self.measure_active:
+            print("Stopping measurement...")
+        self.measure_active = False
+    # def
+
+    def _stiction_capture_settled(self, phase, sides, kind, rep, target, settle, cal):
+        """Hold still, capture, and record where each side settled.
+
+        The same estimator as the swing analysis uses, on the same high-rate
+        stream, so the two ends of the stiction subtraction are measured
+        identically.
+        """
+        reader = self.position_reader
+        reader.send_command("G")
+        reader.start_capture()
+
+        # Anchor before the wait, not after: to_series() zeroes on the first
+        # sample at or after the timestamp it is given, so a post-capture time
+        # would match nothing and return an empty series.
+        t_start = time.monotonic()
+        time.sleep(settle)
+        samples, _truncated = reader.stop_capture()
+
+        for side in PHASE_SIDES[phase]:
+            series = to_series(samples, t_start, cal, side)
+            angle = settled_angle([a for _t, a in series])
+
+            record = {
+                "phase": phase, "side": side, "kind": kind, "rep": rep,
+                "target": target, "final_deg": angle,
+                "ok": angle is not None,
+                "transit_s": None, "rate_deg_s": None, "travel_deg": None,
+            }
+            self.stiction_results.append(record)
+            self.post_to_gui(lambda r=record: self._st_show_leg(r))
+    # def
+
+    def _stiction_creep_leg(self, phase, sides, rep, target, step, period,
+                            start, settle, cal):
+        """Walk the command to the end stop in `step` increments, then measure.
+
+        The same increment-and-wait the trim calibration uses, but walking to a
+        command rather than to an angle: the end stop is where the command runs
+        out. Nothing is measured during the walk - only where it ends up.
+        """
+        for side in sides:
+            self.drone_interface.command_elevon(self.rr_output_function(side), start)
+        time.sleep(settle)
+
+        for command in creep_commands(start, target, step):
+            if not self.measure_active:
+                return
+            for side in sides:
+                self.drone_interface.command_elevon(
+                    self.rr_output_function(side), command)
+            time.sleep(period)
+
+        self._stiction_capture_settled(phase, sides, "creep", rep, target, settle, cal)
+    # def
+
+    def _st_show_leg(self, record):
+        if self._closing:
+            return
+
+        if record["final_deg"] is None:
+            text = "%s %s %s: no reading" % (
+                record["side"], record["kind"], record["rep"])
+        elif record["rate_deg_s"]:
+            text = "%s %s %d: %.2f deg, %.0f deg/s" % (
+                record["side"], record["kind"], record["rep"],
+                record["final_deg"], record["rate_deg_s"])
+        else:
+            text = "%s %s %d: %.2f deg" % (
+                record["side"], record["kind"], record["rep"], record["final_deg"])
+
+        self.rr_leg_label.config(text=text)
+    # def
+
+    def summarise_stiction(self):
+        """One row per phase/side/end: creep, swing, their difference, and rate.
+
+        The swing half is read straight out of the range/rate legs. A leg that
+        ran neg_to_pos ended at the +1 end stop and one that ran pos_to_neg
+        ended at -1, so the arrival each creep is compared against is the very
+        same hard-over the range/rate table reports - not a second run of them.
+        """
+        rows = []
+        arrival = {"neg_to_pos": 1.0, "pos_to_neg": -1.0}
+
+        for phase in PHASES:
+            for side in ("LEFT", "RIGHT"):
+                for target in (1.0, -1.0):
+                    creeps = [r["final_deg"] for r in self.stiction_results
+                              if r["phase"] == phase and r["side"] == side
+                              and r["target"] == target and r["ok"]
+                              and r["kind"] == "creep"]
+
+                    legs = [r for r in self.rr_results
+                            if r["phase"] == phase and r["side"] == side and r["ok"]
+                            and arrival.get(r["direction"]) == target]
+
+                    swings = [r["final_deg"] for r in legs]
+                    if not creeps or not swings:
+                        continue
+
+                    stats = stiction_stats(creeps, swings)
+                    rates = mean_sd([r["rate_deg_s"] for r in legs
+                                     if r.get("rate_deg_s")])
+                    transits = mean_sd([r["transit_s"] * 1000.0 for r in legs
+                                        if r.get("transit_s")])
+
+                    rows.append((
+                        phase, side, "%+.0f" % target,
+                        self.format_mean_sd((stats["creep_mean"], stats["creep_sd"]), "%.2f"),
+                        self.format_mean_sd((stats["swing_mean"], stats["swing_sd"]), "%.2f"),
+                        self.format_mean_sd((stats["stiction"], stats["stiction_sd"]), "%.2f"),
+                        self.format_mean_sd(transits, "%.1f"),
+                        self.format_mean_sd(rates, "%.0f"),
+                        "%d/%d" % (len(creeps), len(swings)),
+                    ))
+
+        return rows
+    # def
+
+    def export_stiction_csv(self):
+        if not self.stiction_summary_rows:
+            print("Nothing to export")
+            return
+
+        try:
+            path = self.rr_report_path("stiction")
+
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["phase", "side", "target", "creep_deg", "swing_deg",
+                                 "stiction_deg", "transit_ms", "rate_deg_s", "n"])
+                writer.writerows(self.stiction_summary_rows)
+
+            print("Stiction summary written to %s" % path)
+
+        except Exception as e:
+            print("Failed to export stiction CSV: %s" % str(e))
     # def
 
     def _rr_status(self, text, fraction=None):
@@ -1938,77 +2222,106 @@ class FourSliderGUI:
         }
     # def
 
-    def _range_rate_worker(self, phases, cycles, settle, rate):
+    def _measure_worker(self, settings):
+        """Creeps first, then the hard-overs, per phase.
+
+        One pass drives both measurements. The hard-overs are the range/rate
+        test outright, and they are also the swing half of the stiction
+        comparison - a cycle parks at one end and drives full span to the other,
+        which is exactly the arrival the creep is being compared against. There
+        is no separate swing pass, so the two summaries quote the same legs.
+        """
         restore_rate = self.position_reader.sample_hz
+        phases = settings["phases"]
+        settle = settings["settle"]
 
         try:
-            achieved = self.position_reader.set_sample_rate(rate)
-
-            if achieved is None:
+            if self.position_reader.set_sample_rate(settings["rate"]) is None:
                 self._rr_status("Pico refused the rate - is it running sampler.py?")
-                messagebox_text = (
-                    "The Pico did not accept a rate command, so it is probably running "
-                    "the legacy 10 Hz firmware. That is far too slow to resolve a "
-                    "transit.\n\nUpload pico/sampler.py as main.py and try again.")
-                self.post_to_gui(
-                    lambda: messagebox.showerror("Old firmware", messagebox_text))
+                self.post_to_gui(lambda: messagebox.showerror(
+                    "Old firmware",
+                    "The Pico did not accept a rate command, so it is probably "
+                    "running the legacy 10 Hz firmware. That is far too slow to "
+                    "resolve a transit.\n\nUpload pico/sampler.py as main.py and "
+                    "try again."))
                 return
 
             cal = self._rr_calibration()
-
-            total_legs = len(phases) * cycles * 2
+            swings, creeps = self.measure_plan(settings)
+            total = max(1, swings + creeps)
             done = 0
 
             for phase in phases:
-                if not self.range_test_active:
+                if not self.measure_active:
                     break
 
                 sides = PHASE_SIDES[phase]
 
-                self._rr_status("%s: parking at -1" % phase, done / float(total_legs))
+                if settings["stiction"]:
+                    for target in (1.0, -1.0):
+                        for rep in range(1, settings["creep_reps"] + 1):
+                            if not self.measure_active:
+                                break
+
+                            self._rr_status(
+                                "%s: creep to %+.0f, %d/%d"
+                                % (phase, target, rep, settings["creep_reps"]),
+                                done / float(total))
+
+                            self._stiction_creep_leg(
+                                phase, sides, rep, target, settings["creep_step"],
+                                settings["creep_period"], settings["creep_start"],
+                                settle, cal)
+                            done += 1
+
+                self._rr_status("%s: parking at -1" % phase, done / float(total))
                 for side in sides:
                     self.drone_interface.command_elevon(
                         self.rr_output_function(side), -1.0)
                 time.sleep(settle)
 
-                for cycle in range(1, cycles + 1):
-                    for direction, target in (("neg_to_pos", 1.0), ("pos_to_neg", -1.0)):
-                        if not self.range_test_active:
+                for cycle in range(1, settings["cycles"] + 1):
+                    for direction, target in (("neg_to_pos", 1.0),
+                                              ("pos_to_neg", -1.0)):
+                        if not self.measure_active:
                             break
 
                         self._rr_status(
-                            "%s: cycle %d/%d, %s" % (phase, cycle, cycles, direction),
-                            done / float(total_legs))
+                            "%s: cycle %d/%d, %s"
+                            % (phase, cycle, settings["cycles"], direction),
+                            done / float(total))
 
                         self._rr_run_leg(phase, sides, cycle, direction, target,
                                          settle, cal)
 
                         done += 1
                         self._rr_status(
-                            "%s: cycle %d/%d, %s" % (phase, cycle, cycles, direction),
-                            done / float(total_legs))
+                            "%s: cycle %d/%d, %s"
+                            % (phase, cycle, settings["cycles"], direction),
+                            done / float(total))
 
                 for side in sides:
-                    self.drone_interface.command_elevon(self.rr_output_function(side), 0.0)
+                    self.drone_interface.command_elevon(
+                        self.rr_output_function(side), 0.0)
 
         except Exception as e:
-            print("Range/rate test failed: %s" % str(e))
+            print("Measurement failed: %s" % str(e))
             self._rr_status("Failed: %s" % str(e))
 
         finally:
             # Always park the surfaces. MAV_CMD_ACTUATOR_TEST holds its value for
-            # 60 s, so an abandoned test would otherwise leave them hard over.
+            # 60 s, so an abandoned run would otherwise leave them hard over.
             try:
                 self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, 0.0)
                 self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, 0.0)
             except Exception as e:
-                print("Failed to centre elevons after the test: %s" % str(e))
+                print("Failed to centre elevons after the run: %s" % str(e))
 
             if restore_rate <= SLOW_RATE_HZ:
                 self.position_reader.set_sample_rate(SLOW_RATE_HZ)
 
-            self.range_test_active = False
-            self.post_to_gui(self._rr_finish)
+            self.measure_active = False
+            self.post_to_gui(lambda s=settings: self._measure_finish(s))
     # def
 
     def rr_output_function(self, side):
@@ -2190,18 +2503,24 @@ class FourSliderGUI:
                            anchor="e", fill="gray40")
     # def
 
-    def _rr_finish(self):
+    def _measure_finish(self, settings):
         if self._closing:
             return
 
         self.rr_run_btn.config(state="normal")
         self.rr_stop_btn.config(state="disabled")
 
-        rows = self.summarise_range_rate()
+        rows = self.summarise_range_rate() if settings["range_rate"] else []
         self.rr_summary_rows = rows
 
         for row in rows:
             self.rr_tree.insert("", tk.END, values=row)
+
+        stiction_rows = self.summarise_stiction() if settings["stiction"] else []
+        self.stiction_summary_rows = stiction_rows
+
+        for row in stiction_rows:
+            self.st_tree.insert("", tk.END, values=row)
 
         notes = []
 
@@ -2220,9 +2539,11 @@ class FourSliderGUI:
         self.rr_note_label.config(text="; ".join(notes))
         self.rr_export_btn.config(state="normal" if rows else "disabled")
         self.rr_samples_btn.config(state="normal" if self.rr_samples else "disabled")
+        self.st_export_btn.config(state="normal" if stiction_rows else "disabled")
 
-        self.rr_progress.config(value=100.0 if rows else 0.0)
-        self.rr_status_label.config(text="Done" if rows else "No measurements")
+        any_rows = bool(rows or stiction_rows)
+        self.rr_progress.config(value=100.0 if any_rows else 0.0)
+        self.rr_status_label.config(text="Done" if any_rows else "No measurements")
     # def
 
     def summarise_range_rate(self):
@@ -3679,12 +4000,12 @@ class FourSliderGUI:
 
         try:
             if not self.left_cal_active and not self.sweep_active \
-                    and not self.range_test_active:
+                    and not self.measure_active:
                 left_cmd = float(self.left_pos.get())
                 self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, left_cmd)
 
             if not self.right_cal_active and not self.sweep_active \
-                    and not self.range_test_active:
+                    and not self.measure_active:
                 right_cmd = float(self.right_pos.get())
                 self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, right_cmd)
 
@@ -3723,10 +4044,10 @@ class FourSliderGUI:
         self.left_cal_active = False
         self.right_cal_active = False
         self.sweep_active = False
-        self.range_test_active = False
+        self.measure_active = False
 
         for thread in (self.left_cal_thread, self.right_cal_thread,
-                       self.sweep_thread, self.range_test_thread):
+                       self.sweep_thread, self.measure_thread):
             if thread is not None and thread.is_alive():
                 thread.join(2.0)
 
