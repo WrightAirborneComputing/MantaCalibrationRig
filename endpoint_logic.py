@@ -104,6 +104,49 @@ def correction_us(angle_deg, target_deg, gain_deg_per_us):
 # def
 
 
+def travel_direction(target_deg, other_target_deg):
+    """+1 when this end lies at higher angles than the other, -1 otherwise.
+
+    Taken from the two targets rather than from the reverse bit, so it holds for
+    either wiring and for asymmetric travel.
+    """
+    return 1.0 if float(target_deg) > float(other_target_deg) else -1.0
+# def
+
+
+def overshot_target(angle_deg, target_deg, other_target_deg,
+                    tolerance=ENDPOINT_TOLERANCE_DEG):
+    """True when the surface travelled *past* its target, away from the far end.
+
+    A surface beyond its target plainly has travel to spare, so probing it for a
+    hard stop answers a question nobody asked and costs a back-off cycle to do
+    it. Probing earns its place when the surface landed on target - where being
+    jammed is the difference between a good end stop and a meaningless one - or
+    fell short, where jamming is the likely explanation.
+
+    An end stop 17 deg past target needs pulling in, and that is true whether or
+    not there is a stop somewhere beyond it.
+    """
+    direction = travel_direction(target_deg, other_target_deg)
+    return (float(angle_deg) - float(target_deg)) * direction > tolerance
+# def
+
+
+def nominal_gain_deg_per_us(target_at_max, target_at_min, pwm_min, pwm_max):
+    """Average deg/us across the whole travel, from the targets and the span.
+
+    A stand-in for the local gain the back-off probe measures, for corrections
+    made without probing. Coarse - the linkage gain was measured to vary about
+    2:1 end to end - but a correction of many degrees does not need a precise
+    gain, and the attempt that follows lands near target and measures properly.
+    """
+    span = float(pwm_max) - float(pwm_min)
+    if span == 0:
+        return None
+    return (float(target_at_max) - float(target_at_min)) / span
+# def
+
+
 def endpoint_accepted(angle_deg, target_deg, is_hard_stop):
     return (not is_hard_stop
             and abs(float(angle_deg) - float(target_deg)) <= ENDPOINT_TOLERANCE_DEG)

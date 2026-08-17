@@ -97,8 +97,12 @@ Then, repeatedly:
 2. **Measure** after 0.8 s — one 0.5 s averaging window plus margin. Do not
    linger: if the surface is jammed against a mechanical stop, the servo is
    stalled and holding it there is what the next step exists to detect.
-3. **Probe for a hard stop.** Back the output off inward in 10 µs steps, waiting
-   one dwell after each, until the elevon moves by at least 0.25° — comfortably
+3. **Probe for a hard stop** — but only when it can tell you something. A
+   surface that landed *past* its target by more than the acceptance band
+   plainly has travel to spare, so it is corrected on the average gain and the
+   probe is skipped; the attempt that follows lands near target and measures
+   properly. Otherwise back the output off inward in 10 µs steps, waiting one
+   dwell after each, until the elevon moves by at least 0.25° — comfortably
    above the 0.23–0.27° noise floor measured during steady holds.
 4. **Correct**, then evaluate **the opposite end**. The traverse across to it is
    itself the next rapid approach, so alternating MAX, MIN, MAX, MIN costs

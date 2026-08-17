@@ -109,3 +109,47 @@ def test_a_left_endpoint_converges_in_one_correction():
 
     # And the corrected endpoint would now be inside tolerance.
     assert endpoint_logic.endpoint_accepted(angle + shift * gain, target, False)
+
+
+def test_overshoot_is_measured_against_the_far_end_not_the_sign():
+    """Which way is "past" comes from the two targets, so it holds for either
+    wiring and for asymmetric travel."""
+    # MAX at +30, MIN at -30: past means above +30.
+    assert endpoint_logic.overshot_target(47.0, 30.0, -30.0)
+    assert not endpoint_logic.overshot_target(25.0, 30.0, -30.0)
+    assert not endpoint_logic.overshot_target(30.3, 30.0, -30.0), "inside tolerance"
+
+    # MIN at -30: past means below -30.
+    assert endpoint_logic.overshot_target(-47.0, -30.0, 30.0)
+    assert not endpoint_logic.overshot_target(-25.0, -30.0, 30.0)
+
+    # Reversed wiring puts the negative angle at the MAX end. Still works.
+    assert endpoint_logic.overshot_target(-40.0, -33.0, 35.0)
+    assert not endpoint_logic.overshot_target(-30.0, -33.0, 35.0)
+
+
+def test_asymmetric_targets_do_not_confuse_the_direction():
+    """-33/+35 is not symmetric, and neither is a trimmed airframe."""
+    assert endpoint_logic.travel_direction(35.0, -33.0) == 1.0
+    assert endpoint_logic.travel_direction(-33.0, 35.0) == -1.0
+
+
+def test_nominal_gain_takes_its_sign_from_the_travel():
+    """Reversed channels run the other way, and the gain has to say so."""
+    plain = endpoint_logic.nominal_gain_deg_per_us(35.0, -33.0, 1116, 1926)
+    assert plain == pytest.approx(68.0 / 810.0)
+
+    reversed_channel = endpoint_logic.nominal_gain_deg_per_us(-33.0, 35.0, 1116, 1926)
+    assert reversed_channel == pytest.approx(-68.0 / 810.0)
+
+    assert endpoint_logic.nominal_gain_deg_per_us(35.0, -33.0, 1500, 1500) is None
+
+
+def test_a_large_overshoot_corrects_toward_the_target():
+    """The 17 deg case: a rough gain is enough to get near, and the attempt
+    that follows lands in range and measures the local gain properly."""
+    gain = endpoint_logic.nominal_gain_deg_per_us(30.0, -30.0, 1000, 2000)
+    shift = endpoint_logic.correction_us(47.0, 30.0, gain)
+
+    assert shift < 0, "pulled inward"
+    assert endpoint_logic.clamp_endpoint(2000 + shift) == pytest.approx(1717, abs=1)

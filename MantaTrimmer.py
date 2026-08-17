@@ -68,6 +68,8 @@ from endpoint_logic import (
     MOVEMENT_THRESHOLD_DEG,
     alternating_order,
     angle_gain_per_us,
+    nominal_gain_deg_per_us,
+    overshot_target,
     clamp_endpoint,
     command_delta_for_pwm,
     correction_us,
@@ -4030,14 +4032,39 @@ class FourSliderGUI:
     # def
 
     def _cal_evaluate_endpoint(self, side, output_function, which, pwm_now,
-                               target_deg, span, rev):
-        """One rapid approach: measure, probe, and decide. None if it failed."""
+                               targets, span, rev):
+        """One rapid approach: measure, probe if it is worth it, and decide."""
         command = endpoint_command(which, rev)
+        target_deg = targets[which]
+        other_deg = targets["MIN" if which == "MAX" else "MAX"]
 
         angle = self._cal_measure(side, output_function, command)
         if angle is None:
             print("%s calibration: no angle at the %s end stop" % (side, which))
             return None
+
+        # Past target: it has travel to spare, so there is nothing a stop check
+        # could tell us and the correction is already determined. Pull it in on
+        # the average gain and measure properly on the next pass, which lands
+        # near target.
+        if overshot_target(angle, target_deg, other_deg):
+            gain = nominal_gain_deg_per_us(targets["MAX"], targets["MIN"],
+                                           span[0], span[1])
+            shift = correction_us(angle, target_deg, gain)
+            result = {"which": which, "angle_deg": angle,
+                      "target_deg": target_deg, "hard_stop": False,
+                      "breakaway_us": None, "probed": False, "gain": gain,
+                      "new_pwm": None, "accepted": False}
+
+            if shift is None:
+                print("%s calibration: %s has no usable span" % (side, which))
+                return result
+
+            result["new_pwm"] = clamp_endpoint(pwm_now + shift)
+            print("%s calibration: %s at %+.2f deg, %+.2f past target - "
+                  "shifting %+.0f us without a stop check"
+                  % (side, which, angle, angle - target_deg, shift))
+            return result
 
         breakaway, angle_backed = self._cal_probe_breakaway(
             side, output_function, which, span, rev, command, angle)
@@ -4051,7 +4078,7 @@ class FourSliderGUI:
 
         result = {"which": which, "angle_deg": angle, "target_deg": target_deg,
                   "hard_stop": is_hard_stop, "breakaway_us": breakaway,
-                  "gain": gain, "new_pwm": None,
+                  "probed": True, "gain": gain, "new_pwm": None,
                   "accepted": endpoint_accepted(angle, target_deg, is_hard_stop)}
 
         if result["accepted"]:
@@ -4090,6 +4117,7 @@ class FourSliderGUI:
         """
         pwm = {which: value for which, (value, _target) in endpoints.items()}
         targets = {which: target for which, (_value, target) in endpoints.items()}
+
         attempts = {"MAX": 0, "MIN": 0}
         accepted = {"MAX": False, "MIN": False}
 
@@ -4111,8 +4139,7 @@ class FourSliderGUI:
 
             span = (pwm["MIN"], pwm["MAX"])
             result = self._cal_evaluate_endpoint(
-                side, output_function, which, pwm[which], targets[which],
-                span, rev)
+                side, output_function, which, pwm[which], targets, span, rev)
 
             if result is None:
                 return None

@@ -236,8 +236,8 @@ def test_a_pinned_end_stop_is_detected_as_a_hard_stop(rig, capsys):
     # 145 us of travel, far beyond the 50 us that counts as free.
     result = gui._cal_evaluate_endpoint(
         "LEFT", gui.LEFT_OUTPUT_FUNCTION, "MIN", drone.params["PWM_MAIN_MIN5"],
-        -30.0, (drone.params["PWM_MAIN_MIN5"], drone.params["PWM_MAIN_MAX5"]),
-        False)
+        {"MAX": 30.0, "MIN": -30.0},
+        (drone.params["PWM_MAIN_MIN5"], drone.params["PWM_MAIN_MAX5"]), False)
 
     assert result is not None
     assert result["hard_stop"] is True
@@ -255,8 +255,8 @@ def test_a_free_end_stop_is_not_called_jammed(rig):
 
     result = gui._cal_evaluate_endpoint(
         "LEFT", gui.LEFT_OUTPUT_FUNCTION, "MIN", drone.params["PWM_MAIN_MIN5"],
-        -41.6, (drone.params["PWM_MAIN_MIN5"], drone.params["PWM_MAIN_MAX5"]),
-        False)
+        {"MAX": 41.6, "MIN": -41.6},
+        (drone.params["PWM_MAIN_MIN5"], drone.params["PWM_MAIN_MAX5"]), False)
 
     assert result is not None
     assert result["hard_stop"] is False
@@ -308,3 +308,47 @@ def test_a_failed_parameter_write_aborts(rig, capsys):
 
     assert "failed to write" in capsys.readouterr().out
 # def
+
+
+def test_an_end_stop_far_past_target_skips_the_stop_check(rig, capsys):
+    """The 17 deg case. A surface well past its target has travel to spare, so
+    probing it answers nothing and only costs a back-off cycle."""
+    gui, drone, servo = rig
+    gui.left_cal_active = True
+
+    drives = []
+    original = servo.drive
+    servo.drive = lambda pwm: (drives.append(pwm), original(pwm))[1]
+
+    # cmd -1 reaches -41.6 deg against a -25 deg target: 16.6 deg past.
+    result = gui._cal_evaluate_endpoint(
+        "LEFT", gui.LEFT_OUTPUT_FUNCTION, "MIN", drone.params["PWM_MAIN_MIN5"],
+        {"MAX": 25.0, "MIN": -25.0},
+        (drone.params["PWM_MAIN_MIN5"], drone.params["PWM_MAIN_MAX5"]), False)
+
+    assert result["probed"] is False
+    assert result["hard_stop"] is False
+    assert result["breakaway_us"] is None
+    assert result["new_pwm"] > drone.params["PWM_MAIN_MIN5"], "pulled inward"
+
+    # Only the one measurement: no back-off cycle was run.
+    assert len(set(drives)) == 1, "the probe would have used several PWM values"
+    assert "without a stop check" in capsys.readouterr().out
+
+
+def test_an_end_stop_near_target_still_gets_checked(rig):
+    """The skip must not swallow the case the probe exists for."""
+    gui, drone, servo = rig
+    gui.left_cal_active = True
+
+    drives = []
+    original = servo.drive
+    servo.drive = lambda pwm: (drives.append(pwm), original(pwm))[1]
+
+    result = gui._cal_evaluate_endpoint(
+        "LEFT", gui.LEFT_OUTPUT_FUNCTION, "MIN", drone.params["PWM_MAIN_MIN5"],
+        {"MAX": 41.6, "MIN": -41.6},
+        (drone.params["PWM_MAIN_MIN5"], drone.params["PWM_MAIN_MAX5"]), False)
+
+    assert result["probed"] is True
+    assert len(set(drives)) > 1, "the back-off probe ran"

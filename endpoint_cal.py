@@ -61,6 +61,8 @@ from endpoint_logic import (
     endpoint_command,
     hard_stop_verdict,
     inward_sign,
+    nominal_gain_deg_per_us,
+    overshot_target,
 )
 from manta_common import find_pico_port
 
@@ -173,8 +175,8 @@ def probe_breakaway(rig, params, which, cmd_endpoint, angle_at_endpoint):
 # def
 
 
-def evaluate_endpoint(rig, which, target_deg, attempt):
-    """One rapid approach: measure, probe for a hard stop, and decide.
+def evaluate_endpoint(rig, which, targets, attempt):
+    """One rapid approach: measure, probe if it is worth it, and decide.
 
     Returns a dict describing what happened; the caller writes the new value.
     """
@@ -182,6 +184,8 @@ def evaluate_endpoint(rig, which, target_deg, attempt):
     if params is None:
         return None
 
+    target_deg = targets[which]
+    other_deg = targets["MIN" if which == "MAX" else "MAX"]
     pwm_now = params["pwm_max"] if which == "MAX" else params["pwm_min"]
     cmd = endpoint_command(which, params["rev"])
 
@@ -194,6 +198,23 @@ def evaluate_endpoint(rig, which, target_deg, attempt):
     if not ok:
         print("  lost command authority (read %s, expected %d)" % (actual, expected))
         return None
+
+    # Past target: it has travel to spare, so a stop check answers nothing and
+    # the correction is already determined. See overshot_target().
+    if overshot_target(angle, target_deg, other_deg):
+        gain = nominal_gain_deg_per_us(targets["MAX"], targets["MIN"],
+                                       params["pwm_min"], params["pwm_max"])
+        shift = correction_us(angle, target_deg, gain)
+        result = {"which": which, "attempt": attempt, "pwm": pwm_now,
+                  "pwm_read": pwm_read, "cmd": cmd, "angle_deg": angle,
+                  "target_deg": target_deg, "error_deg": angle - target_deg,
+                  "breakaway_us": None, "hard_stop": False,
+                  "gain_deg_per_us": gain, "accepted": False, "new_pwm": None,
+                  "reason": "%.2f deg past target, shifting without a stop check"
+                            % (angle - target_deg)}
+        if shift is not None:
+            result["new_pwm"] = clamp_endpoint(pwm_now + shift)
+        return result
 
     breakaway, angle_backed = probe_breakaway(rig, params, which, cmd, angle)
     is_hard_stop, pull_in_us = hard_stop_verdict(breakaway)
@@ -289,6 +310,7 @@ def run_coarse_stage(rig, target_neg, target_pos, step_us):
 def run_refine_stage(rig, endpoints, rows):
     """Alternate MAX, MIN, MAX, MIN until both are set or one runs out of tries."""
     print("\nStage 2: rapid-approach refinement")
+    targets = {which: target for which, (_pwm, target) in endpoints.items()}
 
     # Every measured approach has to be a full-span traverse. The verify pass
     # showed MAX reading -36.04 when approached from centre but -37.7 twice
@@ -314,7 +336,7 @@ def run_refine_stage(rig, endpoints, rows):
             print("  %s did not converge in %d attempts" % (which, MAX_ATTEMPTS))
             return False
 
-        result = evaluate_endpoint(rig, which, endpoints[which][1], attempts[which])
+        result = evaluate_endpoint(rig, which, targets, attempts[which])
         if result is None:
             return False
 
