@@ -87,7 +87,7 @@ class SimulatedRig(object):
         self._thread.join(2.0)
     # def
 
-    def command_elevon(self, output_function, value):
+    def command_elevon(self, output_function, value, wait_ack=False, ack_timeout=1.0):
         side = "LEFT" if output_function == 1201 else "RIGHT"
 
         with self._lock:
@@ -96,6 +96,8 @@ class SimulatedRig(object):
                 self._target[side] = float(value)
                 self._start[side] = self._position[side]
                 self._commanded_at[side] = time.monotonic()
+
+        return MT.DroneInterface.MAV_RESULT_ACCEPTED if wait_ack else None
     # def
 
     def _integrate(self):
