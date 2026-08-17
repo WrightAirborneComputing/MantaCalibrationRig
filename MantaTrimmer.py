@@ -63,6 +63,7 @@ from range_test import (
     PRE_ROLL_S,
     analyse_leg,
     creep_commands,
+    creep_grid,
     endpoint_stats,
     mean_sd,
     settled_angle,
@@ -88,6 +89,24 @@ POSITION_WINDOW_S = 0.5
 CREEP_STEP_CMD = 0.01
 CREEP_PERIOD_S = 0.25
 DEFAULT_STICTION_REPS = 3
+
+# Curve samples per creep, including the arrival at the end stop.
+DEFAULT_CREEP_POINTS = 21
+
+# How long a curve sample dwells before it is read. It MUST exceed
+# POSITION_WINDOW_S, or the trailing mean still contains samples from before the
+# step and every reading lags the surface. That lag is not harmless noise: it
+# biases an upward sweep low and a downward sweep high, so the two errors add
+# into the apparent hysteresis band. At 0.01 cmd per 0.25 s the sweep covers
+# 0.7-1.5 deg/s, and a 0.25 s effective lag would inflate the band by 0.35-0.75
+# deg - the same order as the effect being measured, and systematic, so it would
+# look like a clean result rather than an error.
+CREEP_SAMPLE_DWELL_S = POSITION_WINDOW_S + 0.3
+
+# Named once so the writer and any reader cannot drift apart - the mismatch that
+# ISSUES.md #4 records against calibration_log.csv.
+CREEP_CURVE_COLUMNS = ("phase", "side", "direction", "rep", "cmd", "pwm_us",
+                       "angle_deg")
 
 # Backlog is sized in *seconds*, not samples, because the Pico's rate is now
 # negotiable. A fixed 200 entries meant 20 s at 10 Hz but only 0.2 s at 1000 Hz -
@@ -1257,6 +1276,7 @@ class FourSliderGUI:
         self.measure_active = False
 
         self.stiction_results = []
+        self.creep_points = []
         self.stiction_summary_rows = []
         self.rr_results = []
         self.rr_summary_rows = []
@@ -1750,7 +1770,7 @@ class FourSliderGUI:
         self.rr_rate_var = tk.StringVar(value=str(FAST_RATE_HZ))
         self.st_step_var = tk.StringVar(value="%.3f" % CREEP_STEP_CMD)
         self.st_period_var = tk.StringVar(value="%.2f" % CREEP_PERIOD_S)
-        self.st_start_var = tk.StringVar(value="0.00")
+        self.st_points_var = tk.StringVar(value=str(DEFAULT_CREEP_POINTS))
 
         # Swing cycles and creep reps are separate counts on purpose: a swing is
         # a couple of seconds and a creep from centre is a hundred steps, so
@@ -1762,7 +1782,7 @@ class FourSliderGUI:
                            ("Rate Hz", self.rr_rate_var),
                            ("Creep step", self.st_step_var),
                            ("Creep s", self.st_period_var),
-                           ("Creep from", self.st_start_var)):
+                           ("Sample pts", self.st_points_var)):
             row = tk.Frame(setup)
             row.pack(anchor="w", pady=(2, 0), fill=tk.X)
             tk.Label(row, text=label, width=11, anchor="w").pack(side=tk.LEFT)
@@ -1881,6 +1901,14 @@ class FourSliderGUI:
             command=self.export_range_rate_samples_csv)
         self.rr_samples_btn.pack(side=tk.RIGHT)
 
+        # The creep curve belongs to neither table: it is the raw PWM/angle
+        # material the tables are silent about, and the only way to look at the
+        # shape until there is a plot.
+        self.st_curve_btn = tk.Button(
+            footer, text="Save creep curve", width=16, state="disabled",
+            command=self.export_creep_curve_csv)
+        self.st_curve_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
         self.update_measure_estimate()
     # def
 
@@ -1932,9 +1960,23 @@ class FourSliderGUI:
                                                         CREEP_STEP_CMD)),
             "creep_period": max(0.05, self.get_float_var(self.st_period_var,
                                                          CREEP_PERIOD_S)),
-            "creep_start": self.clamp(
-                self.get_float_var(self.st_start_var, 0.0), -1.0, 1.0),
+            "creep_points": max(3, self.get_int_var(self.st_points_var,
+                                                    DEFAULT_CREEP_POINTS)),
+            # Snapshotted on the Tk thread: the worker needs min/max/trim to put
+            # a curve sample on a PWM axis, and a command only means anything
+            # relative to the values in force when it was issued.
+            "pwm_map": self.read_pwm_map(),
         }
+    # def
+
+    def read_pwm_map(self):
+        """Per side, what it takes to turn a command into a PWM. Tk thread only."""
+        mapping = {}
+        for side, channel in (("LEFT", 5), ("RIGHT", 6)):
+            pwm_min, pwm_max, trim = self.read_side_param_snapshot(side)
+            mapping[side] = (pwm_min, pwm_max, trim,
+                             self.is_main_channel_reversed(channel))
+        return mapping
     # def
 
     def measure_plan(self, settings):
@@ -1966,9 +2008,14 @@ class FourSliderGUI:
         seconds += swings * (PRE_ROLL_S + settle)
 
         if creeps:
-            walk = len(creep_commands(settings["creep_start"], 1.0,
-                                      settings["creep_step"]))
-            seconds += creeps * (settle + walk * settings["creep_period"] + settle)
+            # Full span now, and the sampled steps dwell instead of waiting a
+            # period, so they are counted at the dwell rather than the period.
+            walk = len(creep_commands(-1.0, 1.0, settings["creep_step"]))
+            samples = len(creep_grid(-1.0, 1.0, settings["creep_points"]))
+            seconds += creeps * (settle
+                                 + (walk - samples) * settings["creep_period"]
+                                 + samples * CREEP_SAMPLE_DWELL_S
+                                 + settle)
 
         text = "%d hard-overs" % swings
         if creeps:
@@ -2035,6 +2082,7 @@ class FourSliderGUI:
         self.st_tree.delete(*self.st_tree.get_children())
         self.rr_results = []
         self.stiction_results = []
+        self.creep_points = []
         self.rr_summary_rows = []
         self.stiction_summary_rows = []
         self.rr_samples = []
@@ -2048,6 +2096,7 @@ class FourSliderGUI:
         self.rr_export_btn.config(state="disabled")
         self.rr_samples_btn.config(state="disabled")
         self.st_export_btn.config(state="disabled")
+        self.st_curve_btn.config(state="disabled")
 
         self.measure_active = True
         self.rr_run_btn.config(state="disabled")
@@ -2064,12 +2113,13 @@ class FourSliderGUI:
         self.measure_active = False
     # def
 
-    def _stiction_capture_settled(self, phase, sides, kind, rep, target, settle, cal):
-        """Hold still, capture, and record where each side settled.
+    def _measure_settled(self, phase, dwell_s, cal):
+        """Hold still for dwell_s and return {side: settled angle}.
 
-        The same estimator as the swing analysis uses, on the same high-rate
-        stream, so the two ends of the stiction subtraction are measured
-        identically.
+        One estimator for every static reading this tab takes - curve samples
+        and end stop arrivals alike. Differencing two angles measured different
+        ways would mean nothing, and the curve has to join up with the endpoint
+        value it ends at.
         """
         reader = self.position_reader
         reader.send_command("G")
@@ -2079,13 +2129,19 @@ class FourSliderGUI:
         # sample at or after the timestamp it is given, so a post-capture time
         # would match nothing and return an empty series.
         t_start = time.monotonic()
-        time.sleep(settle)
+        time.sleep(dwell_s)
         samples, _truncated = reader.stop_capture()
 
+        angles = {}
         for side in PHASE_SIDES[phase]:
             series = to_series(samples, t_start, cal, side)
-            angle = settled_angle([a for _t, a in series])
+            angles[side] = settled_angle([a for _t, a in series])
+        return angles
+    # def
 
+    def _stiction_capture_settled(self, phase, sides, kind, rep, target, settle, cal):
+        """The end stop arrival: what the stiction comparison is built from."""
+        for side, angle in self._measure_settled(phase, settle, cal).items():
             record = {
                 "phase": phase, "side": side, "kind": kind, "rep": rep,
                 "target": target, "final_deg": angle,
@@ -2096,25 +2152,76 @@ class FourSliderGUI:
             self.post_to_gui(lambda r=record: self._st_show_leg(r))
     # def
 
+    def _sample_creep_point(self, phase, rep, target, command, cal, pwm_map):
+        """One dwelled sample part way along a creep.
+
+        Stored raw and separately from the stiction results: these are curve
+        points, and letting them into the same list would put mid-travel
+        positions into an end stop comparison.
+        """
+        direction = 1.0 if target > 0.0 else -1.0
+
+        for side, angle in self._measure_settled(
+                phase, CREEP_SAMPLE_DWELL_S, cal).items():
+            if angle is None:
+                continue
+
+            pwm_min, pwm_max, trim, rev = pwm_map[side]
+            self.creep_points.append({
+                "phase": phase,
+                "side": side,
+                "direction": direction,
+                "rep": rep,
+                "cmd": round(command, 4),
+                "pwm_us": self.expected_pwm(command, pwm_min, pwm_max, trim, rev),
+                "angle_deg": round(angle, 3),
+            })
+    # def
+
     def _stiction_creep_leg(self, phase, sides, rep, target, step, period,
-                            start, settle, cal):
-        """Walk the command to the end stop in `step` increments, then measure.
+                            points, settle, cal, pwm_map):
+        """Creep the full span to the end stop, sampling the curve on the way.
 
         The same increment-and-wait the trim calibration uses, but walking to a
         command rather than to an angle: the end stop is where the command runs
-        out. Nothing is measured during the walk - only where it ends up.
+        out.
+
+        Full span, from the opposite end rather than from centre, so that the
+        two directions cover the same ground and can be differenced. Creeping
+        outward from centre gives two halves of one curve travelled in opposite
+        directions, which overlap nowhere and so cannot show hysteresis at all.
+
+        The walk pauses at each grid position for longer than the averaging
+        window and records a sample - see CREEP_SAMPLE_DWELL_S for why sampling
+        on the move would manufacture a band that is not there. The arrival at
+        the end stop is measured separately and is still the number the stiction
+        comparison uses, unchanged.
         """
+        origin = -target
+
         for side in sides:
-            self.drone_interface.command_elevon(self.rr_output_function(side), start)
+            self.drone_interface.command_elevon(self.rr_output_function(side), origin)
         time.sleep(settle)
 
-        for command in creep_commands(start, target, step):
+        grid = creep_grid(origin, target, points)
+        next_sample = 0
+
+        for command in creep_commands(origin, target, step):
             if not self.measure_active:
                 return
+
             for side in sides:
                 self.drone_interface.command_elevon(
                     self.rr_output_function(side), command)
-            time.sleep(period)
+
+            # The dwell replaces this step's wait rather than adding to it: it
+            # is already longer than the period.
+            if next_sample < len(grid) and \
+                    abs(command - grid[next_sample]) <= step / 2.0:
+                self._sample_creep_point(phase, rep, target, command, cal, pwm_map)
+                next_sample += 1
+            else:
+                time.sleep(period)
 
         self._stiction_capture_settled(phase, sides, "creep", rep, target, settle, cal)
     # def
@@ -2181,6 +2288,36 @@ class FourSliderGUI:
                     ))
 
         return rows
+    # def
+
+    def export_creep_curve_csv(self):
+        """Every dwelled sample from every creep, as PWM against angle.
+
+        One row per sample rather than a summary: the shape has not been
+        characterised yet, so anything that reduced it here would be guessing at
+        what matters. Direction is carried per row because the up and down
+        sweeps are the two halves of the hysteresis comparison and must never be
+        pooled.
+        """
+        if not self.creep_points:
+            print("No creep curve to export")
+            return
+
+        try:
+            path = self.rr_report_path("creepcurve")
+
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(CREEP_CURVE_COLUMNS)
+                for point in self.creep_points:
+                    row = [point[column] for column in CREEP_CURVE_COLUMNS]
+                    writer.writerow(row)
+
+            print("Creep curve written to %s (%d points)"
+                  % (path, len(self.creep_points)))
+
+        except Exception as e:
+            print("Failed to export the creep curve: %s" % str(e))
     # def
 
     def export_stiction_csv(self):
@@ -2270,8 +2407,9 @@ class FourSliderGUI:
 
                             self._stiction_creep_leg(
                                 phase, sides, rep, target, settings["creep_step"],
-                                settings["creep_period"], settings["creep_start"],
-                                settle, cal)
+                                settings["creep_period"],
+                                settings["creep_points"], settle, cal,
+                                settings["pwm_map"])
                             done += 1
 
                 self._rr_status("%s: parking at -1" % phase, done / float(total))
@@ -2540,6 +2678,8 @@ class FourSliderGUI:
         self.rr_export_btn.config(state="normal" if rows else "disabled")
         self.rr_samples_btn.config(state="normal" if self.rr_samples else "disabled")
         self.st_export_btn.config(state="normal" if stiction_rows else "disabled")
+        self.st_curve_btn.config(
+            state="normal" if self.creep_points else "disabled")
 
         any_rows = bool(rows or stiction_rows)
         self.rr_progress.config(value=100.0 if any_rows else 0.0)

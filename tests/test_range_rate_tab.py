@@ -587,8 +587,8 @@ def test_sample_retention_is_bounded(rig, monkeypatch):
 STICTION_DEG = {"LEFT": 3.3, "RIGHT": 4.8}
 
 
-def run_stiction(gui, phases, reps=2, cycles=2, step=0.1, period=0.02, start=0.0,
-                 settle=0.4, range_rate=True, timeout=120.0):
+def run_stiction(gui, phases, reps=2, cycles=2, step=0.1, period=0.02, points=5,
+                 settle=0.4, range_rate=True, timeout=180.0):
     """Drive one stiction run synchronously, pumping Tk so callbacks land."""
     for phase, var in gui.rr_phase_vars.items():
         var.set(1 if phase in phases else 0)
@@ -597,7 +597,7 @@ def run_stiction(gui, phases, reps=2, cycles=2, step=0.1, period=0.02, start=0.0
     gui.st_reps_var.set(str(reps))
     gui.st_step_var.set(str(step))
     gui.st_period_var.set(str(period))
-    gui.st_start_var.set(str(start))
+    gui.st_points_var.set(str(points))
     gui.m_range_rate_var.set(1 if range_rate else 0)
     gui.m_stiction_var.set(1)
 
@@ -605,11 +605,12 @@ def run_stiction(gui, phases, reps=2, cycles=2, step=0.1, period=0.02, start=0.0
     settings.update({"phases": list(phases), "creep_reps": reps,
                      "cycles": cycles, "settle": settle, "rate": TAB_RATE_HZ,
                      "creep_step": step, "creep_period": period,
-                     "creep_start": start})
+                     "creep_points": points})
 
     gui.measure_active = True
     gui.rr_results = []
     gui.stiction_results = []
+    gui.creep_points = []
 
     thread = threading.Thread(
         target=gui._measure_worker, args=(settings,), daemon=True)
@@ -775,4 +776,109 @@ def test_actuator_tick_yields_while_the_stiction_test_runs(rig):
         assert len(drone.commands) == before
     finally:
         gui.measure_active = False
+# def
+
+
+def test_creeps_run_the_full_span_from_the_opposite_end(rig):
+    """Both directions must cover the same ground, or there is nothing to
+    difference - creeping outward from centre overlaps nowhere."""
+    gui, drone, _ = rig
+
+    run_stiction(gui, ["LEFT"], reps=1, cycles=1, points=5)
+
+    commands = [value for side, value in drone.commands if side == "LEFT"]
+    assert min(commands) == pytest.approx(-1.0)
+    assert max(commands) == pytest.approx(1.0)
+
+    up = [p for p in gui.creep_points if p["direction"] > 0]
+    down = [p for p in gui.creep_points if p["direction"] < 0]
+    assert up and down
+
+    # Each direction spans the travel, and they overlap across it.
+    assert min(p["cmd"] for p in up) < 0 < max(p["cmd"] for p in up)
+    assert min(p["cmd"] for p in down) < 0 < max(p["cmd"] for p in down)
+# def
+
+
+def test_curve_samples_land_on_the_grid_excluding_both_ends(rig):
+    """The start was arrived at by a jump and the target by the arrival, so
+    neither is a creep sample."""
+    gui, _, _ = rig
+
+    run_stiction(gui, ["LEFT"], reps=1, cycles=1, points=5)
+
+    up = sorted(p["cmd"] for p in gui.creep_points if p["direction"] > 0)
+    assert up == pytest.approx([-0.5, 0.0, 0.5])
+    assert len(up) == len(MT.creep_grid(-1.0, 1.0, 5))
+# def
+
+
+def test_curve_samples_carry_a_pwm_axis(rig):
+    """A command only means something against the min/max in force at the time,
+    so the PWM is stored rather than reconstructed later."""
+    gui, _, _ = rig
+
+    run_stiction(gui, ["LEFT"], reps=1, cycles=1, points=5)
+
+    pwm_min, pwm_max, trim = gui.read_side_param_snapshot("LEFT")
+    rev = gui.is_main_channel_reversed(5)
+
+    for point in gui.creep_points:
+        assert point["pwm_us"] == gui.expected_pwm(
+            point["cmd"], pwm_min, pwm_max, trim, rev)
+        assert min(pwm_min, pwm_max) <= point["pwm_us"] <= max(pwm_min, pwm_max)
+# def
+
+
+def test_curve_samples_dwell_longer_than_the_averaging_window(rig):
+    """Sampling on the move biases up and down sweeps opposite ways, which adds
+    into the apparent band. The dwell is what prevents it."""
+    assert MT.CREEP_SAMPLE_DWELL_S > MT.POSITION_WINDOW_S
+
+    gui, _, _ = rig
+    started = time.time()
+    run_stiction(gui, ["LEFT"], reps=1, cycles=1, points=5, period=0.0)
+    elapsed = time.time() - started
+
+    samples = len([p for p in gui.creep_points if p["side"] == "LEFT"])
+    assert samples == 6, "3 grid points each way"
+    assert elapsed > samples * MT.CREEP_SAMPLE_DWELL_S
+# def
+
+
+def test_the_end_stop_comparison_is_unchanged_by_the_curve(rig):
+    """Curve points are stored apart from the stiction results: a mid-travel
+    position must never enter an end stop comparison."""
+    gui, drone, _ = rig
+    drone.stiction_deg["LEFT"] = STICTION_DEG["LEFT"]
+
+    run_stiction(gui, ["LEFT"], reps=2, cycles=2, points=5)
+
+    assert all(abs(r["target"]) == 1.0 for r in gui.stiction_results)
+    assert all(r["kind"] == "creep" for r in gui.stiction_results)
+    assert gui.creep_points, "and the curve was still captured"
+
+    rows = gui.st_tree.get_children()
+    assert len(rows) == 2
+# def
+
+
+def test_creep_curve_exports_every_point(rig, tmp_path, monkeypatch):
+    gui, _, _ = rig
+    monkeypatch.setattr(MT, "APP_DIR", str(tmp_path))
+
+    run_stiction(gui, ["LEFT"], reps=1, cycles=1, points=5)
+    assert gui.st_curve_btn.cget("state") == "normal"
+    gui.export_creep_curve_csv()
+
+    written = list((tmp_path / "reports").glob("*_creepcurve.csv"))
+    assert len(written) == 1
+
+    import csv as csv_module
+    with open(written[0]) as handle:
+        rows = list(csv_module.reader(handle))
+
+    assert tuple(rows[0]) == MT.CREEP_CURVE_COLUMNS
+    assert len(rows) - 1 == len(gui.creep_points)
+    assert all(len(row) == len(MT.CREEP_CURVE_COLUMNS) for row in rows)
 # def

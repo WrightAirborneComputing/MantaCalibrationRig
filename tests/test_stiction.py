@@ -42,6 +42,31 @@ def test_the_number_of_creep_steps_sets_the_wall_clock():
     assert len(RT.creep_commands(0.0, 1.0, 0.01)) == 100
 
 
+def test_creep_grid_excludes_both_ends():
+    """The start was arrived at by a jump and the target by the arrival that
+    ends the creep, so neither is a creep sample."""
+    assert RT.creep_grid(-1.0, 1.0, 5) == [-0.5, 0.0, 0.5]
+    assert RT.creep_grid(1.0, -1.0, 5) == [0.5, 0.0, -0.5]
+
+    grid = RT.creep_grid(-1.0, 1.0, 21)
+    assert len(grid) == 19
+    assert -1.0 not in grid and 1.0 not in grid
+
+
+def test_creep_grid_is_evenly_spaced_and_ordered_by_travel():
+    grid = RT.creep_grid(-1.0, 1.0, 11)
+    gaps = [round(b - a, 6) for a, b in zip(grid, grid[1:])]
+    assert len(set(gaps)) == 1
+
+    # A downward creep is ordered downward, so a reader never has to sort.
+    assert RT.creep_grid(1.0, -1.0, 11) == list(reversed(grid))
+
+
+def test_creep_grid_needs_enough_points_to_be_a_curve():
+    with pytest.raises(ValueError):
+        RT.creep_grid(-1.0, 1.0, 2)
+
+
 def test_settled_angle_uses_the_last_fifth():
     # Ramp then hold: the settled value is the hold, not the mean of the ramp.
     values = list(range(0, 50)) + [100.0] * 50

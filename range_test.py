@@ -327,6 +327,25 @@ def creep_commands(start, target, step):
 # def
 
 
+def creep_grid(start, target, points):
+    """Commands at which a creep pauses to record a curve sample.
+
+    `points` counts the curve samples a creep produces, but only the interior
+    ones are returned. The two ends are excluded deliberately and for different
+    reasons: `start` was arrived at by a jump to park there, so it is not a
+    creep sample at all, and `target` is measured by the arrival that ends the
+    creep - sampling it here as well would record the same position twice.
+    """
+    points = int(points)
+    if points < 3:
+        raise ValueError("a curve needs at least 3 points")
+
+    span = float(target) - float(start)
+    return [round(float(start) + (span * index) / (points - 1), 6)
+            for index in range(1, points - 1)]
+# def
+
+
 def stiction_stats(creep_values, swing_values):
     """Compare crept-to and swung-to settled angles at the same end stop.
 
