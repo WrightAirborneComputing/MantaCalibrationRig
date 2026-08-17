@@ -24,6 +24,9 @@ ports are detected automatically — see [Port detection](#port-detection).
 | `calibration_log.csv` | Append-only record of every logged calibration. Tracked on purpose, so it stays at the top level rather than in `reports/`. |
 | `reports/` | Per-run CSV artefacts: sweep captures, range/rate summaries and sample dumps. Gitignored — clear it out whenever you like. |
 | `tests/` | Host-side tests. No hardware needed: `python3 -m pytest tests/`. |
+| `SERVO_SETTING.md` | The end stop setting procedure, and the measurements behind it. |
+| `endpoint_cal.py` | Implements that procedure offline. `set` writes parameters; `verify` does not. |
+| `servo_probe.py` | Read-only PWM diagnostic. A bolt-on - delete it when the investigation closes. |
 | `ISSUES.md` | Known defects with proposed fixes. |
 
 ## Setup
