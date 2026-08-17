@@ -57,6 +57,25 @@ from manta_common import (
 # DroneInterface lazily inside main(), so this is not a cycle.
 from pico_monitor import TickTracker
 import curve_plot
+from endpoint_logic import (
+    BACKOFF_CEILING_US,
+    BACKOFF_STEP_US,
+    COARSE_MAX,
+    COARSE_MIN,
+    ENDPOINT_DWELL_S,
+    ENDPOINT_TOLERANCE_DEG,
+    MAX_ATTEMPTS,
+    MOVEMENT_THRESHOLD_DEG,
+    alternating_order,
+    angle_gain_per_us,
+    clamp_endpoint,
+    command_delta_for_pwm,
+    correction_us,
+    endpoint_accepted,
+    endpoint_command,
+    hard_stop_verdict,
+    inward_sign,
+)
 from range_test import (
     MIN_TRAVEL_DEG,
     curve_series,
@@ -3592,7 +3611,15 @@ class FourSliderGUI:
     # def
 
     def set_side_param_and_refresh(self, side, param_name, py_type, value):
+        """Write a parameter and show what the FC read back. False if it failed.
+
+        Callers must check the result. A failed MIN or MAX write leaves the
+        calibration computing endpoints against a span the FC is not using, and
+        every number after it is wrong with nothing to show for it.
+        """
         ok = self.drone_interface.set_param_value(param_name, py_type, value)
+        if not ok:
+            print("%s calibration: failed to write %s" % (side, param_name))
         self.refresh_side_param_vars_from_drone(side)
         return ok
     # def
@@ -3810,9 +3837,12 @@ class FourSliderGUI:
         pwm_max = max(pwm_neg, pwm_pos)
 
         print("%s automatic calibration loading Min[%d] Max[%d]" % (side, pwm_min, pwm_max))
-        self.set_side_param_and_refresh(side, min_param, int, pwm_min)
-        self.set_side_param_and_refresh(side, max_param, int, pwm_max)
-        return True
+
+        # Checked, not fired and forgotten: everything downstream assumes the FC
+        # is using this span.
+        if not self.set_side_param_and_refresh(side, min_param, int, pwm_min):
+            return False
+        return self.set_side_param_and_refresh(side, max_param, int, pwm_max)
     # def
 
     def get_side_expected_pwm(self, side, cmd):
@@ -3931,43 +3961,297 @@ class FourSliderGUI:
         return None
     # def
 
-    def _left_calibration_worker(self):
-        self.left_cal_active = True
-        side = "LEFT"
-        output_function = self.LEFT_OUTPUT_FUNCTION
-        min_param = self.LEFT_MIN_PARAM
-        max_param = self.LEFT_MAX_PARAM
-        trim_param = self.LEFT_TRIM_PARAM
+    # ---- End stop calibration (the procedure in SERVO_SETTING.md) ------------
+
+    def side_calibration_params(self, side):
+        if side == "LEFT":
+            return (self.LEFT_OUTPUT_FUNCTION, self.LEFT_MIN_PARAM,
+                    self.LEFT_MAX_PARAM, self.LEFT_TRIM_PARAM)
+        return (self.RIGHT_OUTPUT_FUNCTION, self.RIGHT_MIN_PARAM,
+                self.RIGHT_MAX_PARAM, self.RIGHT_TRIM_PARAM)
+    # def
+
+    def set_calibration_active(self, side, active):
+        if side == "LEFT":
+            self.left_cal_active = active
+        else:
+            self.right_cal_active = active
+    # def
+
+    def _cal_measure(self, side, output_function, command,
+                     dwell_s=ENDPOINT_DWELL_S):
+        """Drive to a command in one motion, hold, and read the settled angle.
+
+        The dwell is longer than POSITION_WINDOW_S so the trailing mean contains
+        only post-move samples, and the hold re-sends the command so the FC
+        cannot take the surface back part way through - the override lapses
+        after about 2 s whatever timeout is requested.
+
+        Short by design. Lingering on a surface that may be against a mechanical
+        stop is exactly what the back-off probe exists to avoid.
+        """
+        self.drone_interface.command_elevon(output_function, command)
+        self._hold([side], command, dwell_s)
+        return self.get_side_angle(side)
+    # def
+
+    def _cal_probe_breakaway(self, side, output_function, which, span,
+                             rev, cmd_endpoint, angle_at_endpoint):
+        """Back off inward until the elevon moves. (microseconds, angle there).
+
+        Answers two questions at once. Whether the surface still has authority
+        at this end stop - if a range of PWM values all produce the same angle
+        it is jammed and the value written there means nothing - and what the
+        local deg/us gain is, which is what the correction needs. Taking the
+        gain from the probe rather than assuming it means the sign falls out of
+        the measurement, so nothing has to know the linkage direction.
+        """
+        pwm_min, pwm_max = span
+        backed = 0.0
+
+        while backed < BACKOFF_CEILING_US:
+            if not self.is_calibration_active(side):
+                return None, None
+
+            backed += BACKOFF_STEP_US
+            delta = command_delta_for_pwm(inward_sign(which) * backed,
+                                          pwm_min, pwm_max, rev)
+            command = self.clamp(cmd_endpoint + delta, -1.0, 1.0)
+
+            angle = self._cal_measure(side, output_function, command)
+            if angle is None:
+                print("%s calibration: no angle while probing %s" % (side, which))
+                return None, None
+
+            if abs(angle - angle_at_endpoint) >= MOVEMENT_THRESHOLD_DEG:
+                return backed, angle
+
+        return None, None
+    # def
+
+    def _cal_evaluate_endpoint(self, side, output_function, which, pwm_now,
+                               target_deg, span, rev):
+        """One rapid approach: measure, probe, and decide. None if it failed."""
+        command = endpoint_command(which, rev)
+
+        angle = self._cal_measure(side, output_function, command)
+        if angle is None:
+            print("%s calibration: no angle at the %s end stop" % (side, which))
+            return None
+
+        breakaway, angle_backed = self._cal_probe_breakaway(
+            side, output_function, which, span, rev, command, angle)
+
+        if not self.is_calibration_active(side):
+            return None
+
+        is_hard_stop, pull_in = hard_stop_verdict(breakaway)
+        gain = (None if breakaway is None
+                else angle_gain_per_us(angle, angle_backed, breakaway, which))
+
+        result = {"which": which, "angle_deg": angle, "target_deg": target_deg,
+                  "hard_stop": is_hard_stop, "breakaway_us": breakaway,
+                  "gain": gain, "new_pwm": None,
+                  "accepted": endpoint_accepted(angle, target_deg, is_hard_stop)}
+
+        if result["accepted"]:
+            print("%s calibration: %s at %+.2f deg (target %+.2f) - set"
+                  % (side, which, angle, target_deg))
+            return result
+
+        if is_hard_stop:
+            result["new_pwm"] = clamp_endpoint(pwm_now + inward_sign(which) * pull_in)
+            print("%s calibration: %s is against a stop - %s of inward travel did "
+                  "not move it. Pulling in %.0f us."
+                  % (side, which,
+                     "no amount" if breakaway is None else "%.0f us" % breakaway,
+                     pull_in))
+            return result
+
+        shift = correction_us(angle, target_deg, gain)
+        if shift is None:
+            print("%s calibration: %s gave no usable gain" % (side, which))
+            return result
+
+        result["new_pwm"] = clamp_endpoint(pwm_now + shift)
+        print("%s calibration: %s at %+.2f deg, %+.2f out - shifting %+.0f us"
+              % (side, which, angle, angle - target_deg, shift))
+        return result
+    # def
+
+    def _cal_refine_endpoints(self, side, output_function, min_param, max_param,
+                              endpoints, rev):
+        """Alternate MAX, MIN until both are set. Endpoints, or None on failure.
+
+        Alternating costs nothing: the traverse across to the other end *is* the
+        next rapid approach. It is also primed with one unmeasured traverse, so
+        the opening measurement has the same full-span run-up as every later
+        one - approach distance was measured to be worth 1.7 deg.
+        """
+        pwm = {which: value for which, (value, _target) in endpoints.items()}
+        targets = {which: target for which, (_value, target) in endpoints.items()}
+        attempts = {"MAX": 0, "MIN": 0}
+        accepted = {"MAX": False, "MIN": False}
+
+        self._cal_measure(side, output_function, endpoint_command("MIN", rev))
+
+        for which in alternating_order(MAX_ATTEMPTS):
+            if accepted["MAX"] and accepted["MIN"]:
+                break
+            if accepted[which]:
+                continue
+            if not self.is_calibration_active(side):
+                return None
+
+            attempts[which] += 1
+            if attempts[which] > MAX_ATTEMPTS:
+                print("%s calibration: %s did not settle in %d attempts"
+                      % (side, which, MAX_ATTEMPTS))
+                return None
+
+            span = (pwm["MIN"], pwm["MAX"])
+            result = self._cal_evaluate_endpoint(
+                side, output_function, which, pwm[which], targets[which],
+                span, rev)
+
+            if result is None:
+                return None
+
+            if result["accepted"]:
+                accepted[which] = True
+                continue
+
+            if result["new_pwm"] is None:
+                return None
+
+            pwm[which] = result["new_pwm"]
+            param = max_param if which == "MAX" else min_param
+            if not self.set_side_param_and_refresh(side, param, int, pwm[which]):
+                return None
+
+        if not (accepted["MAX"] and accepted["MIN"]):
+            print("%s calibration: ran out of attempts" % side)
+            return None
+
+        return pwm
+    # def
+
+    def _cal_verify_endpoints(self, side, output_function, pwm, targets, rev):
+        """Re-measure both end stops after the fact and report the error.
+
+        A calibration marking its own work proves nothing. This drives each end
+        once more, from the far side, and says what it actually reached - which
+        is the number that says whether the end stops are repeatable.
+        """
+        print("%s calibration: verifying" % side)
+        worst = 0.0
+
+        # Primed like the refinement, and for the same reason: the refinement
+        # leaves the surface next to whichever end it finished on, so an
+        # unprimed verify would measure that one after a few tens of
+        # microseconds of travel instead of a full-span run-up, and read it
+        # short by the stiction it is supposed to be checking for.
+        self._cal_measure(side, output_function, endpoint_command("MIN", rev))
+
+        for which in ("MAX", "MIN"):
+            if not self.is_calibration_active(side):
+                return None
+            angle = self._cal_measure(side, output_function,
+                                      endpoint_command(which, rev))
+            if angle is None:
+                print("%s verify: no angle at %s" % (side, which))
+                return None
+
+            error = angle - targets[which]
+            worst = max(worst, abs(error))
+            print("%s verify: %s pwm %d reached %+.2f deg, target %+.2f, "
+                  "error %+.2f%s"
+                  % (side, which, pwm[which], angle, targets[which], error,
+                     "" if abs(error) <= ENDPOINT_TOLERANCE_DEG else "  OUT"))
+
+        return worst
+    # def
+
+    def _calibration_worker(self, side):
+        """Coarse creep to get close, then set each end stop by rapid approach.
+
+        The creep is only ever used to get roughly into range; nothing it
+        measures is committed. An angle held while creeping up to it is not the
+        angle that PWM produces when the surface is driven there normally - on
+        this airframe the two differ by about 4 deg - so every value written
+        here is measured the way the surface is actually used.
+
+        The trim stage below is unchanged and still runs on the narrowed range.
+        It is known to eat travel and is deliberately left alone until the end
+        stops are repeatable; see SERVO_SETTING.md.
+        """
+        self.set_calibration_active(side, True)
+        output_function, min_param, max_param, trim_param = \
+            self.side_calibration_params(side)
+        rev = self.is_main_channel_reversed(5 if side == "LEFT" else 6)
+
         try:
             print("%s automatic calibration started" % side)
 
-            self.set_side_param_and_refresh(side, min_param, int, 900)
-            self.set_side_param_and_refresh(side, max_param, int, 2100)
-            self.set_side_param_and_refresh(side, trim_param, float, 0.0)
+            if not self.set_side_param_and_refresh(side, min_param, int, COARSE_MIN):
+                return
+            if not self.set_side_param_and_refresh(side, max_param, int, COARSE_MAX):
+                return
+            if not self.set_side_param_and_refresh(side, trim_param, float, 0.0):
+                return
 
-            if not self.left_cal_active:
+            if not self.is_calibration_active(side):
                 print("%s automatic calibration stopped" % side)
                 return
 
-            cmd_neg = self.move_elevon_to_angle(side, output_function, self.angle_neg_degs, -0.01)
-            if not self.left_cal_active or cmd_neg is None:
+            cmd_neg = self.move_elevon_to_angle(side, output_function,
+                                                self.angle_neg_degs, -0.01)
+            if not self.is_calibration_active(side) or cmd_neg is None:
                 print("%s automatic calibration stopped before negative endpoint completed" % side)
                 return
             pwm_neg = self.get_side_expected_pwm(side, cmd_neg)
 
-            cmd_pos = self.move_elevon_to_angle(side, output_function, self.angle_pos_degs, 0.01)
-            if not self.left_cal_active or cmd_pos is None:
+            cmd_pos = self.move_elevon_to_angle(side, output_function,
+                                                self.angle_pos_degs, 0.01)
+            if not self.is_calibration_active(side) or cmd_pos is None:
                 print("%s automatic calibration stopped before positive endpoint completed" % side)
                 return
             pwm_pos = self.get_side_expected_pwm(side, cmd_pos)
 
-            if not self.load_endpoint_params(side, min_param, max_param, pwm_neg, pwm_pos):
+            if not self.load_endpoint_params(side, min_param, max_param,
+                                             pwm_neg, pwm_pos):
+                return
+
+            # Which end carries which angle target comes from the measurement,
+            # not from the reverse bit: on a reversed channel the negative angle
+            # sits at the high PWM end, and assuming otherwise mirrors the
+            # calibration silently.
+            if pwm_neg >= pwm_pos:
+                endpoints = {"MAX": (max(pwm_neg, pwm_pos), self.angle_neg_degs),
+                             "MIN": (min(pwm_neg, pwm_pos), self.angle_pos_degs)}
+            else:
+                endpoints = {"MAX": (max(pwm_neg, pwm_pos), self.angle_pos_degs),
+                             "MIN": (min(pwm_neg, pwm_pos), self.angle_neg_degs)}
+
+            targets = {which: target for which, (_v, target) in endpoints.items()}
+
+            pwm = self._cal_refine_endpoints(side, output_function, min_param,
+                                             max_param, endpoints, rev)
+            if pwm is None:
+                print("%s automatic calibration did not set the end stops" % side)
+                return
+
+            print("%s end stops set: MIN=%d MAX=%d" % (side, pwm["MIN"], pwm["MAX"]))
+            self._cal_verify_endpoints(side, output_function, pwm, targets, rev)
+
+            if not self.is_calibration_active(side):
                 return
 
             trim_step = -0.01 if self.angle_trim_degs < 0.0 else 0.01
-            cmd_trim = self.move_elevon_to_angle(side, output_function, self.angle_trim_degs, trim_step)
+            cmd_trim = self.move_elevon_to_angle(side, output_function,
+                                                 self.angle_trim_degs, trim_step)
 
-            if not self.left_cal_active or cmd_trim is None:
+            if not self.is_calibration_active(side) or cmd_trim is None:
                 print("%s automatic calibration stopped before trim completed" % side)
                 return
 
@@ -3976,57 +4260,16 @@ class FourSliderGUI:
 
             print("%s automatic calibration finished" % side)
         finally:
-            self.left_cal_active = False
+            self.set_calibration_active(side, False)
             self.drone_interface.command_elevon(output_function, 0.0)
     # def
 
+    def _left_calibration_worker(self):
+        self._calibration_worker("LEFT")
+    # def
+
     def _right_calibration_worker(self):
-        self.right_cal_active = True
-        side = "RIGHT"
-        output_function = self.RIGHT_OUTPUT_FUNCTION
-        min_param = self.RIGHT_MIN_PARAM
-        max_param = self.RIGHT_MAX_PARAM
-        trim_param = self.RIGHT_TRIM_PARAM
-        try:
-            print("%s automatic calibration started" % side)
-
-            self.set_side_param_and_refresh(side, min_param, int, 900)
-            self.set_side_param_and_refresh(side, max_param, int, 2100)
-            self.set_side_param_and_refresh(side, trim_param, float, 0.0)
-
-            if not self.right_cal_active:
-                print("%s automatic calibration stopped" % side)
-                return
-
-            cmd_neg = self.move_elevon_to_angle(side, output_function, self.angle_neg_degs, -0.01)
-            if not self.right_cal_active or cmd_neg is None:
-                print("%s automatic calibration stopped before negative endpoint completed" % side)
-                return
-            pwm_neg = self.get_side_expected_pwm(side, cmd_neg)
-
-            cmd_pos = self.move_elevon_to_angle(side, output_function, self.angle_pos_degs, 0.01)
-            if not self.right_cal_active or cmd_pos is None:
-                print("%s automatic calibration stopped before positive endpoint completed" % side)
-                return
-            pwm_pos = self.get_side_expected_pwm(side, cmd_pos)
-
-            if not self.load_endpoint_params(side, min_param, max_param, pwm_neg, pwm_pos):
-                return
-
-            trim_step = -0.01 if self.angle_trim_degs < 0.0 else 0.01
-            cmd_trim = self.move_elevon_to_angle(side, output_function, self.angle_trim_degs, trim_step)
-
-            if not self.right_cal_active or cmd_trim is None:
-                print("%s automatic calibration stopped before trim completed" % side)
-                return
-
-            print("%s automatic calibration loading Trim[%.2f]" % (side, cmd_trim))
-            self.set_side_param_and_refresh(side, trim_param, float, cmd_trim)
-
-            print("%s automatic calibration finished" % side)
-        finally:
-            self.right_cal_active = False
-            self.drone_interface.command_elevon(output_function, 0.0)
+        self._calibration_worker("RIGHT")
     # def
 
     def _start_left_calibration_worker(self):
