@@ -262,6 +262,21 @@ def discover_ports(prefer_pico=None, prefer_drone=None):
 
 class DroneInterface:
 
+    MAV_CMD_ACTUATOR_TEST = 310
+
+    MAV_RESULT_ACCEPTED = 0
+    ACK_NOT_RECEIVED = -1
+
+    MAV_RESULT_NAMES = {
+        0: "ACCEPTED",
+        1: "TEMPORARILY_REJECTED",
+        2: "DENIED",
+        3: "UNSUPPORTED",
+        4: "FAILED",
+        5: "IN_PROGRESS",
+        6: "CANCELLED",
+    }
+
     def __init__(self, port=None):
         self.port = port
         self.baud = SERIAL_BAUD
@@ -538,22 +553,59 @@ class DroneInterface:
         return False
     # def
 
-    def command_elevon(self, output_function, value):
+    def describe_mav_result(self, result):
+        if result is None:
+            return "not sent"
+        if result == self.ACK_NOT_RECEIVED:
+            return "no ACK"
+        return self.MAV_RESULT_NAMES.get(int(result), "RESULT_%d" % int(result))
+    # def
+
+    def _wait_command_ack(self, command_id, timeout):
+        """Drain the link for a COMMAND_ACK. The caller must hold _mav_lock.
+
+        Every message is fed to the param handler on the way past, because this
+        consumes whatever else is in the buffer while it waits.
+        """
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            msg = self.master.recv_match(blocking=True, timeout=0.1)
+
+            if msg is None:
+                continue
+
+            self._handle_incoming_param_msg(msg)
+
+            if msg.get_type() == "COMMAND_ACK" and msg.command == command_id:
+                return int(msg.result)
+
+        return self.ACK_NOT_RECEIVED
+    # def
+
+    def command_elevon(self, output_function, value, wait_ack=False, ack_timeout=1.0):
+        """Send one actuator test command.
+
+        Returns None when nothing was sent, otherwise a MAV_RESULT (or
+        ACK_NOT_RECEIVED) when wait_ack is set. PX4 refuses the command when the
+        vehicle is armed, when the safety switch is on, or when COM_MOT_TEST_EN
+        is not 1 - all of which look exactly like a stuck surface unless the
+        caller reads the ACK.
+        """
         if not self.is_connected():
-            return
+            return None
 
         # Test escape hatch: exercise the whole app without moving surfaces.
         if os.environ.get("MANTA_NO_ACTUATE"):
-            return
+            return self.MAV_RESULT_ACCEPTED if wait_ack else None
 
-        MAV_CMD_ACTUATOR_TEST = 310
         timeout_s = 60.0
 
         with self._mav_lock:
             self.master.mav.command_long_send(
                 self.master.target_system,
                 self.master.target_component,
-                MAV_CMD_ACTUATOR_TEST,
+                self.MAV_CMD_ACTUATOR_TEST,
                 0,
                 float(value),
                 float(timeout_s),
@@ -563,6 +615,11 @@ class DroneInterface:
                 0,
                 0,
             )
+
+            if not wait_ack:
+                return None
+
+            return self._wait_command_ack(self.MAV_CMD_ACTUATOR_TEST, ack_timeout)
     # def
 
 # class
@@ -3037,6 +3094,35 @@ class FourSliderGUI:
         )
     # def
 
+    def load_endpoint_params(self, side, min_param, max_param, pwm_neg, pwm_pos):
+        """Write the measured endpoints as the side's PWM min/max.
+
+        PX4 has no inverted-range concept: mixer_module swaps MIN and MAX at
+        param load if MIN > MAX, and travel direction comes solely from
+        PWM_MAIN_REV. So the endpoints go in numerically, and the reverse bit is
+        only used to sanity check which end the positive command landed on.
+        """
+        if pwm_neg is None or pwm_pos is None:
+            print("%s automatic calibration could not convert the endpoints to PWM" % side)
+            return False
+
+        rev = self.is_main_channel_reversed(5 if side == "LEFT" else 6)
+
+        # Not reversed: a positive command drives towards the higher PWM.
+        if (pwm_pos > pwm_neg) != (not rev):
+            print("%s automatic calibration WARNING: reversed=%s, but the positive "
+                  "endpoint measured %d against %d for the negative. Check the channel "
+                  "wiring and PWM_MAIN_REV." % (side, str(rev), pwm_pos, pwm_neg))
+
+        pwm_min = min(pwm_neg, pwm_pos)
+        pwm_max = max(pwm_neg, pwm_pos)
+
+        print("%s automatic calibration loading Min[%d] Max[%d]" % (side, pwm_min, pwm_max))
+        self.set_side_param_and_refresh(side, min_param, int, pwm_min)
+        self.set_side_param_and_refresh(side, max_param, int, pwm_max)
+        return True
+    # def
+
     def get_side_expected_pwm(self, side, cmd):
         """Called from the calibration workers, so the Tk reads are marshalled.
 
@@ -3064,12 +3150,38 @@ class FourSliderGUI:
         return False
     # def
 
+    def actuator_test_rejected(self, side, result):
+        """True if PX4 explicitly refused the actuator test.
+
+        A missing ACK is only warned about: a congested or lossy link should not
+        abort a calibration that is otherwise working.
+        """
+        if result is None or result == DroneInterface.MAV_RESULT_ACCEPTED:
+            return False
+
+        if result == DroneInterface.ACK_NOT_RECEIVED:
+            print("%s calibration move: no ACK for the actuator test, continuing" % side)
+            return False
+
+        description = self.drone_interface.describe_mav_result(result)
+
+        print("%s calibration move: PX4 refused the actuator test (%s). Check that the "
+              "vehicle is disarmed, the safety switch is off, and COM_MOT_TEST_EN is 1." %
+              (side, description))
+        return True
+    # def
+
     def move_elevon_to_angle(self, side, output_function, target_angle_deg, inc_angle_deg):
         print("%s calibration move: centering elevon to 0.0 command" % side)
-        self.drone_interface.command_elevon(output_function, 0.0)
+        result = self.drone_interface.command_elevon(output_function, 0.0, wait_ack=True)
+
+        if self.actuator_test_rejected(side, result):
+            return None
+
         time.sleep(1.0)
 
         cmd = 0.0
+        ticks = 0
         deadline = time.time() + 60.0
 
         while time.time() < deadline:
@@ -3109,7 +3221,13 @@ class FourSliderGUI:
             if cmd > 1.0:
                 cmd = 1.0
 
-            self.drone_interface.command_elevon(output_function, cmd)
+            ticks += 1
+            check_ack = (ticks % 8 == 0)
+            result = self.drone_interface.command_elevon(
+                output_function, cmd, wait_ack=check_ack, ack_timeout=0.3)
+
+            if check_ack and self.actuator_test_rejected(side, result):
+                return None
 
             if (inc_angle_deg < 0.0 and cmd <= -1.0) or (inc_angle_deg > 0.0 and cmd >= 1.0):
                 print("%s calibration move: hit command limit before reaching target" % side)
@@ -3151,10 +3269,8 @@ class FourSliderGUI:
                 return
             pwm_pos = self.get_side_expected_pwm(side, cmd_pos)
 
-            print("%s automatic calibration loading Min[%s] Max[%s]" %
-                  (side, str(pwm_pos), str(pwm_neg)))
-            self.set_side_param_and_refresh(side, min_param, int, pwm_pos)
-            self.set_side_param_and_refresh(side, max_param, int, pwm_neg)
+            if not self.load_endpoint_params(side, min_param, max_param, pwm_neg, pwm_pos):
+                return
 
             trim_step = -0.01 if self.angle_trim_degs < 0.0 else 0.01
             cmd_trim = self.move_elevon_to_angle(side, output_function, self.angle_trim_degs, trim_step)
@@ -3202,10 +3318,8 @@ class FourSliderGUI:
                 return
             pwm_pos = self.get_side_expected_pwm(side, cmd_pos)
 
-            print("%s automatic calibration loading Min[%s] Max[%s]" %
-                  (side, str(pwm_neg), str(pwm_pos)))
-            self.set_side_param_and_refresh(side, min_param, int, pwm_neg)
-            self.set_side_param_and_refresh(side, max_param, int, pwm_pos)
+            if not self.load_endpoint_params(side, min_param, max_param, pwm_neg, pwm_pos):
+                return
 
             trim_step = -0.01 if self.angle_trim_degs < 0.0 else 0.01
             cmd_trim = self.move_elevon_to_angle(side, output_function, self.angle_trim_degs, trim_step)
