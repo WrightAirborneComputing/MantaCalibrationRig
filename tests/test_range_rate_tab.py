@@ -919,3 +919,63 @@ def test_no_gap_longer_than_the_override_during_a_creep(rig):
     gaps = [b - a for a, b in zip(stamps, stamps[1:])]
     assert max(gaps) < 2.0, "longest silence was %.2f s" % max(gaps)
 # def
+
+
+def test_curve_plot_window_opens_and_draws(rig):
+    gui, _, _ = rig
+
+    run_stiction(gui, ["LEFT"], reps=1, cycles=1, points=5)
+    assert gui.st_plot_btn.cget("state") == "normal"
+
+    gui.show_creep_curve()
+    gui.pump(0.4)
+
+    assert gui.curve_window is not None and gui.curve_window.winfo_exists()
+    assert gui.curve_canvas.find_all(), "something was drawn"
+    assert "band" in gui.curve_caption.cget("text")
+
+    # Re-opening raises the existing window rather than stacking another.
+    existing = gui.curve_window
+    gui.show_creep_curve()
+    gui.pump(0.2)
+    assert gui.curve_window is existing
+
+    gui.curve_window.destroy()
+# def
+
+
+def test_curve_plot_modes_label_their_axis(rig):
+    gui, _, _ = rig
+    run_stiction(gui, ["LEFT"], reps=1, cycles=1, points=5)
+    gui.show_creep_curve()
+    gui.pump(0.3)
+
+    def axis_label():
+        plot = gui.build_creep_plot(700, 400)
+        return [t["text"] for t in plot["texts"]]
+
+    assert "deviation deg" in axis_label(), "deviation is the default"
+
+    gui.curve_mode_var.set(MT.curve_plot.MODE_CURVE)
+    assert "angle deg" in axis_label()
+
+    gui.curve_window.destroy()
+# def
+
+
+def test_curve_plot_exports_an_svg(rig, tmp_path, monkeypatch):
+    gui, _, _ = rig
+    monkeypatch.setattr(MT, "APP_DIR", str(tmp_path))
+
+    run_stiction(gui, ["LEFT"], reps=1, cycles=1, points=5)
+    gui.show_creep_curve()
+    gui.pump(0.3)
+    gui.export_creep_curve_svg()
+
+    written = list((tmp_path / "reports").glob("*_creepcurve_left.svg"))
+    assert len(written) == 1
+    body = written[0].read_text()
+    assert body.startswith("<?xml") and body.rstrip().endswith("</svg>")
+
+    gui.curve_window.destroy()
+# def

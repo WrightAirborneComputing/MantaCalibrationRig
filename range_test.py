@@ -327,6 +327,92 @@ def creep_commands(start, target, step):
 # def
 
 
+def fit_polynomial(xs, ys, order=2):
+    """Least squares polynomial fit, returned lowest power first.
+
+    Pure Python by necessity: numpy is not in requirements.txt and the README
+    commits to a stock Windows install, so a plot cannot be the thing that adds
+    a build dependency. For order 2-3 over a few dozen points the normal
+    equations are perfectly well conditioned once x is centred, and centring is
+    what stops PWM values near 1500 from squaring into a badly scaled matrix.
+
+    Returns None when there are fewer distinct x values than the fit needs -
+    a fit through 2 points at order 2 is not underdetermined, it is meaningless.
+    """
+    xs = [float(x) for x in xs]
+    ys = [float(y) for y in ys]
+
+    if len(xs) != len(ys) or len(set(xs)) <= order:
+        return None
+
+    centre = sum(xs) / len(xs)
+    shifted = [x - centre for x in xs]
+    size = order + 1
+
+    # Normal equations: (A^T A) c = A^T y, built from power sums.
+    powers = [sum(x ** p for x in shifted) for p in range(2 * order + 1)]
+    matrix = [[powers[row + col] for col in range(size)] for row in range(size)]
+    vector = [sum(y * (x ** row) for x, y in zip(shifted, ys))
+              for row in range(size)]
+
+    solution = _solve(matrix, vector)
+    if solution is None:
+        return None
+
+    return {"coeffs": solution, "centre": centre, "order": order}
+# def
+
+
+def _solve(matrix, vector):
+    """Gaussian elimination with partial pivoting. None if singular."""
+    size = len(vector)
+    rows = [list(matrix[i]) + [vector[i]] for i in range(size)]
+
+    for column in range(size):
+        pivot = max(range(column, size), key=lambda r: abs(rows[r][column]))
+        if abs(rows[pivot][column]) < 1e-12:
+            return None
+        rows[column], rows[pivot] = rows[pivot], rows[column]
+
+        for row in range(column + 1, size):
+            factor = rows[row][column] / rows[column][column]
+            for col in range(column, size + 1):
+                rows[row][col] -= factor * rows[column][col]
+
+    result = [0.0] * size
+    for row in range(size - 1, -1, -1):
+        total = rows[row][size] - sum(rows[row][c] * result[c]
+                                      for c in range(row + 1, size))
+        result[row] = total / rows[row][row]
+    return result
+# def
+
+
+def evaluate_polynomial(fit, x):
+    """The fitted value at x, or None when there was no fit."""
+    if not fit:
+        return None
+    shifted = float(x) - fit["centre"]
+    return sum(c * (shifted ** power) for power, c in enumerate(fit["coeffs"]))
+# def
+
+
+def fit_residuals(fit, xs, ys):
+    """[(x, measured - fitted)], the departures from a smooth curve."""
+    if not fit:
+        return []
+    return [(x, y - evaluate_polynomial(fit, x)) for x, y in zip(xs, ys)]
+# def
+
+
+def rms(values):
+    values = [v for v in values if v is not None]
+    if not values:
+        return None
+    return math.sqrt(sum(v * v for v in values) / len(values))
+# def
+
+
 def creep_grid(start, target, points):
     """Commands at which a creep pauses to record a curve sample.
 
@@ -343,6 +429,55 @@ def creep_grid(start, target, points):
     span = float(target) - float(start)
     return [round(float(start) + (span * index) / (points - 1), 6)
             for index in range(1, points - 1)]
+# def
+
+
+def curve_series(points, side):
+    """{direction: [(pwm, mean angle, sd, n)]} for one side, averaged over reps.
+
+    Ordered by PWM so a plot can draw straight through it. Repeats at the same
+    PWM are averaged rather than plotted individually: the run-to-run spread is
+    carried as the sd, where it can be drawn as an error bar or used to decide
+    whether a feature is real, instead of being three overlapping lines.
+    """
+    grouped = {}
+
+    for point in points:
+        if point["side"] != side:
+            continue
+        direction = float(point["direction"])
+        pwm = int(point["pwm_us"])
+        grouped.setdefault(direction, {}).setdefault(pwm, []).append(
+            float(point["angle_deg"]))
+
+    series = {}
+    for direction, by_pwm in grouped.items():
+        series[direction] = [
+            (pwm,) + mean_sd(values) + (len(values),)
+            for pwm, values in sorted(by_pwm.items())
+        ]
+    return series
+# def
+
+
+def band_profile(series):
+    """[(pwm, band)] wherever both directions sampled the same PWM.
+
+    The band is the up sweep minus the down sweep, so it carries the sign that
+    says which way the surface was lagging. Only shared PWM values are compared:
+    interpolating one direction onto the other's grid would invent readings at
+    positions neither sweep actually visited, which is the one thing a stiction
+    measurement must not do.
+    """
+    if len(series) < 2:
+        return []
+
+    up = {pwm: mean for pwm, mean, _sd, _n in series.get(1.0, [])}
+    down = {pwm: mean for pwm, mean, _sd, _n in series.get(-1.0, [])}
+
+    return [(pwm, up[pwm] - down[pwm])
+            for pwm in sorted(set(up) & set(down))
+            if up[pwm] is not None and down[pwm] is not None]
 # def
 
 

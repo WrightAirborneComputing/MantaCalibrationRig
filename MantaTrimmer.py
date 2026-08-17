@@ -56,8 +56,10 @@ from manta_common import (
 # second copy would be a second thing to get wrong. range_test imports
 # DroneInterface lazily inside main(), so this is not a cycle.
 from pico_monitor import TickTracker
+import curve_plot
 from range_test import (
     MIN_TRAVEL_DEG,
+    curve_series,
     PHASES,
     PHASE_SIDES,
     PRE_ROLL_S,
@@ -1284,6 +1286,7 @@ class FourSliderGUI:
 
         self.stiction_results = []
         self.creep_points = []
+        self.curve_window = None
         self.stiction_summary_rows = []
         self.rr_results = []
         self.rr_summary_rows = []
@@ -1916,6 +1919,14 @@ class FourSliderGUI:
             command=self.export_creep_curve_csv)
         self.st_curve_btn.pack(side=tk.RIGHT, padx=(0, 6))
 
+        # A window rather than another panel: the plot wants room, it is not
+        # needed continuously, and the main window is already as tall as the
+        # Trim tab makes it.
+        self.st_plot_btn = tk.Button(
+            footer, text="Plot curve", width=11, state="disabled",
+            command=self.show_creep_curve)
+        self.st_plot_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
         self.update_measure_estimate()
     # def
 
@@ -2104,6 +2115,7 @@ class FourSliderGUI:
         self.rr_samples_btn.config(state="disabled")
         self.st_export_btn.config(state="disabled")
         self.st_curve_btn.config(state="disabled")
+        self.st_plot_btn.config(state="disabled")
 
         self.measure_active = True
         self.rr_run_btn.config(state="disabled")
@@ -2320,6 +2332,179 @@ class FourSliderGUI:
                     ))
 
         return rows
+    # def
+
+    # ---- Creep curve plot ----------------------------------------------------
+
+    CURVE_ROLE_COLOURS = {
+        curve_plot.ROLE_UP: "accent",
+        curve_plot.ROLE_FIT_UP: "accent",
+        curve_plot.ROLE_DOWN: "bad",
+        curve_plot.ROLE_FIT_DOWN: "bad",
+        curve_plot.ROLE_TRAM: "ink_faint",
+        curve_plot.ROLE_AXIS: "ink_muted",
+    }
+
+    def show_creep_curve(self):
+        """Open (or raise) the PWM/angle plot for the captured creeps."""
+        if not self.creep_points:
+            messagebox.showinfo("No curve", "Run a stiction measurement first.")
+            return
+
+        if self.curve_window is not None and self.curve_window.winfo_exists():
+            self.curve_window.deiconify()
+            self.curve_window.lift()
+            self.redraw_creep_curve()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Creep curve - PWM against angle")
+        self.curve_window = window
+
+        controls = tk.Frame(window, padx=8, pady=6)
+        controls.pack(fill=tk.X)
+
+        sides = sorted({point["side"] for point in self.creep_points})
+        self.curve_side_var = tk.StringVar(value=sides[0])
+        for side in sides:
+            tk.Radiobutton(controls, text=side, value=side,
+                           variable=self.curve_side_var,
+                           command=self.redraw_creep_curve).pack(side=tk.LEFT)
+
+        # Deviation by default: the raw curve cannot show a 1 deg band on a
+        # 62 deg axis, which is the entire quantity of interest.
+        self.curve_mode_var = tk.StringVar(value=curve_plot.MODE_DEVIATION)
+        tk.Checkbutton(controls, text="Deviation from fit",
+                       variable=self.curve_mode_var,
+                       onvalue=curve_plot.MODE_DEVIATION,
+                       offvalue=curve_plot.MODE_CURVE,
+                       command=self.redraw_creep_curve).pack(side=tk.LEFT,
+                                                             padx=(12, 0))
+
+        for label, var, default in (("Fit order", "curve_order_var", "2"),
+                                    ("Tramline deg", "curve_tol_var", "0.5")):
+            tk.Label(controls, text=label).pack(side=tk.LEFT, padx=(12, 4))
+            variable = tk.StringVar(value=default)
+            setattr(self, var, variable)
+            entry = tk.Entry(controls, textvariable=variable, width=5)
+            entry.pack(side=tk.LEFT)
+            entry.bind("<KeyRelease>", lambda event: self.redraw_creep_curve())
+
+        tk.Button(controls, text="Save SVG",
+                  command=self.export_creep_curve_svg).pack(side=tk.RIGHT)
+
+        self.curve_canvas = tk.Canvas(window, width=780, height=470,
+                                      bg=PALETTE["paper"], highlightthickness=1,
+                                      highlightbackground=PALETTE["rule"])
+        self.curve_canvas.pack(fill=tk.BOTH, expand=True, padx=8)
+        self.curve_canvas.bind("<Configure>",
+                               lambda event: self.redraw_creep_curve())
+
+        self.curve_caption = tk.Label(window, text="", anchor="w", justify="left",
+                                      padx=8, pady=6, fg=PALETTE["ink_muted"])
+        self.curve_caption.pack(fill=tk.X)
+
+        self.redraw_creep_curve()
+    # def
+
+    def build_creep_plot(self, width, height):
+        """The geometry for the current selection, or None when unplottable."""
+        if not self.creep_points:
+            return None
+
+        series = curve_series(self.creep_points, self.curve_side_var.get())
+        return curve_plot.build_plot(
+            series,
+            order=max(1, self.get_int_var(self.curve_order_var, 2)),
+            tolerance_deg=max(0.0, self.get_float_var(self.curve_tol_var, 0.5)),
+            width=width, height=height, mode=self.curve_mode_var.get())
+    # def
+
+    def redraw_creep_curve(self):
+        if self.curve_window is None or not self.curve_window.winfo_exists():
+            return
+
+        canvas = self.curve_canvas
+        canvas.delete("all")
+
+        width = max(320, canvas.winfo_width())
+        height = max(240, canvas.winfo_height())
+
+        plot = self.build_creep_plot(width, height)
+        if plot is None:
+            canvas.create_text(width / 2, height / 2, text="Nothing to plot",
+                               fill=PALETTE["ink_muted"])
+            return
+
+        for line in plot["axes"]:
+            self._draw_plot_line(canvas, line, 1)
+
+        for line in plot["polylines"]:
+            self._draw_plot_line(canvas, line, line.get("width", 2))
+
+        for marker in plot["markers"]:
+            x, y = marker["point"]
+            colour = PALETTE[self.CURVE_ROLE_COLOURS[marker["role"]]]
+            canvas.create_oval(x - 2.5, y - 2.5, x + 2.5, y + 2.5,
+                               fill=colour, outline=colour)
+
+        for text in plot["texts"]:
+            anchor = {"middle": "n", "end": "e", "start": "w"}[text["anchor"]]
+            canvas.create_text(text["x"], text["y"], text=text["text"],
+                               anchor=anchor, fill=PALETTE["ink_muted"])
+
+        self.curve_caption.config(text=self.describe_creep_plot(plot))
+    # def
+
+    def _draw_plot_line(self, canvas, line, width):
+        colour = PALETTE[self.CURVE_ROLE_COLOURS[line["role"]]]
+        flat = []
+        for x, y in line["points"]:
+            flat.extend((x, y))
+        if len(flat) < 4:
+            return
+        canvas.create_line(*flat, fill=colour, width=width,
+                           dash=(4, 3) if line.get("dash") else None)
+    # def
+
+    def describe_creep_plot(self, plot):
+        """The numbers the picture cannot carry: fit quality and band size."""
+        stats = plot["stats"]
+        parts = []
+
+        for direction, label in ((1.0, "up"), (-1.0, "down")):
+            fit = stats["fits"].get(direction)
+            if fit and fit["rms_deg"] is not None:
+                parts.append("%s fit rms %.2f deg, worst %+.2f at %d us"
+                             % (label, fit["rms_deg"], fit["max_deg"],
+                                fit["max_pwm"]))
+
+        band = stats.get("band")
+        if band:
+            parts.append("band mean %.2f deg, max %.2f deg at %d us"
+                         % (band["mean_deg"], band["max_deg"], band["max_pwm"]))
+
+        return "\n".join(parts) if parts else "Not enough points to fit"
+    # def
+
+    def export_creep_curve_svg(self):
+        plot = self.build_creep_plot(880, 520)
+        if plot is None:
+            print("Nothing to plot")
+            return
+
+        try:
+            side = self.curve_side_var.get()
+            path = self.rr_report_path("creepcurve_%s" % side.lower())
+            path = path[:-4] + ".svg"
+
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(curve_plot.to_svg(plot, "Creep curve - %s" % side))
+
+            print("Creep curve plot written to %s" % path)
+
+        except Exception as e:
+            print("Failed to export the creep curve plot: %s" % str(e))
     # def
 
     def export_creep_curve_csv(self):
@@ -2723,8 +2908,9 @@ class FourSliderGUI:
         self.rr_export_btn.config(state="normal" if rows else "disabled")
         self.rr_samples_btn.config(state="normal" if self.rr_samples else "disabled")
         self.st_export_btn.config(state="normal" if stiction_rows else "disabled")
-        self.st_curve_btn.config(
-            state="normal" if self.creep_points else "disabled")
+        enabled = "normal" if self.creep_points else "disabled"
+        self.st_curve_btn.config(state=enabled)
+        self.st_plot_btn.config(state=enabled)
 
         any_rows = bool(rows or stiction_rows)
         self.rr_progress.config(value=100.0 if any_rows else 0.0)
