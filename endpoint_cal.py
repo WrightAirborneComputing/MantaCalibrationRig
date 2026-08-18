@@ -59,10 +59,14 @@ from endpoint_logic import (
     correction_us,
     endpoint_accepted,
     endpoint_command,
+    error_grew,
     hard_stop_verdict,
+    has_diverged,
     inward_sign,
+    limit_correction,
     nominal_gain_deg_per_us,
     overshot_target,
+    usable_gain,
 )
 from manta_common import find_pico_port
 
@@ -175,7 +179,7 @@ def probe_breakaway(rig, params, which, cmd_endpoint, angle_at_endpoint):
 # def
 
 
-def evaluate_endpoint(rig, which, targets, attempt):
+def evaluate_endpoint(rig, which, targets, attempt, anchor_pwm=None):
     """One rapid approach: measure, probe if it is worth it, and decide.
 
     Returns a dict describing what happened; the caller writes the new value.
@@ -187,7 +191,13 @@ def evaluate_endpoint(rig, which, targets, attempt):
     target_deg = targets[which]
     other_deg = targets["MIN" if which == "MAX" else "MAX"]
     pwm_now = params["pwm_max"] if which == "MAX" else params["pwm_min"]
+    other_pwm = params["pwm_max"] if which == "MIN" else params["pwm_min"]
     cmd = endpoint_command(which, params["rev"])
+    nominal = nominal_gain_deg_per_us(targets["MAX"], targets["MIN"],
+                                      params["pwm_min"], params["pwm_max"])
+
+    def bounded(value):
+        return clamp_endpoint(value, which, other_pwm, anchor_pwm)
 
     angle, pwm_read = rig.measure_at(cmd)
     if angle is None:
@@ -202,9 +212,8 @@ def evaluate_endpoint(rig, which, targets, attempt):
     # Past target: it has travel to spare, so a stop check answers nothing and
     # the correction is already determined. See overshot_target().
     if overshot_target(angle, target_deg, other_deg):
-        gain = nominal_gain_deg_per_us(targets["MAX"], targets["MIN"],
-                                       params["pwm_min"], params["pwm_max"])
-        shift = correction_us(angle, target_deg, gain)
+        gain = nominal
+        shift = limit_correction(correction_us(angle, target_deg, gain))
         result = {"which": which, "attempt": attempt, "pwm": pwm_now,
                   "pwm_read": pwm_read, "cmd": cmd, "angle_deg": angle,
                   "target_deg": target_deg, "error_deg": angle - target_deg,
@@ -213,19 +222,21 @@ def evaluate_endpoint(rig, which, targets, attempt):
                   "reason": "%.2f deg past target, shifting without a stop check"
                             % (angle - target_deg)}
         if shift is not None:
-            result["new_pwm"] = clamp_endpoint(pwm_now + shift)
+            result["new_pwm"] = bounded(pwm_now + shift)
         return result
 
     breakaway, angle_backed = probe_breakaway(rig, params, which, cmd, angle)
     is_hard_stop, pull_in_us = hard_stop_verdict(breakaway)
-    gain = (None if breakaway is None
-            else angle_gain_per_us(angle, angle_backed, breakaway, which))
+    probed = (None if breakaway is None
+              else angle_gain_per_us(angle, angle_backed, breakaway, which))
+    gain, gain_source = usable_gain(probed, nominal)
 
     result = {
         "which": which, "attempt": attempt, "pwm": pwm_now, "pwm_read": pwm_read,
         "cmd": cmd, "angle_deg": angle, "target_deg": target_deg,
         "error_deg": angle - target_deg, "breakaway_us": breakaway,
         "hard_stop": is_hard_stop, "gain_deg_per_us": gain,
+        "probed_gain_deg_per_us": probed, "gain_source": gain_source,
         "accepted": endpoint_accepted(angle, target_deg, is_hard_stop),
         "new_pwm": None,
     }
@@ -234,16 +245,16 @@ def evaluate_endpoint(rig, which, targets, attempt):
         return result
 
     if is_hard_stop:
-        result["new_pwm"] = clamp_endpoint(pwm_now + inward_sign(which) * pull_in_us)
+        result["new_pwm"] = bounded(pwm_now + inward_sign(which) * pull_in_us)
         result["reason"] = "hard stop, pulling in %.0f us" % pull_in_us
         return result
 
-    shift = correction_us(angle, target_deg, gain)
+    shift = limit_correction(correction_us(angle, target_deg, gain))
     if shift is None:
         result["reason"] = "no usable gain from the probe"
         return result
 
-    result["new_pwm"] = clamp_endpoint(pwm_now + shift)
+    result["new_pwm"] = bounded(pwm_now + shift)
     result["reason"] = "%.2f deg out, shifting %+.0f us" % (result["error_deg"], shift)
     return result
 # def
@@ -258,7 +269,9 @@ def describe(result):
     else:
         parts.append("breakaway %.0f us" % result["breakaway_us"])
         if result["gain_deg_per_us"]:
-            parts.append("gain %+.4f deg/us" % result["gain_deg_per_us"])
+            parts.append("gain %+.4f deg/us (%s)"
+                         % (result["gain_deg_per_us"],
+                            result.get("gain_source", "probe")))
     if result["accepted"]:
         parts.append("ACCEPTED")
     elif result.get("reason"):
@@ -324,6 +337,9 @@ def run_refine_stage(rig, endpoints, rows):
 
     attempts = {"MAX": 0, "MIN": 0}
     accepted = {"MAX": False, "MIN": False}
+    anchors = {which: pwm for which, (pwm, _target) in endpoints.items()}
+    last_error = {"MAX": None, "MIN": None}
+    growths = {"MAX": 0, "MIN": 0}
 
     for which in alternating_order(MAX_ATTEMPTS):
         if accepted["MAX"] and accepted["MIN"]:
@@ -336,7 +352,8 @@ def run_refine_stage(rig, endpoints, rows):
             print("  %s did not converge in %d attempts" % (which, MAX_ATTEMPTS))
             return False
 
-        result = evaluate_endpoint(rig, which, targets, attempts[which])
+        result = evaluate_endpoint(rig, which, targets, attempts[which],
+                                   anchors[which])
         if result is None:
             return False
 
@@ -345,9 +362,29 @@ def run_refine_stage(rig, endpoints, rows):
 
         if result["accepted"]:
             accepted[which] = True
+            last_error[which] = 0.0
+            growths[which] = 0
             continue
 
+        # An end stop that lands further out than it did last time is being
+        # corrected the wrong way, and applying the same correction again only
+        # makes it worse. Two growths in a row ends the run.
+        previous = last_error[which]
+        growths[which] = (growths[which] + 1
+                          if error_grew(previous, result["error_deg"]) else 0)
+        last_error[which] = result["error_deg"]
+
+        if has_diverged(growths[which]):
+            print("  %s is diverging: %+.2f deg out after %+.2f deg last attempt"
+                  % (which, result["error_deg"], previous))
+            return False
+
         if result["new_pwm"] is None:
+            return False
+
+        if result["new_pwm"] == result["pwm"]:
+            print("  %s is against its limit at %d us and still %+.2f deg out"
+                  % (which, result["pwm"], result["error_deg"]))
             return False
 
         param = rig.max_param if which == "MAX" else rig.min_param

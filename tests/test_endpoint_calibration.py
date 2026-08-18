@@ -16,6 +16,10 @@ import time
 
 import pytest
 
+# Captured before the fake clock replaces time.sleep, so the test's own polling
+# loop still waits in real seconds while the code under test does not.
+REAL_SLEEP = time.sleep
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -80,6 +84,32 @@ class SimServo:
 # class
 
 
+class FakeClock:
+    """A wall clock without the wall. Tests only.
+
+    The dwells in the procedure are real waits: _hold() spins until
+    monotonic() passes its deadline, so patching sleep() to a no-op does not
+    shorten a 0.8 s dwell, it only turns it into a busy-wait. That cost the
+    file about a minute, and it made the interleaving between the worker
+    thread and the Tk main loop depend on how fast the machine happened to be.
+
+    Advancing the clock from sleep() instead leaves every loop running the
+    same number of iterations, issuing the same commands in the same order,
+    and takes the seconds out. time() is deliberately left alone - the test's
+    own timeout is measured with it, and a frozen one would never fire.
+    """
+
+    def __init__(self):
+        self.now = 0.0
+
+    def sleep(self, seconds):
+        self.now += max(0.0, float(seconds))
+
+    def monotonic(self):
+        return self.now
+# class
+
+
 class SimRig:
     """A flight controller whose parameters actually drive a simulated servo."""
 
@@ -135,7 +165,9 @@ def rig(monkeypatch):
 
     # Real time, compressed. Every dwell and hold in the procedure is honoured
     # in order and in proportion, just not in seconds.
-    monkeypatch.setattr(MT.time, "sleep", lambda seconds: None)
+    clock = FakeClock()
+    monkeypatch.setattr(MT.time, "sleep", clock.sleep)
+    monkeypatch.setattr(MT.time, "monotonic", clock.monotonic)
 
     gui.angle_neg_degs = -30.0
     gui.angle_pos_degs = 30.0
@@ -170,7 +202,7 @@ def run_calibration(gui, side="LEFT", timeout=60.0):
             root.update()
         except Exception:
             break
-        time.sleep(0.005)
+        REAL_SLEEP(0.005)
 
     assert not thread.is_alive(), "calibration worker did not finish"
 # def
@@ -282,13 +314,13 @@ def test_stopping_mid_run_leaves_the_surface_centred(rig):
     thread = threading.Thread(target=gui._calibration_worker, args=("LEFT",),
                               daemon=True)
     thread.start()
-    time.sleep(0.05)
+    REAL_SLEEP(0.05)
     gui.left_cal_active = False
 
     deadline = time.time() + 30.0
     while thread.is_alive() and time.time() < deadline:
         gui.root.update()
-        time.sleep(0.005)
+        REAL_SLEEP(0.005)
 
     assert not thread.is_alive()
     assert drone.params["PWM_MAIN_MIN5"] is not None
@@ -446,3 +478,67 @@ def test_a_parameter_write_leaves_the_surface_where_it_was_told(rig):
 
     assert commands[-1] == pytest.approx(-1.0), "re-commanded after the write"
     assert drone.params["PWM_MAIN_MAX5"] == 1900
+
+
+def test_a_probe_poisoned_by_creep_does_not_send_the_endpoint_backwards(rig):
+    """The RIGHT run's failure.
+
+    The probe measures the local gain over one 10 us step taken 0.8 s after a
+    full-span slam into the end stop, while the surface is still creeping back
+    from the overshoot. On the rig the creep won, and the probe reported the
+    right magnitude with the wrong sign: MIN was corrected away from its target
+    three attempts running, 1.8 deg of error becoming 44 deg.
+
+    Here the probe is poisoned outright. The geometry still says which way the
+    surface moves, and that is what the correction has to follow.
+    """
+    gui, drone, _servo = rig
+    gui.left_cal_active = True
+    drone.params["PWM_MAIN_MIN5"] = 1100
+
+    # Backing off inward moved the surface the *other* way: creep, not gain.
+    monkey = lambda side, fn, which, span, rev, cmd, angle: (10.0, angle - 1.0)
+    gui._cal_probe_breakaway = monkey
+
+    result = gui._cal_evaluate_endpoint(
+        "LEFT", gui.LEFT_OUTPUT_FUNCTION, "MIN", 1100,
+        {"MAX": 35.0, "MIN": -35.0}, (1100, 2000), False)
+
+    assert result["probed"] is True
+    assert result["gain"] > 0, "corrected on the geometry, not on the creep"
+    assert result["new_pwm"] < 1100, "MIN moved toward its target"
+    assert result["new_pwm"] >= endpoint_logic.PWM_FLOOR
+
+
+def test_an_end_stop_that_keeps_getting_worse_ends_the_run(rig, capsys):
+    """Ten attempts of a correction pushing the wrong way is how MIN reached
+    2200 us against a MAX of 1893 - a crossed pair PX4 silently swaps, so every
+    reading after it was taken against a range nobody chose."""
+    gui, drone, _servo = rig
+    gui.left_cal_active = True
+
+    errors = iter((1.82, 3.58, 15.82, 44.65, 66.79))
+
+    def worsening(side, fn, which, pwm_now, targets, span, rev, anchor=None):
+        if which == "MAX":
+            return {"which": which, "angle_deg": targets["MAX"],
+                    "target_deg": targets["MAX"], "accepted": True,
+                    "new_pwm": None, "gain": 0.1, "hard_stop": False,
+                    "breakaway_us": 10.0, "probed": True}
+        angle = targets["MIN"] + next(errors)
+        return {"which": which, "angle_deg": angle, "target_deg": targets["MIN"],
+                "accepted": False, "new_pwm": pwm_now + 100, "gain": -0.1,
+                "hard_stop": False, "breakaway_us": 10.0, "probed": True}
+
+    gui._cal_evaluate_endpoint = worsening
+    gui._cal_measure = lambda *args, **kwargs: 0.0
+
+    result = gui._cal_refine_endpoints(
+        "LEFT", gui.LEFT_OUTPUT_FUNCTION, "PWM_MAIN_MIN5", "PWM_MAIN_MAX5",
+        {"MAX": (1893, 35.0), "MIN": (1192, -33.0)}, False)
+
+    assert result is None, "the run stops rather than writing ten bad values"
+    assert "diverging" in capsys.readouterr().out
+    # Two attempts' worth of damage, not ten, and nowhere near MAX.
+    assert drone.params["PWM_MAIN_MIN5"] <= 1192 + 200
+    assert drone.params["PWM_MAIN_MIN5"] < drone.params["PWM_MAIN_MAX5"]

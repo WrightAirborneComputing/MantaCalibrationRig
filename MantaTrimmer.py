@@ -75,8 +75,12 @@ from endpoint_logic import (
     correction_us,
     endpoint_accepted,
     endpoint_command,
+    error_grew,
     hard_stop_verdict,
+    has_diverged,
     inward_sign,
+    limit_correction,
+    usable_gain,
 )
 from range_test import (
     MIN_TRAVEL_DEG,
@@ -4070,11 +4074,22 @@ class FourSliderGUI:
     # def
 
     def _cal_evaluate_endpoint(self, side, output_function, which, pwm_now,
-                               targets, span, rev):
-        """One rapid approach: measure, probe if it is worth it, and decide."""
+                               targets, span, rev, anchor_pwm=None):
+        """One rapid approach: measure, probe if it is worth it, and decide.
+
+        anchor_pwm is where the coarse creep put this end. Every new value is
+        clamped against it, against the servo band, and against the other end -
+        see clamp_endpoint().
+        """
         command = endpoint_command(which, rev)
         target_deg = targets[which]
         other_deg = targets["MIN" if which == "MAX" else "MAX"]
+        other_pwm = span[1] if which == "MIN" else span[0]
+        nominal = nominal_gain_deg_per_us(targets["MAX"], targets["MIN"],
+                                          span[0], span[1])
+
+        def bounded(value):
+            return clamp_endpoint(value, which, other_pwm, anchor_pwm)
 
         angle = self._cal_approach(side, output_function, which, rev)
         if angle is None:
@@ -4086,9 +4101,8 @@ class FourSliderGUI:
         # the average gain and measure properly on the next pass, which lands
         # near target.
         if overshot_target(angle, target_deg, other_deg):
-            gain = nominal_gain_deg_per_us(targets["MAX"], targets["MIN"],
-                                           span[0], span[1])
-            shift = correction_us(angle, target_deg, gain)
+            gain = nominal
+            shift = limit_correction(correction_us(angle, target_deg, gain))
             result = {"which": which, "angle_deg": angle,
                       "target_deg": target_deg, "hard_stop": False,
                       "breakaway_us": None, "probed": False, "gain": gain,
@@ -4098,7 +4112,7 @@ class FourSliderGUI:
                 print("%s calibration: %s has no usable span" % (side, which))
                 return result
 
-            result["new_pwm"] = clamp_endpoint(pwm_now + shift)
+            result["new_pwm"] = bounded(pwm_now + shift)
             print("%s calibration: %s at %+.2f deg, %+.2f past target - "
                   "shifting %+.0f us without a stop check"
                   % (side, which, angle, angle - target_deg, shift))
@@ -4111,8 +4125,13 @@ class FourSliderGUI:
             return None
 
         is_hard_stop, pull_in = hard_stop_verdict(breakaway)
-        gain = (None if breakaway is None
-                else angle_gain_per_us(angle, angle_backed, breakaway, which))
+        probed = (None if breakaway is None
+                  else angle_gain_per_us(angle, angle_backed, breakaway, which))
+        gain, gain_source = usable_gain(probed, nominal)
+        if gain_source.startswith("nominal (") and probed:
+            print("%s calibration: %s probe gave %+.4f deg/us against %+.4f "
+                  "nominal - correcting on the nominal gain"
+                  % (side, which, probed, nominal))
 
         result = {"which": which, "angle_deg": angle, "target_deg": target_deg,
                   "hard_stop": is_hard_stop, "breakaway_us": breakaway,
@@ -4125,7 +4144,7 @@ class FourSliderGUI:
             return result
 
         if is_hard_stop:
-            result["new_pwm"] = clamp_endpoint(pwm_now + inward_sign(which) * pull_in)
+            result["new_pwm"] = bounded(pwm_now + inward_sign(which) * pull_in)
             print("%s calibration: %s is against a stop - %s of inward travel did "
                   "not move it. Pulling in %.0f us."
                   % (side, which,
@@ -4133,12 +4152,12 @@ class FourSliderGUI:
                      pull_in))
             return result
 
-        shift = correction_us(angle, target_deg, gain)
+        shift = limit_correction(correction_us(angle, target_deg, gain))
         if shift is None:
             print("%s calibration: %s gave no usable gain" % (side, which))
             return result
 
-        result["new_pwm"] = clamp_endpoint(pwm_now + shift)
+        result["new_pwm"] = bounded(pwm_now + shift)
         print("%s calibration: %s at %+.2f deg, %+.2f out - shifting %+.0f us"
               % (side, which, angle, angle - target_deg, shift))
         return result
@@ -4155,9 +4174,12 @@ class FourSliderGUI:
         """
         pwm = {which: value for which, (value, _target) in endpoints.items()}
         targets = {which: target for which, (_value, target) in endpoints.items()}
+        anchors = dict(pwm)
 
         attempts = {"MAX": 0, "MIN": 0}
         accepted = {"MAX": False, "MIN": False}
+        last_error = {"MAX": None, "MIN": None}
+        growths = {"MAX": 0, "MIN": 0}
 
         self._cal_measure(side, output_function, endpoint_command("MIN", rev))
 
@@ -4177,16 +4199,41 @@ class FourSliderGUI:
 
             span = (pwm["MIN"], pwm["MAX"])
             result = self._cal_evaluate_endpoint(
-                side, output_function, which, pwm[which], targets, span, rev)
+                side, output_function, which, pwm[which], targets, span, rev,
+                anchors[which])
 
             if result is None:
                 return None
 
             if result["accepted"]:
                 accepted[which] = True
+                last_error[which] = 0.0
+                growths[which] = 0
                 continue
 
+            # A correction that leaves the end stop further out than it found it
+            # is the correction going the wrong way, and it does not get better
+            # by being applied again. One growth can be noise on a surface that
+            # is nearly there; two in a row ends the run while the endpoint is
+            # still somewhere sane.
+            error = result["angle_deg"] - result["target_deg"]
+            previous = last_error[which]
+            growths[which] = (growths[which] + 1
+                              if error_grew(previous, error) else 0)
+            last_error[which] = error
+
+            if has_diverged(growths[which]):
+                print("%s calibration: %s is diverging - %+.2f deg out after "
+                      "%+.2f deg on the previous attempt. Stopping with the end "
+                      "stops where they are." % (side, which, error, previous))
+                return None
+
             if result["new_pwm"] is None:
+                return None
+
+            if result["new_pwm"] == pwm[which]:
+                print("%s calibration: %s is against its limit at %d us and "
+                      "still %+.2f deg out" % (side, which, pwm[which], error))
                 return None
 
             pwm[which] = result["new_pwm"]

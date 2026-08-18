@@ -153,3 +153,119 @@ def test_a_large_overshoot_corrects_toward_the_target():
 
     assert shift < 0, "pulled inward"
     assert endpoint_logic.clamp_endpoint(2000 + shift) == pytest.approx(1717, abs=1)
+
+
+def test_a_probed_gain_that_disagrees_with_the_geometry_is_dropped():
+    """The RIGHT run's failure, in numbers.
+
+    MIN read -31.18 against a -33.00 target on a 1213-1893 span, so the gain
+    must be about +0.10 deg/us. The probe returned -0.087: right magnitude,
+    wrong sign, because the surface was still creeping back from the overshoot
+    when the 10 us step was measured. Correcting on it pushed MIN the wrong way
+    three attempts running.
+    """
+    nominal = endpoint_logic.nominal_gain_deg_per_us(35.0, -33.0, 1213, 1893)
+    assert nominal == pytest.approx(0.1, abs=0.005)
+
+    gain, source = endpoint_logic.usable_gain(-0.087, nominal)
+    assert gain == nominal
+    assert "direction" in source
+
+    # And now the correction goes the way it should: MIN comes down, not up.
+    shift = endpoint_logic.correction_us(-31.18, -33.0, gain)
+    assert shift < 0
+    assert endpoint_logic.clamp_endpoint(1213 + shift, "MIN", 1893, 1213) < 1213
+
+
+def test_a_plausible_probed_gain_is_kept():
+    """The probe exists because the local gain is not the average one - it was
+    measured to vary about 2:1 end to end, and that has to survive the check."""
+    nominal = endpoint_logic.nominal_gain_deg_per_us(35.0, -33.0, 1213, 1893)
+
+    for probed in (nominal * 0.5, nominal, nominal * 2.0):
+        gain, source = endpoint_logic.usable_gain(probed, nominal)
+        assert gain == probed
+        assert source == "probe"
+
+
+def test_an_implausible_magnitude_is_dropped_even_with_the_right_sign():
+    nominal = endpoint_logic.nominal_gain_deg_per_us(35.0, -33.0, 1213, 1893)
+
+    gain, source = endpoint_logic.usable_gain(nominal * 10.0, nominal)
+    assert gain == nominal and "10.0x" in source
+
+    gain, source = endpoint_logic.usable_gain(nominal * 0.05, nominal)
+    assert gain == nominal and "nominal" in source
+
+
+def test_a_missing_gain_falls_back_to_whichever_one_exists():
+    assert endpoint_logic.usable_gain(None, 0.1) == (0.1, "nominal")
+    assert endpoint_logic.usable_gain(0.1, None) == (0.1, "probe")
+    assert endpoint_logic.usable_gain(None, None) == (None, "none")
+
+
+def test_one_attempt_cannot_move_an_endpoint_more_than_the_cap():
+    limit = endpoint_logic.MAX_CORRECTION_US
+
+    assert endpoint_logic.limit_correction(5154.0) == limit
+    assert endpoint_logic.limit_correction(-1348.0) == -limit
+    assert endpoint_logic.limit_correction(-60.0) == -60.0
+    assert endpoint_logic.limit_correction(None) is None
+
+
+def test_the_end_stops_cannot_cross():
+    """PX4 swaps MIN and MAX at param load, so a crossed pair does not fail -
+    it calibrates on against a range nobody chose. MIN=2200 against MAX=1893 is
+    what the RIGHT run wrote, and every reading after it was meaningless."""
+    span = endpoint_logic.MIN_ENDPOINT_SPAN_US
+
+    assert endpoint_logic.clamp_endpoint(2200, "MIN", 1893) == 1893 - span
+    assert endpoint_logic.clamp_endpoint(1100, "MAX", 1500) == 1500 + span
+
+    # Well clear of the other end, nothing is imposed.
+    assert endpoint_logic.clamp_endpoint(1213, "MIN", 1893) == 1213
+
+
+def test_an_endpoint_stays_near_where_the_coarse_creep_found_it():
+    drift = endpoint_logic.ENDPOINT_DRIFT_LIMIT_US
+
+    assert endpoint_logic.clamp_endpoint(1674, "MIN", 1893, 1192) == int(1192 + drift)
+    assert endpoint_logic.clamp_endpoint(1210, "MIN", 1893, 1192) == 1210
+
+    # Below the anchor too, where the servo band is not already the tighter one.
+    assert endpoint_logic.clamp_endpoint(1050, "MIN", 1893, 1400) == int(1400 - drift)
+
+
+def test_the_servo_band_is_the_outer_bound():
+    """800 us is a PX4 limit, not a servo one. Writing it drove the elevon so
+    far past its stop that the flight controller browned out."""
+    assert endpoint_logic.PWM_FLOOR == 1000
+    assert endpoint_logic.PWM_CEILING == 2000
+    assert endpoint_logic.clamp_endpoint(800, "MIN", 1893, 900) == 1000
+    assert endpoint_logic.clamp_endpoint(2200, "MAX", 1000, 2100) == 2000
+
+
+def test_a_growing_error_is_only_called_divergence_after_two_of_them():
+    """One growth can be the hold noise on a surface that is nearly there."""
+    assert not endpoint_logic.error_grew(None, 1.82)
+    assert not endpoint_logic.error_grew(1.82, -1.9), "inside the noise floor"
+    assert endpoint_logic.error_grew(1.82, 3.58)
+    assert not endpoint_logic.error_grew(3.58, 1.82)
+
+    assert not endpoint_logic.has_diverged(1)
+    assert endpoint_logic.has_diverged(2)
+
+
+def test_the_right_run_would_have_stopped_two_attempts_in():
+    """Replaying the errors from the log: 1.82, 3.58, 15.82, 44.65."""
+    growths, stopped_at = 0, None
+    previous = None
+
+    for attempt, error in enumerate((1.82, 3.58, 15.82, 44.65), start=1):
+        growths = growths + 1 if endpoint_logic.error_grew(previous, error) else 0
+        previous = error
+        if endpoint_logic.has_diverged(growths):
+            stopped_at = attempt
+            break
+
+    assert stopped_at == 3, "stopped while MIN was still 15 deg out, not 44"

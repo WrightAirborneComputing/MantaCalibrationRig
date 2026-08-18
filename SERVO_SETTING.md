@@ -135,11 +135,60 @@ Because the rapid approach overshoots where the creep stopped, the corrections
 normally pull both ends **inward** and the span tightens. That is expected, but
 the sign is not forced: an end stop that falls short is pushed outward instead.
 
+#### The probed gain is checked before it is used
+
+The probe measures over a single 10 µs step taken 0.8 s after a full-span slam
+into the end stop — while the surface is still creeping back from the overshoot.
+When the creep is larger than the step, the subtraction returns the creep. On a
+RIGHT run it returned it **with the wrong sign**, at a plausible magnitude:
+
+| attempt | MIN read | error vs −33.0° | shift applied | implied gain |
+|---|---:|---:|---:|---:|
+| 1 | −31.18° | +1.82° | +21 µs | −0.087 deg/µs |
+| 2 | −29.42° | +3.58° | +138 µs | −0.026 |
+| 3 | −17.18° | +15.82° | +323 µs | −0.049 |
+| 4 | +11.65° | +44.65° | −1348 µs | +0.033 |
+
+The true gain there is +0.10 deg/µs (68° over a 1213–1893 span). Every
+correction pushed MIN further from its target until it clamped, crossed MAX, and
+drove the servo into its stop hard enough to brown out the flight controller.
+
+So the probed gain is now believed only when it agrees with the geometry: same
+sign as the nominal gain, and within 0.3× to 3× of it. The linkage gain was
+measured to vary about 2:1 end to end, which that band holds comfortably.
+Anything outside it is settling drift, and the correction falls back to the
+nominal gain — crude, but right about which way the surface moves.
+
+#### Bounds on every correction
+
+Four of them, narrowest wins:
+
+- **200 µs per attempt.** A gain that passes the check above can still be off by
+  a factor of two, and another attempt costs one traverse.
+- **1000–2000 µs.** A servo limit, not a PX4 one: `PWM_MAIN_MIN` accepts 800
+  quite happily, and writing it is what browned out the FC.
+- **±300 µs of the coarse creep's finding.** The creep is rough but measured; an
+  endpoint 300 µs away from it is a symptom, not a correction.
+- **MIN and MAX stay 200 µs apart.** PX4 swaps them at param load when
+  `MIN > MAX`, so a crossed pair does not fail — it calibrates on silently
+  against a range nobody chose, and every reading after it is meaningless.
+
 ### Failure
 
 Ten attempts per end. Beyond that the procedure stops, reports the error, and
 **restores the `MIN`, `MAX` and trim it started with**. A partially corrected
 pair is worse than the values you began with, because it looks calibrated.
+
+It also stops early, on the same terms, when:
+
+- **The error grew on two consecutive attempts at the same end.** A correction
+  that leaves the end stop further out than it found it is pushing the wrong
+  way, and applying it again only makes it worse. One growth can be hold noise
+  on a surface that is nearly there; two in a row is not. On the RIGHT run above
+  this ends it on attempt 3, with MIN 15° out instead of 44°.
+- **A correction is pinned against its own bound** and the end stop is still out
+  of tolerance. There is nowhere left to move it, so spending the remaining
+  attempts driving the surface into its stop achieves nothing.
 
 ---
 
@@ -173,6 +222,12 @@ Two cautions when reading its output:
 | hard stop pull-in | breakaway + 10 µs | |
 | endpoint dwell | 0.8 s | one 0.5 s averaging window plus margin |
 | attempts per end | 10 | |
+| consecutive growing errors allowed | 1 | two in a row is a runaway, not noise |
+| max shift per attempt | 200 µs | |
+| endpoint band | 1000–2000 µs | servo limit; 800 µs browned out the FC |
+| max drift from the coarse value | 300 µs | |
+| minimum MIN–MAX separation | 200 µs | PX4 swaps a crossed pair silently |
+| probed gain accepted within | 0.3×–3× nominal | linkage gain varies about 2:1 end to end |
 | coarse range | 900–2100 µs | wide enough to bracket any endpoint |
 | coarse creep step | 6 µs | matches the existing calibration |
 

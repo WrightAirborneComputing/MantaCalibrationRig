@@ -23,13 +23,45 @@ BACKOFF_CEILING_US = 200.0         # give up looking for breakaway past here
 ENDPOINT_DWELL_S = 0.8             # one 0.5 s averaging window plus margin
 MAX_ATTEMPTS = 10
 
-# The wide-open range the coarse creep crosses.
+# The wide-open range the coarse creep crosses. Wider than the band a refined
+# endpoint is held to below: the creep is looking for the stops, the refinement
+# is placing a value the servo has to live at.
 COARSE_MIN = 900
 COARSE_MAX = 2100
 
-# Refuse to write an endpoint outside this band, whatever the maths says.
-PWM_FLOOR = 800
-PWM_CEILING = 2200
+# Refuse to write an endpoint outside this band, whatever the maths says. These
+# are servo limits, not PX4 limits - PWM_MAIN_MIN accepts 800 quite happily, and
+# a RIGHT run that wrote 800 drove the elevon so far past its stop that the
+# flight controller browned out mid-calibration.
+PWM_FLOOR = 1000
+PWM_CEILING = 2000
+
+# MIN and MAX must stay this far apart. PX4 silently swaps them at param load
+# when MIN > MAX, so a crossed pair does not fail - it quietly calibrates
+# against a range nobody asked for, which is what a runaway MIN did on the rig.
+MIN_ENDPOINT_SPAN_US = 200
+
+# How far a refined endpoint may wander from where the coarse creep found it.
+# The creep is rough, but it is measured: an endpoint 300 us away from it is not
+# a correction, it is a symptom.
+ENDPOINT_DRIFT_LIMIT_US = 300.0
+
+# The most one attempt may move an endpoint. A gain that passes the sanity check
+# below can still be off by a factor of two, and spending another attempt costs
+# one traverse - far cheaper than driving the surface into its stop.
+MAX_CORRECTION_US = 200.0
+
+# A probed gain is believed when it agrees in sign with the nominal one and
+# lands within these multiples of it. Outside that it is settling drift, not
+# linkage gain.
+GAIN_SANITY_LOW = 0.3
+GAIN_SANITY_HIGH = 3.0
+
+# Consecutive attempts whose error grew before an end stop is called diverging.
+# One growth can be noise on a surface that is nearly there; two in a row is the
+# correction pushing the wrong way.
+DIVERGENCE_ATTEMPTS = 2
+DIVERGENCE_MARGIN_DEG = MOVEMENT_THRESHOLD_DEG
 
 
 def endpoint_command(which, rev):
@@ -162,8 +194,101 @@ def alternating_order(rounds):
 # def
 
 
-def clamp_endpoint(pwm):
-    return int(round(min(PWM_CEILING, max(PWM_FLOOR, float(pwm)))))
+def usable_gain(probed_gain, nominal_gain):
+    """The gain to correct on, and where it came from: (gain, source).
+
+    The probe measures the local gain over a single 10 us step taken 0.8 s after
+    a full-span slam into the end stop, while the surface is still creeping back
+    from the overshoot. When the creep is larger than the step the subtraction
+    returns the creep, and on a RIGHT run it returned it with the wrong sign -
+    three corrections in a row pushed MIN away from its target, 1.8 deg of error
+    becoming 44 deg. The magnitude looked right the whole way.
+
+    So the probed gain is believed only when it agrees with what the geometry
+    says it must be: the same sign, and within a factor of GAIN_SANITY_HIGH
+    either way. The linkage gain was measured to vary about 2:1 end to end,
+    which that band comfortably holds. Anything else is the creep, and the
+    nominal gain - crude, but right about which way the surface moves - is the
+    better number to correct on.
+    """
+    if not nominal_gain:
+        return (probed_gain, "probe") if probed_gain else (None, "none")
+    if not probed_gain:
+        return nominal_gain, "nominal"
+
+    if (probed_gain > 0.0) != (nominal_gain > 0.0):
+        return nominal_gain, "nominal (probe disagreed on direction)"
+
+    ratio = abs(probed_gain) / abs(nominal_gain)
+    if ratio < GAIN_SANITY_LOW or ratio > GAIN_SANITY_HIGH:
+        return nominal_gain, "nominal (probe was %.1fx nominal)" % ratio
+
+    return probed_gain, "probe"
+# def
+
+
+def limit_correction(shift_us, limit=MAX_CORRECTION_US):
+    """Cap one attempt's shift. None passes through untouched."""
+    if shift_us is None:
+        return None
+    shift = float(shift_us)
+    if shift > limit:
+        return limit
+    if shift < -limit:
+        return -limit
+    return shift
+# def
+
+
+def error_grew(previous_error_deg, error_deg):
+    """Did this attempt land further out than the last one at the same end?
+
+    The margin is the hold noise floor, so a surface sitting still is never
+    called worse than it was.
+    """
+    if previous_error_deg is None:
+        return False
+    return abs(float(error_deg)) > abs(float(previous_error_deg)) + DIVERGENCE_MARGIN_DEG
+# def
+
+
+def has_diverged(consecutive_growths):
+    return int(consecutive_growths) >= DIVERGENCE_ATTEMPTS
+# def
+
+
+def clamp_endpoint(pwm, which=None, other_pwm=None, anchor_pwm=None):
+    """The value that may actually be written, given everything constraining it.
+
+    Four bounds, narrowest wins: the servo band, the coarse creep's finding, and
+    - when the other end is known - the requirement that MIN and MAX stay
+    MIN_ENDPOINT_SPAN_US apart. PX4 swaps them at param load when MIN > MAX, so
+    a crossed pair calibrates on silently and every reading after it is taken
+    against a range nobody chose.
+
+    which and other_pwm come as a pair; either missing and the crossing check is
+    skipped, which is what the old single-argument callers get.
+    """
+    low = float(PWM_FLOOR)
+    high = float(PWM_CEILING)
+
+    if anchor_pwm is not None:
+        low = max(low, float(anchor_pwm) - ENDPOINT_DRIFT_LIMIT_US)
+        high = min(high, float(anchor_pwm) + ENDPOINT_DRIFT_LIMIT_US)
+
+    if which is not None and other_pwm is not None:
+        if which == "MIN":
+            high = min(high, float(other_pwm) - MIN_ENDPOINT_SPAN_US)
+        else:
+            low = max(low, float(other_pwm) + MIN_ENDPOINT_SPAN_US)
+
+    # Bounds that cannot all be met means the two ends are already too close or
+    # the anchor sits outside the servo band. Keeping the ends apart matters
+    # more than honouring the anchor, so the upper bound wins.
+    if low > high:
+        low = high
+
+    return int(round(min(high, max(low, float(pwm)))))
 # def
 
 
