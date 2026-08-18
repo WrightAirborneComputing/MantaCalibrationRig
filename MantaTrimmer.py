@@ -1,5 +1,6 @@
 try:
     import tkinter as tk
+    import tkinter.font as tkfont
     from tkinter import messagebox, ttk
 except ImportError:
     raise SystemExit(
@@ -11,6 +12,7 @@ except ImportError:
 
 import threading
 import time
+import traceback
 import re
 import struct
 import builtins
@@ -77,12 +79,16 @@ from endpoint_logic import (
     endpoint_accepted,
     endpoint_command,
     error_grew,
-    hard_stop_verdict,
     has_diverged,
     inward_sign,
     limit_correction,
+    stop_verdict,
+    STOP_FREE,
     usable_gain,
+    STOP_UNCONFIRMED,
+    UNCONFIRMED_ATTEMPTS,
 )
+import cal_flow
 from trim_logic import (
     TRIM_APPROACH_CMD,
     TRIM_ATTEMPTS,
@@ -155,6 +161,15 @@ CREEP_SAMPLE_DWELL_S = POSITION_WINDOW_S + 0.3
 # re-send, or the surface wanders off mid-measurement and is yanked back by the
 # next command.
 MEASURE_REFRESH_S = 0.5
+
+# The per-drone setup gate, named once so the status strip and the warning
+# dialog cannot describe the same blocker in two different ways. Order is the
+# order they appear on the strip, and the order they are listed when refused.
+SETUP_ITEMS = (
+    ("name", "SET DRONE NAME"),
+    ("left", "ZERO LEFT ELEVON"),
+    ("right", "ZERO RIGHT ELEVON"),
+)
 
 # Named once so the writer and any reader cannot drift apart - the mismatch that
 # ISSUES.md #4 records against calibration_log.csv.
@@ -952,21 +967,41 @@ class PositionReader:
     # def
 
     def set_center(self, side):
+        """Centre one side on the current reading. True only if it really centred."""
         raw = self.get_average_position_nonblocking(side)
         if raw is None:
             print("No data for centering %s" % side)
-            return
+            return False
 
         with self._settings_lock:
             if side == "LEFT":
                 self.left_offset = -(self.left_scaler * raw)
                 print("Left centred. Scaler=%.4f Offset = %.4f" % (self.left_scaler, self.left_offset))
                 self.save_calibration(("LEFT",))
+                return True
 
             elif side == "RIGHT":
                 self.right_offset = (self.right_scaler * raw)
                 print("Right centred. Scaler=%.4f Offset = %.4f" % (self.right_scaler, self.right_offset))
                 self.save_calibration(("RIGHT",))
+                return True
+
+        return False
+    # def
+
+    def clear_center(self):
+        """Drop both centring offsets, so the angles read raw until re-zeroed.
+
+        Called when a drone is connected: the offsets on file were measured
+        against whatever airframe was on the rig last, and carrying them over
+        would quietly report the previous drone's zero as this one's.
+        """
+        with self._settings_lock:
+            self.left_offset = 0.0
+            self.right_offset = 0.0
+            self.save_calibration(("LEFT", "RIGHT"))
+
+        print("Centring cleared - zero both angles before calibrating")
     # def
 
     def set_scaler_and_offset(self, side, scaler=None, offset=None):
@@ -1324,6 +1359,11 @@ class FourSliderGUI:
         self.left_cal_active = False
         self.right_cal_active = False
 
+        # What each side's flow chart draws. One model per side, touched only
+        # by that side's worker; the chart is drawn from snapshots of them.
+        self.cal_flow = {"LEFT": cal_flow.SideFlow(),
+                         "RIGHT": cal_flow.SideFlow()}
+
         # Measured by the trim stage, kept so "Log calibration" can record it.
         # None until a calibration has actually measured one: an unmeasured
         # backlash and a zero backlash are not the same claim.
@@ -1350,6 +1390,14 @@ class FourSliderGUI:
         self.drone_name_var = tk.StringVar(value="")
         self.folding_var = tk.StringVar(value="")
 
+        # Per-drone setup gate. Nothing that drives the surfaces or writes a
+        # named record may run until this drone has been named and both sides
+        # zeroed - see reset_setup_state(). Reset on every connect, so the
+        # previous airframe's name and zeros cannot be inherited.
+        self.name_is_set = False
+        self.left_zeroed = False
+        self.right_zeroed = False
+
         self.angle_neg_degs = self.position_reader.angle_neg_degs
         self.angle_pos_degs = self.position_reader.angle_pos_degs
         self.angle_trim_degs = self.position_reader.angle_trim_degs
@@ -1373,9 +1421,20 @@ class FourSliderGUI:
         status_strip.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
 
         self.build_connection_panel(status_strip)
+        self.build_setup_panel(status_strip)
 
         body = tk.Frame(main_frame)
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # The right-hand column is packed BEFORE the notebook, and the order
+        # is the whole point. pack hands out space in pack order, so whoever
+        # goes first takes its full request and whoever goes last absorbs the
+        # shortfall. With the notebook first, a 1280-wide window left this
+        # column 152 px of the 650 it asks for - survivable when it only held a
+        # log you could scroll, fatal now it holds the flow charts, which a
+        # Canvas would clip without saying anything.
+        right_col = tk.Frame(body)
+        right_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         self.notebook = ttk.Notebook(body)
         self.notebook.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1436,13 +1495,13 @@ class FourSliderGUI:
         )
         zero_angles_btn.pack(pady=2, anchor="w")
 
-        auto_both_btn = tk.Button(
+        self.auto_both_btn = tk.Button(
             angle_group,
             text="Auto calibrate",
             width=18,
             command=self.start_both_calibration
         )
-        auto_both_btn.pack(pady=2, anchor="w")
+        self.auto_both_btn.pack(pady=2, anchor="w")
 
         stop_both_btn = tk.Button(
             angle_group,
@@ -1452,13 +1511,13 @@ class FourSliderGUI:
         )
         stop_both_btn.pack(pady=2, anchor="w")
 
-        sweep_btn = tk.Button(
+        self.sweep_btn = tk.Button(
             angle_group,
             text="Sweep to CSV",
             width=18,
             command=self.start_sweep_to_csv
         )
-        sweep_btn.pack(pady=(8, 2), anchor="w")
+        self.sweep_btn.pack(pady=(8, 2), anchor="w")
 
         folding_row = tk.Frame(angle_group, bd=1, relief="groove", padx=4, pady=4)
         folding_row.pack(anchor="w", pady=(8, 2), fill=tk.X)
@@ -1488,13 +1547,13 @@ class FourSliderGUI:
         )
         left_clear_btn.pack(pady=(0, 10))
 
-        left_cal_btn = tk.Button(
+        self.left_cal_btn = tk.Button(
             left_group,
             text="Auto calibrate",
             width=18,
             command=self.start_left_calibration
         )
-        left_cal_btn.pack(pady=(0, 4))
+        self.left_cal_btn.pack(pady=(0, 4))
 
         left_stop_btn = tk.Button(
             left_group,
@@ -1566,13 +1625,13 @@ class FourSliderGUI:
         )
         right_clear_btn.pack(pady=(0, 10))
 
-        right_cal_btn = tk.Button(
+        self.right_cal_btn = tk.Button(
             right_group,
             text="Auto calibrate",
             width=18,
             command=self.start_right_calibration
         )
-        right_cal_btn.pack(pady=(0, 4))
+        self.right_cal_btn.pack(pady=(0, 4))
 
         right_stop_btn = tk.Button(
             right_group,
@@ -1636,21 +1695,39 @@ class FourSliderGUI:
         self.notebook.add(rr_tab, text="  Measure  ")
         self.build_measure_tab(rr_tab)
 
-        # Instrumentation panel
-        log_group = tk.LabelFrame(body, text="Instrumentation", padx=10, pady=10)
-        log_group.pack(side=tk.LEFT, padx=10, fill=tk.BOTH, expand=True)
+        # Calibration flow charts, above the log and outside the notebook for
+        # the same reason the log itself is: a run you cannot see because you
+        # are on the other tab is a run you cannot follow.
+        self.build_calibration_flow(right_col)
 
+        # Instrumentation panel
+        log_group = tk.LabelFrame(right_col, text="Instrumentation",
+                                  padx=10, pady=10)
+        log_group.pack(side=tk.TOP, padx=10, pady=(8, 0), fill=tk.BOTH,
+                       expand=True)
+
+        # The scrollbar is packed first on purpose. Packed after an expanding
+        # Text it is last in line for space, and under any width pressure it
+        # collapsed to about a pixel.
+        log_scroll = tk.Scrollbar(log_group)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 50 rather than 80 columns: the charts above need the width, and
+        # wrap="word" means nothing here depended on 80. The height is set so
+        # charts plus log come to about what the notebook beside them already
+        # asks for, which is what actually sets the window height.
         self.log_text = tk.Text(
             log_group,
-            width=80,
-            height=32,
+            width=50,
+            height=24,
             wrap="word"
         )
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        log_scroll = tk.Scrollbar(log_group, command=self.log_text.yview)
-        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        log_scroll.config(command=self.log_text.yview)
         self.log_text.config(yscrollcommand=log_scroll.set)
+
+        self.refresh_setup_gate()
 
         self._drain_gui_queue()
         self.update_labels()
@@ -1686,6 +1763,9 @@ class FourSliderGUI:
     def start_sweep_to_csv(self):
         if self.sweep_thread is not None and self.sweep_thread.is_alive():
             print("Sweep already running")
+            return
+
+        if not self.require_setup("a sweep"):
             return
 
         self.stop_both_calibration()
@@ -2105,6 +2185,9 @@ class FourSliderGUI:
     def start_measure(self):
         if self.measure_active:
             print("A measurement is already running")
+            return
+
+        if not self.require_setup("a measurement"):
             return
 
         if self.left_cal_active or self.right_cal_active or self.sweep_active:
@@ -2927,7 +3010,9 @@ class FourSliderGUI:
         if self._closing:
             return
 
-        self.rr_run_btn.config(state="normal")
+        # Back through the gate: the run's owner is done with the button, but
+        # a connect during the run may have closed the gate behind it.
+        self.refresh_setup_gate()
         self.rr_stop_btn.config(state="disabled")
 
         rows = self.summarise_range_rate() if settings["range_rate"] else []
@@ -3101,6 +3186,280 @@ class FourSliderGUI:
         return entry
     # def
 
+    # ---- Calibration flow charts --------------------------------------------
+
+    # Canvas geometry. Fixed, because fixed is the point: a chart laid out with
+    # widgets would re-request its width every time a node's note changed from
+    # "attempt 3 of 10" to "1902 us  +34.92 deg", and with this column in an
+    # expanding pack chain the whole notebook would shift while a run was in
+    # flight. Coordinates cannot do that.
+    CAL_CANVAS_W = 300
+    CAL_HEADER_H = 22
+    CAL_NODE_H = 30
+    CAL_ROW_GAP = 9
+    CAL_PAD = 8
+    CAL_FORK_GAP = 8
+
+    def _cal_node_box(self, row, column):
+        """(x1, y1, x2, y2) for a node, from its row and which column it is in."""
+        y1 = self.CAL_HEADER_H + row * (self.CAL_NODE_H + self.CAL_ROW_GAP)
+        y2 = y1 + self.CAL_NODE_H
+
+        left = self.CAL_PAD
+        right = self.CAL_CANVAS_W - self.CAL_PAD
+
+        if column == "full":
+            return left, y1, right, y2
+
+        half = (right - left - self.CAL_FORK_GAP) // 2
+        if column == "left":
+            return left, y1, left + half, y2
+        return right - half, y1, right, y2
+    # def
+
+    def build_calibration_flow(self, parent):
+        """One flow chart per side, drawn rather than typed.
+
+        A Canvas and not a grid of labels: the two ends fork, and a fork is not
+        something stacked text can draw. Drawing it also means the state marks
+        are strokes rather than characters, so nothing depends on the running
+        font having a tick in it.
+        """
+        group = tk.LabelFrame(parent, text="Calibration", padx=8, pady=6)
+        group.pack(side=tk.TOP, padx=10, fill=tk.X)
+
+        rows = max(row for _k, _l, row, _c in cal_flow.NODES) + 1
+        height = (self.CAL_HEADER_H
+                  + rows * self.CAL_NODE_H
+                  + (rows - 1) * self.CAL_ROW_GAP
+                  + 4)
+
+        # Made once and kept. A tkfont.Font is a named Tcl object whose
+        # __del__ calls back into Tcl to delete it, so building them per
+        # redraw leaves a stream of them for the garbage collector - and the
+        # collector runs on whichever thread happens to allocate. A calibration
+        # worker collecting one aborts the interpreter, which is how a suite
+        # that passes file by file dies when run whole.
+        self.cal_label_font = tkfont.Font(font=("TkDefaultFont", 9))
+        self.cal_note_font = tkfont.Font(font=("TkDefaultFont", 8))
+        self.cal_header_font = tkfont.Font(font=("TkDefaultFont", 9, "bold"))
+
+        self.cal_canvas = {}
+        self.cal_detail = {}
+
+        for side in ("LEFT", "RIGHT"):
+            column = tk.Frame(group)
+            column.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+            canvas = tk.Canvas(column, width=self.CAL_CANVAS_W, height=height,
+                               bg=PALETTE["panel"], highlightthickness=1,
+                               highlightbackground=PALETTE["rule"])
+            canvas.pack(side=tk.TOP)
+            self.cal_canvas[side] = canvas
+
+            # Fixed height and wraplength, so a failure arriving mid-run cannot
+            # resize the panel and shove the log about underneath it.
+            holder = tk.Frame(column, height=104)
+            holder.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+            holder.pack_propagate(False)
+
+            detail = tk.Label(holder, text="", justify="left", anchor="nw",
+                              wraplength=self.CAL_CANVAS_W - 8,
+                              fg=PALETTE["ink_muted"], font=("TkDefaultFont", 8))
+            detail.pack(fill=tk.BOTH, expand=True)
+            self.cal_detail[side] = detail
+
+            self.draw_calibration_flow(
+                side, self.cal_flow[side].snapshot(time.monotonic()))
+    # def
+
+    def _cal_mark(self, canvas, state, x, y):
+        """The state's mark, drawn at (x, y). Strokes, never glyphs."""
+        if state == cal_flow.DONE:
+            canvas.create_line(x - 5, y, x - 2, y + 4, x + 5, y - 5,
+                               fill=PALETTE["ok"], width=2)
+        elif state == cal_flow.FAILED:
+            canvas.create_line(x - 4, y - 4, x + 4, y + 4,
+                               fill=PALETTE["bad"], width=2)
+            canvas.create_line(x + 4, y - 4, x - 4, y + 4,
+                               fill=PALETTE["bad"], width=2)
+        elif state == cal_flow.WARNED:
+            canvas.create_line(x, y - 5, x, y + 1, fill=PALETTE["warn"], width=2)
+            canvas.create_line(x, y + 4, x, y + 5, fill=PALETTE["warn"], width=2)
+        elif state == cal_flow.RUNNING:
+            canvas.create_arc(x - 5, y - 5, x + 5, y + 5, start=90, extent=-270,
+                              style="pieslice", fill=PALETTE["accent"],
+                              outline=PALETTE["accent"])
+    # def
+
+    def draw_calibration_flow(self, side, snapshot):
+        """Repaint one side's chart from a snapshot. GUI thread only.
+
+        Redrawn whole rather than patched, the way redraw_range_rate_trace
+        already works - there is nothing here expensive enough to be worth
+        tracking item ids for.
+        """
+        if self._closing:
+            return
+
+        canvas = self.cal_canvas.get(side)
+        if canvas is None:
+            return
+
+        verdict, elapsed, rows, failure = snapshot
+        canvas.delete("all")
+
+        label_font = self.cal_label_font
+        note_font = self.cal_note_font
+
+        states = {key: state for key, _l, _r, _c, state, _n in rows}
+        boxes = {key: self._cal_node_box(row, column)
+                 for key, _l, row, column, _s, _n in rows}
+
+        canvas.create_text(self.CAL_PAD, self.CAL_HEADER_H // 2 + 1,
+                           text=side.lower(), anchor="w",
+                           fill=PALETTE["ink"], font=self.cal_header_font)
+        canvas.create_text(self.CAL_CANVAS_W - self.CAL_PAD,
+                           self.CAL_HEADER_H // 2 + 1,
+                           text=cal_flow.header_text(verdict, elapsed),
+                           anchor="e", fill=PALETTE["ink_faint"],
+                           font=self.cal_note_font)
+
+        # Edges first, so the nodes sit on top of where they meet.
+        for source, target in cal_flow.EDGES:
+            sx1, _sy1, sx2, sy2 = boxes[source]
+            tx1, ty1, tx2, _ty2 = boxes[target]
+            colour = (PALETTE["ok"] if states[source] == cal_flow.DONE
+                      else PALETTE["rule"])
+            dash = (3, 3) if states[target] == cal_flow.SKIPPED else ()
+            mid_y = (sy2 + ty1) // 2
+            sx = (sx1 + sx2) // 2
+            tx = (tx1 + tx2) // 2
+            canvas.create_line(sx, sy2, sx, mid_y, tx, mid_y, tx, ty1,
+                               fill=colour, dash=dash, width=1)
+
+        for key, label, _row, _column, state, note in rows:
+            x1, y1, x2, y2 = boxes[key]
+            outline, fill, text_key, width = cal_flow.STYLE[state]
+            dash = (3, 3) if state == cal_flow.SKIPPED else ()
+
+            canvas.create_rectangle(x1, y1, x2, y2, outline=PALETTE[outline],
+                                    fill=PALETTE[fill], width=width, dash=dash)
+            # Every string is cut to the node it is drawn in. The notes are
+            # the variable ones - "attempt 3 of 10" becomes "1902 us  +34.92
+            # deg" becomes a failure - and an uncut one runs over its own
+            # border and through the state mark.
+            room = (x2 - 12) - (x1 + 7)
+            canvas.create_text(x1 + 7, y1 + 10,
+                               text=cal_flow.fit(label, label_font.measure, room),
+                               anchor="w", fill=PALETTE[text_key],
+                               font=label_font)
+            if note:
+                canvas.create_text(x1 + 7, y1 + 22,
+                                   text=cal_flow.fit(note, note_font.measure, room),
+                                   anchor="w", fill=PALETTE["ink_faint"],
+                                   font=note_font)
+            self._cal_mark(canvas, state, x2 - 10, (y1 + y2) // 2)
+
+        detail = self.cal_detail.get(side)
+        if detail is not None:
+            if failure is None:
+                detail.config(text="", fg=PALETTE["ink_muted"])
+            else:
+                # The headline is already drawn in the node that failed, so
+                # the box gives the node its full name and then the detail,
+                # rather than saying the same sentence twice.
+                node_label, _headline, text, _reason = failure
+                detail.config(text="%s\n%s" % (node_label, text),
+                              fg=PALETTE["bad"])
+    # def
+
+    def _cal_publish(self, side):
+        """Snapshot on this thread, draw on the Tk one. Safe from any thread.
+
+        The snapshot is taken here, on the worker, and the callback only draws
+        it. Handing the model across instead would let the Tk thread iterate
+        state the worker is still writing; _drain_gui_queue swallows the
+        RuntimeError that produces, and the chart would freeze with no sign of
+        why - the exact thing a chart is meant to prevent.
+        """
+        snapshot = self.cal_flow[side].snapshot(time.monotonic())
+        self.post_to_gui(lambda: self.draw_calibration_flow(side, snapshot))
+    # def
+
+    def _cal_start_step(self, side, key, note=""):
+        self.cal_flow[side].start(key, note)
+        self._cal_publish(side)
+    # def
+
+    def _cal_note(self, side, key, note):
+        self.cal_flow[side].note(key, note)
+        self._cal_publish(side)
+    # def
+
+    def _cal_done_step(self, side, key, note=""):
+        self.cal_flow[side].finish(key, note)
+        self._cal_publish(side)
+    # def
+
+    def _cal_warn_step(self, side, key, note=""):
+        self.cal_flow[side].warn(key, note)
+        self._cal_publish(side)
+    # def
+
+    def _cal_fail(self, side, key, reason, **fields):
+        """Record why this side stopped, and skip whatever it never reached.
+
+        Called beside the print that already reports the fault, never instead
+        of it: the log is the detailed record and several tests read it. This
+        is the summary the chart draws.
+        """
+        self.cal_flow[side].fail(key, reason, time.monotonic(), **fields)
+        self._cal_publish(side)
+    # def
+
+    def _cal_stopped(self, side):
+        self.cal_flow[side].stop(time.monotonic())
+        self._cal_publish(side)
+    # def
+
+    def _cal_failed_already(self, side):
+        return self.cal_flow[side].verdict == cal_flow.FAILED
+    # def
+
+    def _cal_verify_step(self, side, key, targets, reached):
+        """Report a verify pass as the two angles it measured.
+
+        Amber when an end is outside tolerance, but never a failure: a verify
+        that disagrees is telling you something, not grounds for throwing the
+        calibration away.
+        """
+        note = cal_flow.reached_note(targets, reached)
+        worst = cal_flow.worst_error(targets, reached)
+
+        if worst is None or worst > ENDPOINT_TOLERANCE_DEG:
+            self._cal_warn_step(side, key, note)
+        else:
+            self._cal_done_step(side, key, note)
+    # def
+
+    def _cal_fail_running(self, side, message):
+        """Blame whatever node was live. For faults with no site of their own.
+
+        An unexpected exception can surface anywhere, so there is no fixed node
+        to attach it to - but leaving it unattached would leave that node
+        spinning, which is the one thing a chart must never do.
+        """
+        flow = self.cal_flow[side]
+        if flow.verdict == cal_flow.FAILED:
+            return
+
+        running = [key for key in cal_flow.NODE_KEYS
+                   if flow.states[key] == cal_flow.RUNNING]
+        key = running[-1] if running else cal_flow.NODE_KEYS[0]
+        self._cal_fail(side, key, "unexpected", error=message)
+    # def
+
     def build_connection_panel(self, parent):
         """Link state, laid out horizontally so it can live above the notebook.
 
@@ -3162,6 +3521,36 @@ class FourSliderGUI:
             command=self.connect_mavlink
         )
         self.connect_btn.pack(side=tk.LEFT, padx=(6, 0))
+    # def
+
+    def build_setup_panel(self, parent):
+        """What this drone still needs before it may be driven.
+
+        Beside Connection rather than in the Trim tab: the gate stops the Run
+        button on the Measure tab too, and a disabled button with no stated
+        reason is the thing this panel exists to prevent.
+        """
+        group = tk.LabelFrame(parent, text="Setup", padx=6, pady=4)
+        group.pack(fill=tk.X, pady=(6, 0))
+
+        # "Not ready" is the wider of the two - fixed, so the items beside it
+        # do not shuffle sideways when the last one is ticked.
+        self.setup_state_label = tk.Label(
+            group, text="Not ready", anchor="w", width=9, fg=PALETTE["bad"])
+        self.setup_state_label.pack(side=tk.LEFT, padx=(0, 14))
+
+        # Same reasoning per item: the width is the ticked text, so flipping
+        # the marker cannot move its neighbours.
+        width = max(len("[x] %s" % text) for _key, text in SETUP_ITEMS)
+
+        self.setup_item_labels = {}
+
+        for key, text in SETUP_ITEMS:
+            label = tk.Label(
+                group, text="[ ] %s" % text, anchor="w", width=width,
+                fg=PALETTE["bad"])
+            label.pack(side=tk.LEFT, padx=(0, 10))
+            self.setup_item_labels[key] = label
     # def
 
     def update_pico_rate_label(self):
@@ -3301,7 +3690,7 @@ class FourSliderGUI:
                     # Remember the port before the long param refresh, so a
                     # mid-refresh failure doesn't lose a known-good port.
                     self.position_reader.set_remembered_ports(drone_port=drone_device)
-                    self.refresh_params_from_drone(clear_name=True)
+                    self.refresh_params_from_drone(reset_setup=True)
                 elif self.drone_interface.last_error_kind == "open":
                     drone_text = "cannot open %s" % drone_device
                 else:
@@ -3412,7 +3801,7 @@ class FourSliderGUI:
         return value
     # def
 
-    def refresh_params_from_drone(self, clear_name=False):
+    def refresh_params_from_drone(self, reset_setup=False):
         """Read UID and the six elevon params from the FCU and populate the UI.
 
         Safe to call from a worker thread: every widget write is marshalled
@@ -3427,10 +3816,11 @@ class FourSliderGUI:
             self.set_var_on_gui_thread(self.uid_var, "--" if ident is None else str(ident))
             print("PX4 UID = %s" % str(ident))
 
-            if clear_name:
-                self.set_var_on_gui_thread(self.drone_name_var, "")
-                self.position_reader.drone_name = ""
-                print("Drone name cleared after connect")
+            if reset_setup:
+                # Drop the stale centring off-thread, then let the Tk thread
+                # clear the name field and re-arm the gate.
+                self.position_reader.clear_center()
+                self.post_to_gui(self.reset_setup_state)
 
             left_min_param = self.drone_interface.get_param(self.LEFT_MIN_PARAM, int)
             left_max_param = self.drone_interface.get_param(self.LEFT_MAX_PARAM, int)
@@ -3473,7 +3863,91 @@ class FourSliderGUI:
         self.centre_right()
     # def
 
+    def reset_setup_state(self):
+        """Forget this session's name and zeros. GUI thread only."""
+        self.name_is_set = False
+        self.left_zeroed = False
+        self.right_zeroed = False
+        self.drone_name_var.set("")
+        self.position_reader.drone_name = ""
+        self.refresh_setup_gate()
+        print("Drone name cleared and angles unzeroed after connect")
+    # def
+
+    def setup_done(self):
+        """Which SETUP_ITEMS are satisfied, by key."""
+        return {
+            "name": self.name_is_set,
+            "left": self.left_zeroed,
+            "right": self.right_zeroed,
+        }
+    # def
+
+    def setup_blockers(self):
+        """What still has to happen before this drone may be driven."""
+        done = self.setup_done()
+        return [text for key, text in SETUP_ITEMS if not done[key]]
+    # def
+
+    def is_setup_complete(self):
+        return not self.setup_blockers()
+    # def
+
+    def refresh_setup_gate(self):
+        """Enable or disable everything behind the setup gate. GUI thread only."""
+        state = "normal" if self.is_setup_complete() else "disabled"
+
+        for btn in (self.auto_both_btn, self.left_cal_btn,
+                    self.right_cal_btn, self.sweep_btn):
+            btn.config(state=state)
+
+        # A side already calibrating stays shut whatever the gate says. This
+        # method re-enables everything unconditionally and is called from
+        # apply_drone_name and reset_setup_state, either of which can fire in
+        # the middle of a run - so the starter cannot own the button state, the
+        # same reason rr_run_btn is exempted below.
+        if self.is_calibration_active("LEFT"):
+            self.left_cal_btn.config(state="disabled")
+        if self.is_calibration_active("RIGHT"):
+            self.right_cal_btn.config(state="disabled")
+        if self.is_calibration_active("LEFT") or self.is_calibration_active("RIGHT"):
+            self.auto_both_btn.config(state="disabled")
+
+        # The measurement button has an owner while a run is in flight; leave
+        # its state to start_measure/_measure_worker rather than fighting them.
+        if not self.measure_active:
+            self.rr_run_btn.config(state=state)
+
+        done = self.setup_done()
+
+        for key, text in SETUP_ITEMS:
+            self.setup_item_labels[key].config(
+                text="%s %s" % ("[x]" if done[key] else "[ ]", text),
+                fg=PALETTE["ok"] if done[key] else PALETTE["bad"])
+
+        ready = all(done.values())
+        self.setup_state_label.config(
+            text="Ready" if ready else "Not ready",
+            fg=PALETTE["ok"] if ready else PALETTE["bad"])
+    # def
+
+    def require_setup(self, what):
+        """True if `what` may run; otherwise warn and return False."""
+        missing = self.setup_blockers()
+        if not missing:
+            return True
+
+        messagebox.showwarning(
+            "Drone not set up",
+            "Before running %s:\n\n  - %s" % (what, "\n  - ".join(missing)))
+        print("%s blocked - %s" % (what, ", ".join(missing)))
+        return False
+    # def
+
     def start_both_calibration(self):
+        if not self.require_setup("automatic calibration"):
+            return
+
         print("Starting automatic calibration on both sides...")
         self.zero_both_sliders()
         self._start_left_calibration_worker()
@@ -3490,6 +3964,11 @@ class FourSliderGUI:
         try:
             name = self.drone_name_var.get().strip()
             self.position_reader.drone_name = str(name)
+            # A blank name does not count as set: it is the state the connect
+            # reset leaves behind, and every named export would fall back to
+            # "drone" and overwrite the last one.
+            self.name_is_set = name != ""
+            self.refresh_setup_gate()
             print("drone_name = %s" % name)
         except Exception as e:
             print("Invalid drone name: %s" % str(e))
@@ -3885,12 +4364,15 @@ class FourSliderGUI:
 
     def centre_left(self):
         print("Centering LEFT...")
-        self.position_reader.set_center("LEFT")
+        # Only a centring that had data to work with clears the gate.
+        self.left_zeroed = bool(self.position_reader.set_center("LEFT"))
+        self.refresh_setup_gate()
     # def
 
     def centre_right(self):
         print("Centering RIGHT...")
-        self.position_reader.set_center("RIGHT")
+        self.right_zeroed = bool(self.position_reader.set_center("RIGHT"))
+        self.refresh_setup_gate()
     # def
 
     def get_side_angle(self, side):
@@ -4001,12 +4483,15 @@ class FourSliderGUI:
         result = self.drone_interface.command_elevon(output_function, 0.0, wait_ack=True)
 
         if self.actuator_test_rejected(side, result):
+            self._cal_fail(side, "sweep", "actuator_refused",
+                           refusal=self.drone_interface.describe_mav_result(result))
             return None
 
         time.sleep(1.0)
 
         cmd = 0.0
         ticks = 0
+        last_angle = None
         deadline = time.time() + 60.0
 
         while time.time() < deadline:
@@ -4018,8 +4503,11 @@ class FourSliderGUI:
             angle_deg = self.get_side_angle(side)
 
             if angle_deg is None:
+                last_angle = None
                 time.sleep(0.25)
                 continue
+
+            last_angle = angle_deg
 
             print("%s calibration move: cmd=%.3f angle_deg=%.2f deg target=%.2f deg" %
                   (side, cmd, angle_deg, target_angle_deg))
@@ -4052,15 +4540,25 @@ class FourSliderGUI:
                 output_function, cmd, wait_ack=check_ack, ack_timeout=0.3)
 
             if check_ack and self.actuator_test_rejected(side, result):
+                self._cal_fail(side, "sweep", "actuator_refused",
+                               refusal=self.drone_interface.describe_mav_result(result))
                 return None
 
             if (inc_angle_deg < 0.0 and cmd <= -1.0) or (inc_angle_deg > 0.0 and cmd >= 1.0):
                 print("%s calibration move: hit command limit before reaching target" % side)
+                self._cal_fail(side, "sweep", "command_exhausted",
+                               target=target_angle_deg, command=cmd,
+                               angle=angle_deg)
                 return None
 
             time.sleep(0.25)
 
         print("%s calibration move: timed out before reaching target" % side)
+        if last_angle is None:
+            self._cal_fail(side, "sweep", "no_angle")
+        else:
+            self._cal_fail(side, "sweep", "creep_timeout",
+                           target=target_angle_deg, angle=last_angle)
         return None
     # def
 
@@ -4169,16 +4667,23 @@ class FourSliderGUI:
         it is jammed and the value written there means nothing - and what the
         local deg/us gain is, which is what the correction needs. Taking the
         gain from the probe rather than assuming it means the sign falls out of
-        the measurement, so nothing has to know the linkage direction.
+        the measurement, so nothing has to know which way the servo is wired.
+
+        Every step is a full dwell, so a probe that runs to the ceiling costs
+        twenty of them - about sixteen seconds. That is why it reports each
+        step to the chart rather than only its result: sixteen seconds of a
+        node sitting still is indistinguishable from a hung run.
         """
         pwm_min, pwm_max = span
         backed = 0.0
+        node = cal_flow.node_for(which, "travel")
 
         while backed < BACKOFF_CEILING_US:
             if not self.is_calibration_active(side):
                 return None, None
 
             backed += BACKOFF_STEP_US
+            self._cal_note(side, node, "backed off %.0f us" % backed)
             delta = command_delta_for_pwm(inward_sign(which) * backed,
                                           pwm_min, pwm_max, rev)
             command = self.clamp(cmd_endpoint + delta, -1.0, 1.0)
@@ -4186,6 +4691,12 @@ class FourSliderGUI:
             angle = self._cal_measure(side, output_function, command)
             if angle is None:
                 print("%s calibration: no angle while probing %s" % (side, which))
+                # Distinguished from the ceiling case below, which returns the
+                # same pair. A surface the reader lost sight of has said
+                # nothing about whether it can move, and blaming stiction for
+                # what is a sensor or link fault sends the operator to the
+                # wrong end of the rig.
+                self._cal_fail(side, node, "no_angle_at_stop", which=which.title())
                 return None, None
 
             if abs(angle - angle_at_endpoint) >= MOVEMENT_THRESHOLD_DEG:
@@ -4215,6 +4726,8 @@ class FourSliderGUI:
         angle = self._cal_approach(side, output_function, which, rev)
         if angle is None:
             print("%s calibration: no angle at the %s end stop" % (side, which))
+            self._cal_fail(side, cal_flow.node_for(which, "find"),
+                           "no_angle_at_stop", which=which.title())
             return None
 
         # Past target: it has travel to spare, so there is nothing a stop check
@@ -4224,13 +4737,19 @@ class FourSliderGUI:
         if overshot_target(angle, target_deg, other_deg):
             gain = nominal
             shift = limit_correction(correction_us(angle, target_deg, gain))
+            # stop_kind stays free even though breakaway_us is None: this
+            # branch never probed. Reading "no breakaway" off the None here is
+            # how a healthy endpoint several corrections from target would get
+            # blamed for stiction.
             result = {"which": which, "angle_deg": angle,
                       "target_deg": target_deg, "hard_stop": False,
+                      "stop_kind": STOP_FREE,
                       "breakaway_us": None, "probed": False, "gain": gain,
                       "new_pwm": None, "accepted": False}
 
             if shift is None:
                 print("%s calibration: %s has no usable span" % (side, which))
+                self._cal_fail(side, cal_flow.node_for(which, "find"), "no_gain")
                 return result
 
             result["new_pwm"] = bounded(pwm_now + shift)
@@ -4245,7 +4764,8 @@ class FourSliderGUI:
         if not self.is_calibration_active(side):
             return None
 
-        is_hard_stop, pull_in = hard_stop_verdict(breakaway)
+        stop_kind, pull_in = stop_verdict(breakaway)
+        is_hard_stop = stop_kind != STOP_FREE
         probed = (None if breakaway is None
                   else angle_gain_per_us(angle, angle_backed, breakaway, which))
         gain, gain_source = usable_gain(probed, nominal)
@@ -4255,13 +4775,18 @@ class FourSliderGUI:
                   % (side, which, probed, nominal))
 
         result = {"which": which, "angle_deg": angle, "target_deg": target_deg,
-                  "hard_stop": is_hard_stop, "breakaway_us": breakaway,
+                  "hard_stop": is_hard_stop, "stop_kind": stop_kind,
+                  "breakaway_us": breakaway,
                   "probed": True, "gain": gain, "new_pwm": None,
                   "accepted": endpoint_accepted(angle, target_deg, is_hard_stop)}
+
+        travel_node = cal_flow.node_for(which, "travel")
 
         if result["accepted"]:
             print("%s calibration: %s at %+.2f deg (target %+.2f) - set"
                   % (side, which, angle, target_deg))
+            self._cal_done_step(side, travel_node,
+                                "broke away at %.0f us" % breakaway)
             return result
 
         if is_hard_stop:
@@ -4271,11 +4796,21 @@ class FourSliderGUI:
                   % (side, which,
                      "no amount" if breakaway is None else "%.0f us" % breakaway,
                      pull_in))
+            if stop_kind == STOP_UNCONFIRMED:
+                self._cal_warn_step(side, travel_node,
+                                    "unconfirmed - pulled in %.0f us" % pull_in)
+            else:
+                self._cal_warn_step(side, travel_node,
+                                    "against a stop at %.0f us" % breakaway)
             return result
+
+        self._cal_done_step(side, travel_node,
+                            "broke away at %.0f us" % breakaway)
 
         shift = limit_correction(correction_us(angle, target_deg, gain))
         if shift is None:
             print("%s calibration: %s gave no usable gain" % (side, which))
+            self._cal_fail(side, cal_flow.node_for(which, "find"), "no_gain")
             return result
 
         result["new_pwm"] = bounded(pwm_now + shift)
@@ -4301,8 +4836,14 @@ class FourSliderGUI:
         accepted = {"MAX": False, "MIN": False}
         last_error = {"MAX": None, "MIN": None}
         growths = {"MAX": 0, "MIN": 0}
+        unconfirmed = {"MAX": 0, "MIN": 0}
+        best_error = {"MAX": None, "MIN": None}
 
         self._cal_measure(side, output_function, endpoint_command("MIN", rev))
+
+        for which in ("MAX", "MIN"):
+            self._cal_start_step(side, cal_flow.node_for(which, "find"),
+                                 "waiting to start")
 
         for which in alternating_order(MAX_ATTEMPTS):
             if accepted["MAX"] and accepted["MIN"]:
@@ -4312,11 +4853,23 @@ class FourSliderGUI:
             if not self.is_calibration_active(side):
                 return None
 
+            find_node = cal_flow.node_for(which, "find")
+            travel_node = cal_flow.node_for(which, "travel")
+
             attempts[which] += 1
             if attempts[which] > MAX_ATTEMPTS:
                 print("%s calibration: %s did not settle in %d attempts"
                       % (side, which, MAX_ATTEMPTS))
+                self._cal_fail(side, find_node, "no_settle",
+                               attempts=MAX_ATTEMPTS, which=which.title(),
+                               error=abs(best_error[which] or 0.0),
+                               tolerance=ENDPOINT_TOLERANCE_DEG)
                 return None
+
+            self._cal_start_step(side, find_node,
+                                 "attempt %d of %d" % (attempts[which],
+                                                       MAX_ATTEMPTS))
+            self._cal_start_step(side, travel_node, "approaching")
 
             span = (pwm["MIN"], pwm["MAX"])
             result = self._cal_evaluate_endpoint(
@@ -4324,13 +4877,39 @@ class FourSliderGUI:
                 anchors[which])
 
             if result is None:
+                # Either a stop, or a failure the evaluation already named.
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
                 return None
 
             if result["accepted"]:
                 accepted[which] = True
                 last_error[which] = 0.0
+                best_error[which] = 0.0
                 growths[which] = 0
+                self._cal_done_step(
+                    side, find_node,
+                    "%d us  %+.2f deg" % (pwm[which], result["angle_deg"]))
                 continue
+
+            # Two probes in a row that could not confirm the surface moved,
+            # the second taken after the endpoint has already been pulled in
+            # by the full ceiling. A pinned end stop would have come free over
+            # that distance; a surface that still will not move is held by
+            # friction, and pulling the end stop in again would only throw
+            # away another 210 us of travel to hide it.
+            if result.get("stop_kind") == STOP_UNCONFIRMED:
+                unconfirmed[which] += 1
+                if unconfirmed[which] >= UNCONFIRMED_ATTEMPTS:
+                    print("%s calibration: %s could not be confirmed off its "
+                          "stop %d times running - stiction, not a stop"
+                          % (side, which, unconfirmed[which]))
+                    self._cal_fail(side, travel_node, "free_travel_unconfirmed",
+                                   ceiling=BACKOFF_CEILING_US,
+                                   threshold=MOVEMENT_THRESHOLD_DEG)
+                    return None
+            else:
+                unconfirmed[which] = 0
 
             # A correction that leaves the end stop further out than it found it
             # is the correction going the wrong way, and it does not get better
@@ -4342,29 +4921,48 @@ class FourSliderGUI:
             growths[which] = (growths[which] + 1
                               if error_grew(previous, error) else 0)
             last_error[which] = error
+            if best_error[which] is None or abs(error) < abs(best_error[which]):
+                best_error[which] = error
 
             if has_diverged(growths[which]):
                 print("%s calibration: %s is diverging - %+.2f deg out after "
                       "%+.2f deg on the previous attempt. Stopping with the end "
                       "stops where they are." % (side, which, error, previous))
+                self._cal_fail(side, find_node, "diverging",
+                               error=error, previous=previous)
                 return None
 
             if result["new_pwm"] is None:
+                if not self._cal_failed_already(side):
+                    self._cal_fail(side, find_node, "no_gain")
                 return None
 
             if result["new_pwm"] == pwm[which]:
                 print("%s calibration: %s is against its limit at %d us and "
                       "still %+.2f deg out" % (side, which, pwm[which], error))
+                self._cal_fail(side, find_node, "at_limit", which=which.title(),
+                               pwm=pwm[which], error=error,
+                               target=result["target_deg"])
                 return None
 
             pwm[which] = result["new_pwm"]
+            self._cal_note(side, find_node,
+                           "attempt %d - moving to %d us"
+                           % (attempts[which], pwm[which]))
             param = max_param if which == "MAX" else min_param
             if not self._cal_write_param(side, output_function, param, int,
                                          pwm[which], endpoint_command(which, rev)):
+                self._cal_fail(side, find_node, "param_write",
+                               param=param, value=str(pwm[which]))
                 return None
 
         if not (accepted["MAX"] and accepted["MIN"]):
             print("%s calibration: ran out of attempts" % side)
+            which = "MAX" if not accepted["MAX"] else "MIN"
+            self._cal_fail(side, cal_flow.node_for(which, "find"), "no_settle",
+                           attempts=MAX_ATTEMPTS, which=which.title(),
+                           error=abs(best_error[which] or 0.0),
+                           tolerance=ENDPOINT_TOLERANCE_DEG)
             return None
 
         return pwm
@@ -4449,6 +5047,8 @@ class FourSliderGUI:
                 print("%s trim: diverging - %+.2f deg out after %+.2f deg on "
                       "the previous attempt. Stopping."
                       % (side, error, previous_error))
+                self._cal_fail(side, "trim", "trim_diverging",
+                               error=error, previous=previous_error)
                 return None
 
             gain = trim_gain_deg(previous_cmd, previous_angle, cmd_trim, angle,
@@ -4457,6 +5057,7 @@ class FourSliderGUI:
 
             if delta is None:
                 print("%s trim: no usable gain" % side)
+                self._cal_fail(side, "trim", "no_gain")
                 return None
 
             new_cmd = clamp_trim(cmd_trim + delta)
@@ -4464,12 +5065,17 @@ class FourSliderGUI:
             if abs(new_cmd - cmd_trim) < 1e-6:
                 print("%s trim: pinned at cmd %+.3f and still %+.2f deg out"
                       % (side, cmd_trim, error))
+                self._cal_fail(side, "trim", "trim_pinned",
+                               command=cmd_trim, error=error)
                 return None
 
             previous_cmd, previous_angle = cmd_trim, angle
             cmd_trim = new_cmd
 
         print("%s trim: did not settle in %d attempts" % (side, TRIM_ATTEMPTS))
+        self._cal_fail(side, "trim", "trim_no_settle", attempts=TRIM_ATTEMPTS,
+                       error=abs(last_error if last_error is not None else 0.0),
+                       tolerance=TRIM_TOLERANCE_DEG)
         return None
     # def
 
@@ -4537,7 +5143,7 @@ class FourSliderGUI:
         labels which pass this is.
         """
         print("%s calibration: verifying%s" % (side, note))
-        worst = 0.0
+        reached = {}
 
         for which in ("MAX", "MIN"):
             if not self.is_calibration_active(side):
@@ -4547,14 +5153,16 @@ class FourSliderGUI:
                 print("%s verify: no angle at %s" % (side, which))
                 return None
 
+            reached[which] = angle
             error = angle - targets[which]
-            worst = max(worst, abs(error))
             print("%s verify: %s pwm %d reached %+.2f deg, target %+.2f, "
                   "error %+.2f%s"
                   % (side, which, pwm[which], angle, targets[which], error,
                      "" if abs(error) <= ENDPOINT_TOLERANCE_DEG else "  OUT"))
 
-        return worst
+        # The angles themselves, not a single worst-case error: what the
+        # operator wants off this step is what the end stops now reach.
+        return reached
     # def
 
     def _calibration_worker(self, side):
@@ -4571,6 +5179,10 @@ class FourSliderGUI:
         stops are repeatable; see SERVO_SETTING.md.
         """
         self.set_calibration_active(side, True)
+        self.cal_flow[side].reset(time.monotonic())
+        self._cal_publish(side)
+        self.post_to_gui(self.refresh_setup_gate)
+
         output_function, min_param, max_param, trim_param = \
             self.side_calibration_params(side)
         rev = self.is_main_channel_reversed(5 if side == "LEFT" else 6)
@@ -4578,37 +5190,64 @@ class FourSliderGUI:
         try:
             print("%s automatic calibration started" % side)
 
-            if not self._cal_write_param(side, output_function, min_param, int,
-                                         COARSE_MIN, 0.0):
-                return
-            if not self._cal_write_param(side, output_function, max_param, int,
-                                         COARSE_MAX, 0.0):
-                return
-            if not self._cal_write_param(side, output_function, trim_param, float,
-                                         0.0, 0.0):
-                return
+            self._cal_start_step(side, "open_range", "opening to 900 / 2100 us")
+            for param, py_type, value in ((min_param, int, COARSE_MIN),
+                                          (max_param, int, COARSE_MAX),
+                                          (trim_param, float, 0.0)):
+                if not self._cal_write_param(side, output_function, param,
+                                             py_type, value, 0.0):
+                    self._cal_fail(side, "open_range", "param_write",
+                                   param=param, value=str(value))
+                    return
+            self._cal_done_step(side, "open_range", "900 / 2100 us")
 
             if not self.is_calibration_active(side):
                 print("%s automatic calibration stopped" % side)
+                self._cal_stopped(side)
                 return
 
+            self._cal_start_step(side, "sweep",
+                                 "finding %+.1f deg" % self.angle_neg_degs)
             cmd_neg = self.move_elevon_to_angle(side, output_function,
                                                 self.angle_neg_degs, -0.01)
             if not self.is_calibration_active(side) or cmd_neg is None:
                 print("%s automatic calibration stopped before negative endpoint completed" % side)
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
                 return
             pwm_neg = self.get_side_expected_pwm(side, cmd_neg)
 
+            self._cal_note(side, "sweep",
+                           "finding %+.1f deg" % self.angle_pos_degs)
             cmd_pos = self.move_elevon_to_angle(side, output_function,
                                                 self.angle_pos_degs, 0.01)
             if not self.is_calibration_active(side) or cmd_pos is None:
                 print("%s automatic calibration stopped before positive endpoint completed" % side)
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
                 return
             pwm_pos = self.get_side_expected_pwm(side, cmd_pos)
+            self._cal_done_step(side, "sweep",
+                                "%+.1f and %+.1f deg found"
+                                % (self.angle_neg_degs, self.angle_pos_degs))
 
+            # load_endpoint_params is borrowed unbound by the StubGUI in
+            # tests/test_calibration_endpoints.py, so it must not reach for
+            # anything on self that a stub would not have. Its reasons are
+            # recorded here instead, from what it returns.
+            self._cal_start_step(side, "load_coarse", "writing min and max")
+            if pwm_neg is None or pwm_pos is None:
+                self.load_endpoint_params(side, min_param, max_param,
+                                          pwm_neg, pwm_pos)
+                self._cal_fail(side, "load_coarse", "pwm_convert")
+                return
             if not self.load_endpoint_params(side, min_param, max_param,
                                              pwm_neg, pwm_pos):
+                self._cal_fail(side, "load_coarse", "endpoint_load")
                 return
+            self._cal_done_step(side, "load_coarse",
+                                "%d / %d us" % (min(pwm_neg, pwm_pos),
+                                                max(pwm_neg, pwm_pos)))
 
             # Which end carries which angle target comes from the measurement,
             # not from the reverse bit: on a reversed channel the negative angle
@@ -4627,44 +5266,92 @@ class FourSliderGUI:
                                              max_param, endpoints, rev)
             if pwm is None:
                 print("%s automatic calibration did not set the end stops" % side)
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
                 return
 
             print("%s end stops set: MIN=%d MAX=%d" % (side, pwm["MIN"], pwm["MAX"]))
-            self._cal_verify_endpoints(side, output_function, pwm, targets, rev)
+
+            self._cal_start_step(side, "verify", "re-measuring both ends")
+            reached = self._cal_verify_endpoints(side, output_function, pwm,
+                                                 targets, rev)
 
             if not self.is_calibration_active(side):
+                self._cal_stopped(side)
                 return
+
+            # Verify has never failed a run and does not start now: it reports
+            # what the ends actually reach, and being out is worth a look
+            # rather than a reason to throw the calibration away.
+            self._cal_verify_step(side, "verify", targets, reached)
 
             # The trim is found the same way the end stops are - driven to and
             # measured settled, from a named direction. The creep that used to
             # set it has the fault this whole procedure exists to fix, and the
             # trim inherited every degree of it.
+            self._cal_start_step(side, "trim", "approaching from cmd %+.1f"
+                                 % TRIM_APPROACH_CMD)
             found = self._cal_trim_point(side, output_function, targets, rev)
 
             if not self.is_calibration_active(side) or found is None:
                 print("%s automatic calibration stopped before trim completed" % side)
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
                 return
 
             cmd_trim, lash = found
             self.set_side_backlash(side, lash)
+            self._cal_done_step(side, "trim", "cmd %+.3f, lash %s"
+                                % (cmd_trim,
+                                   "--" if lash is None else "%+.2f deg" % lash))
 
             print("%s automatic calibration loading Trim[%.3f]" % (side, cmd_trim))
+            self._cal_start_step(side, "write_trim", "writing %s" % trim_param)
             if not self._cal_write_param(side, output_function, trim_param,
                                          float, cmd_trim, cmd_trim):
+                self._cal_fail(side, "write_trim", "param_write",
+                               param=trim_param, value="%+.3f" % cmd_trim)
                 return
+            self._cal_done_step(side, "write_trim", "%+.3f" % cmd_trim)
 
             # What the trim costs, then what the ends actually reach with it
             # applied. One of them is expected to read OUT by the shortfall
             # reported here - that is the price of the trim, printed before the
             # verify rather than left to be inferred from it.
             self._cal_report_trim_cost(side, cmd_trim, pwm, rev)
-            self._cal_verify_endpoints(side, output_function, pwm, targets, rev,
-                                       note=" with the trim applied")
+            self._cal_start_step(side, "verify_trim", "re-measuring both ends")
+            reached = self._cal_verify_endpoints(side, output_function, pwm,
+                                                 targets, rev,
+                                                 note=" with the trim applied")
+
+            # One end is expected to fall short here, by exactly the travel the
+            # trim spent - which is why this reports both angles rather than an
+            # error. "MAX +35.0->+28.4" says what the surface now reaches; a
+            # worst-case error would leave the reader to work that out.
+            self._cal_verify_step(side, "verify_trim", targets, reached)
 
             print("%s automatic calibration finished" % side)
+            self.cal_flow[side].complete(time.monotonic())
+            self._cal_publish(side)
+
+        except Exception as e:
+            # Without this the traceback goes to the real stderr, which the
+            # print shim does not capture, and the run simply stops being
+            # mentioned. That was survivable while the log was the only
+            # display; a node left spinning on the chart is not.
+            print("%s automatic calibration failed: %s" % (side, str(e)))
+            traceback.print_exc()
+            self._cal_fail_running(side, str(e))
         finally:
+            # Marked before the elevon command, which can raise once the window
+            # has closed and drone_interface is shut - an exception escaping
+            # the finally would replace the one being recorded.
             self.set_calibration_active(side, False)
-            self.drone_interface.command_elevon(output_function, 0.0)
+            self.post_to_gui(self.refresh_setup_gate)
+            try:
+                self.drone_interface.command_elevon(output_function, 0.0)
+            except Exception as e:
+                print("%s could not centre after calibration: %s" % (side, str(e)))
     # def
 
     def _left_calibration_worker(self):
@@ -4702,11 +5389,17 @@ class FourSliderGUI:
     # def
 
     def start_left_calibration(self):
+        if not self.require_setup("automatic calibration"):
+            return
+
         self.zero_side_slider("LEFT")
         self._start_left_calibration_worker()
     # def
 
     def start_right_calibration(self):
+        if not self.require_setup("automatic calibration"):
+            return
+
         self.zero_side_slider("RIGHT")
         self._start_right_calibration_worker()
     # def
