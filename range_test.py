@@ -43,6 +43,7 @@ all of that, being differences between two Pico-stamped samples.
 
 import argparse
 import csv
+import math
 import os
 import statistics
 import sys
@@ -198,6 +199,23 @@ def crossing_time(series, baseline, travel, fraction):
 # def
 
 
+def settled_angle(values):
+    """Where a trace ends up: the median of its last fifth, at least 5 samples.
+
+    Shared by the swing analysis and the creep measurement so the two are
+    estimated identically - their difference is the stiction number, and it
+    would be meaningless if each end of the subtraction were computed a
+    different way. Median, not mean, so one ADC outlier cannot define an
+    endpoint.
+    """
+    values = list(values)
+    if not values:
+        return None
+    tail = max(5, len(values) // 5)
+    return statistics.median(values[-tail:])
+# def
+
+
 def analyse_leg(series):
     """Travel and transit metrics for one hard-over, or a 'did not move' result."""
     pre = [a for t, a in series if t < 0.0]
@@ -210,8 +228,7 @@ def analyse_leg(series):
     baseline = statistics.median(pre) if len(pre) >= 3 else \
         statistics.median([a for _, a in post[:5]])
 
-    tail = max(5, len(post) // 5)
-    final = statistics.median([a for _, a in post[-tail:]])
+    final = settled_angle([a for _, a in post])
 
     travel = final - baseline
 
@@ -278,6 +295,228 @@ def endpoint_stats(legs):
 
     clusters.sort(key=lambda pair: pair[0])
     return (clusters[-1], clusters[0])
+# def
+
+
+def creep_commands(start, target, step):
+    """The command sequence a creep walks through, start exclusive, target last.
+
+    Mirrors the step logic the trim calibration uses - a fixed increment at a
+    fixed period - but walks to a *command* rather than to an angle, because the
+    end stop is where the command runs out, not where a target angle is crossed.
+    The final entry is always exactly the target: a creep that stopped one step
+    short would be measuring a different PWM than the swing it is compared with,
+    and the whole point is that the two arrive at the same place.
+    """
+    step = abs(float(step))
+    if step <= 0.0:
+        raise ValueError("creep step must be positive")
+
+    start = float(start)
+    target = float(target)
+    direction = 1.0 if target > start else -1.0
+
+    commands = []
+    value = start
+    while abs(target - value) > step:
+        value += direction * step
+        commands.append(round(value, 6))
+
+    commands.append(target)
+    return commands
+# def
+
+
+def fit_polynomial(xs, ys, order=2):
+    """Least squares polynomial fit, returned lowest power first.
+
+    Pure Python by necessity: numpy is not in requirements.txt and the README
+    commits to a stock Windows install, so a plot cannot be the thing that adds
+    a build dependency. For order 2-3 over a few dozen points the normal
+    equations are perfectly well conditioned once x is centred, and centring is
+    what stops PWM values near 1500 from squaring into a badly scaled matrix.
+
+    Returns None when there are fewer distinct x values than the fit needs -
+    a fit through 2 points at order 2 is not underdetermined, it is meaningless.
+    """
+    xs = [float(x) for x in xs]
+    ys = [float(y) for y in ys]
+
+    if len(xs) != len(ys) or len(set(xs)) <= order:
+        return None
+
+    centre = sum(xs) / len(xs)
+    shifted = [x - centre for x in xs]
+    size = order + 1
+
+    # Normal equations: (A^T A) c = A^T y, built from power sums.
+    powers = [sum(x ** p for x in shifted) for p in range(2 * order + 1)]
+    matrix = [[powers[row + col] for col in range(size)] for row in range(size)]
+    vector = [sum(y * (x ** row) for x, y in zip(shifted, ys))
+              for row in range(size)]
+
+    solution = _solve(matrix, vector)
+    if solution is None:
+        return None
+
+    return {"coeffs": solution, "centre": centre, "order": order}
+# def
+
+
+def _solve(matrix, vector):
+    """Gaussian elimination with partial pivoting. None if singular."""
+    size = len(vector)
+    rows = [list(matrix[i]) + [vector[i]] for i in range(size)]
+
+    for column in range(size):
+        pivot = max(range(column, size), key=lambda r: abs(rows[r][column]))
+        if abs(rows[pivot][column]) < 1e-12:
+            return None
+        rows[column], rows[pivot] = rows[pivot], rows[column]
+
+        for row in range(column + 1, size):
+            factor = rows[row][column] / rows[column][column]
+            for col in range(column, size + 1):
+                rows[row][col] -= factor * rows[column][col]
+
+    result = [0.0] * size
+    for row in range(size - 1, -1, -1):
+        total = rows[row][size] - sum(rows[row][c] * result[c]
+                                      for c in range(row + 1, size))
+        result[row] = total / rows[row][row]
+    return result
+# def
+
+
+def evaluate_polynomial(fit, x):
+    """The fitted value at x, or None when there was no fit."""
+    if not fit:
+        return None
+    shifted = float(x) - fit["centre"]
+    return sum(c * (shifted ** power) for power, c in enumerate(fit["coeffs"]))
+# def
+
+
+def fit_residuals(fit, xs, ys):
+    """[(x, measured - fitted)], the departures from a smooth curve."""
+    if not fit:
+        return []
+    return [(x, y - evaluate_polynomial(fit, x)) for x, y in zip(xs, ys)]
+# def
+
+
+def rms(values):
+    values = [v for v in values if v is not None]
+    if not values:
+        return None
+    return math.sqrt(sum(v * v for v in values) / len(values))
+# def
+
+
+def creep_grid(start, target, points):
+    """Commands at which a creep pauses to record a curve sample.
+
+    `points` counts the curve samples a creep produces, but only the interior
+    ones are returned. The two ends are excluded deliberately and for different
+    reasons: `start` was arrived at by a jump to park there, so it is not a
+    creep sample at all, and `target` is measured by the arrival that ends the
+    creep - sampling it here as well would record the same position twice.
+    """
+    points = int(points)
+    if points < 3:
+        raise ValueError("a curve needs at least 3 points")
+
+    span = float(target) - float(start)
+    return [round(float(start) + (span * index) / (points - 1), 6)
+            for index in range(1, points - 1)]
+# def
+
+
+def curve_series(points, side):
+    """{direction: [(pwm, mean angle, sd, n)]} for one side, averaged over reps.
+
+    Ordered by PWM so a plot can draw straight through it. Repeats at the same
+    PWM are averaged rather than plotted individually: the run-to-run spread is
+    carried as the sd, where it can be drawn as an error bar or used to decide
+    whether a feature is real, instead of being three overlapping lines.
+    """
+    grouped = {}
+
+    for point in points:
+        if point["side"] != side:
+            continue
+        direction = float(point["direction"])
+        pwm = int(point["pwm_us"])
+        grouped.setdefault(direction, {}).setdefault(pwm, []).append(
+            float(point["angle_deg"]))
+
+    series = {}
+    for direction, by_pwm in grouped.items():
+        series[direction] = [
+            (pwm,) + mean_sd(values) + (len(values),)
+            for pwm, values in sorted(by_pwm.items())
+        ]
+    return series
+# def
+
+
+def band_profile(series):
+    """[(pwm, band)] wherever both directions sampled the same PWM.
+
+    The band is the up sweep minus the down sweep, so it carries the sign that
+    says which way the surface was lagging. Only shared PWM values are compared:
+    interpolating one direction onto the other's grid would invent readings at
+    positions neither sweep actually visited, which is the one thing a stiction
+    measurement must not do.
+    """
+    if len(series) < 2:
+        return []
+
+    up = {pwm: mean for pwm, mean, _sd, _n in series.get(1.0, [])}
+    down = {pwm: mean for pwm, mean, _sd, _n in series.get(-1.0, [])}
+
+    return [(pwm, up[pwm] - down[pwm])
+            for pwm in sorted(set(up) & set(down))
+            if up[pwm] is not None and down[pwm] is not None]
+# def
+
+
+def stiction_stats(creep_values, swing_values):
+    """Compare crept-to and swung-to settled angles at the same end stop.
+
+    The difference is the stiction estimate: how much further the surface
+    travels when it arrives with momentum than when it is walked in.
+
+    The two sets are measured in separate phases, so there is no meaningful
+    pairing between an individual creep and an individual swing - a per-rep
+    difference would be an artefact of the order they happened to run in. The
+    estimate is therefore the difference of the means, and its spread is the
+    two sample deviations added in quadrature, which is the scatter a single
+    paired comparison would show. `stiction_se` is the standard error of the
+    difference of the means, and is the one to read when asking whether the
+    difference is real rather than how much it varies.
+    """
+    creep_mean, creep_sd = mean_sd(list(creep_values))
+    swing_mean, swing_sd = mean_sd(list(swing_values))
+
+    result = {
+        "creep_mean": creep_mean, "creep_sd": creep_sd, "creep_n": len(creep_values),
+        "swing_mean": swing_mean, "swing_sd": swing_sd, "swing_n": len(swing_values),
+        "stiction": None, "stiction_sd": None, "stiction_se": None,
+    }
+
+    if creep_mean is None or swing_mean is None:
+        return result
+
+    result["stiction"] = swing_mean - creep_mean
+
+    if creep_sd is None or swing_sd is None:
+        return result
+
+    result["stiction_sd"] = math.sqrt((creep_sd ** 2) + (swing_sd ** 2))
+    result["stiction_se"] = math.sqrt((creep_sd ** 2) / len(creep_values)
+                                      + (swing_sd ** 2) / len(swing_values))
+    return result
 # def
 
 

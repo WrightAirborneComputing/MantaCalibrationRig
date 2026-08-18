@@ -1,5 +1,6 @@
 try:
     import tkinter as tk
+    import tkinter.font as tkfont
     from tkinter import messagebox, ttk
 except ImportError:
     raise SystemExit(
@@ -11,6 +12,7 @@ except ImportError:
 
 import threading
 import time
+import traceback
 import re
 import struct
 import builtins
@@ -24,6 +26,7 @@ import os
 import serial
 import serial.tools.list_ports
 import csv
+import shutil
 from datetime import datetime
 
 from manta_theme import PALETTE, apply_theme
@@ -56,14 +59,67 @@ from manta_common import (
 # second copy would be a second thing to get wrong. range_test imports
 # DroneInterface lazily inside main(), so this is not a cycle.
 from pico_monitor import TickTracker
+import curve_plot
+from endpoint_logic import (
+    BACKOFF_CEILING_US,
+    BACKOFF_STEP_US,
+    COARSE_MAX,
+    COARSE_MIN,
+    ENDPOINT_DWELL_S,
+    ENDPOINT_TOLERANCE_DEG,
+    MAX_ATTEMPTS,
+    MOVEMENT_THRESHOLD_DEG,
+    alternating_order,
+    angle_gain_per_us,
+    nominal_gain_deg_per_us,
+    overshot_target,
+    clamp_endpoint,
+    command_delta_for_pwm,
+    correction_us,
+    endpoint_accepted,
+    endpoint_command,
+    error_grew,
+    has_diverged,
+    inward_sign,
+    limit_correction,
+    stop_verdict,
+    STOP_FREE,
+    usable_gain,
+    STOP_UNCONFIRMED,
+    UNCONFIRMED_ATTEMPTS,
+)
+import cal_flow
+from trim_logic import (
+    TRIM_APPROACH_CMD,
+    TRIM_ATTEMPTS,
+    TRIM_TOLERANCE_DEG,
+    backlash_deg,
+    clamp_trim,
+    command_gain_deg,
+    dead_band_cmd,
+    limit_trim_correction,
+    shortened_endpoint,
+    travel_lost_us,
+    trim_accepted,
+    trim_correction,
+    trim_error_grew,
+    trim_estimate,
+    trim_gain_deg,
+    trim_has_diverged,
+)
 from range_test import (
     MIN_TRAVEL_DEG,
+    curve_series,
     PHASES,
     PHASE_SIDES,
     PRE_ROLL_S,
     analyse_leg,
+    creep_commands,
+    creep_grid,
     endpoint_stats,
     mean_sd,
+    settled_angle,
+    stiction_stats,
     to_series,
 )
 
@@ -77,6 +133,48 @@ from range_test import (
 # cannot disagree. 0.5 s gives ~5 samples (about 2.2x noise reduction) for 250 ms
 # of group delay, which is well inside the calibration mover's 250 ms step cadence.
 POSITION_WINDOW_S = 0.5
+
+# The stiction test's creep, matching the trim calibration's own step logic so
+# the two arrive at an end stop the same way. Repetitions default low because a
+# single creep from centre is 100 steps - a couple of minutes of wall clock per
+# end before the swings are even started.
+CREEP_STEP_CMD = 0.01
+CREEP_PERIOD_S = 0.25
+DEFAULT_STICTION_REPS = 3
+
+# Curve samples per creep, including the arrival at the end stop.
+DEFAULT_CREEP_POINTS = 21
+
+# How long a curve sample dwells before it is read. It MUST exceed
+# POSITION_WINDOW_S, or the trailing mean still contains samples from before the
+# step and every reading lags the surface. That lag is not harmless noise: it
+# biases an upward sweep low and a downward sweep high, so the two errors add
+# into the apparent hysteresis band. At 0.01 cmd per 0.25 s the sweep covers
+# 0.7-1.5 deg/s, and a 0.25 s effective lag would inflate the band by 0.35-0.75
+# deg - the same order as the effect being measured, and systematic, so it would
+# look like a clean result rather than an error.
+CREEP_SAMPLE_DWELL_S = POSITION_WINDOW_S + 0.3
+
+# MAV_CMD_ACTUATOR_TEST asks for a 60 s timeout and does not get it: measured on
+# this board the FC drops the override after about 2 s and drives the surfaces
+# itself again. Anything that waits longer than this between commands has to
+# re-send, or the surface wanders off mid-measurement and is yanked back by the
+# next command.
+MEASURE_REFRESH_S = 0.5
+
+# The per-drone setup gate, named once so the status strip and the warning
+# dialog cannot describe the same blocker in two different ways. Order is the
+# order they appear on the strip, and the order they are listed when refused.
+SETUP_ITEMS = (
+    ("name", "SET DRONE NAME"),
+    ("left", "ZERO LEFT ELEVON"),
+    ("right", "ZERO RIGHT ELEVON"),
+)
+
+# Named once so the writer and any reader cannot drift apart - the mismatch that
+# ISSUES.md #4 records against calibration_log.csv.
+CREEP_CURVE_COLUMNS = ("phase", "side", "direction", "rep", "cmd", "pwm_us",
+                       "angle_deg")
 
 # Backlog is sized in *seconds*, not samples, because the Pico's rate is now
 # negotiable. A fixed 200 entries meant 20 s at 10 Hz but only 0.2 s at 1000 Hz -
@@ -131,6 +229,8 @@ CAL_LOG_COLUMNS = [
     "right_max",
     "right_trim",
     "Folding?",
+    "left_backlash_deg",
+    "right_backlash_deg",
 ]
 
 
@@ -867,21 +967,41 @@ class PositionReader:
     # def
 
     def set_center(self, side):
+        """Centre one side on the current reading. True only if it really centred."""
         raw = self.get_average_position_nonblocking(side)
         if raw is None:
             print("No data for centering %s" % side)
-            return
+            return False
 
         with self._settings_lock:
             if side == "LEFT":
                 self.left_offset = -(self.left_scaler * raw)
                 print("Left centred. Scaler=%.4f Offset = %.4f" % (self.left_scaler, self.left_offset))
                 self.save_calibration(("LEFT",))
+                return True
 
             elif side == "RIGHT":
                 self.right_offset = (self.right_scaler * raw)
                 print("Right centred. Scaler=%.4f Offset = %.4f" % (self.right_scaler, self.right_offset))
                 self.save_calibration(("RIGHT",))
+                return True
+
+        return False
+    # def
+
+    def clear_center(self):
+        """Drop both centring offsets, so the angles read raw until re-zeroed.
+
+        Called when a drone is connected: the offsets on file were measured
+        against whatever airframe was on the rig last, and carrying them over
+        would quietly report the previous drone's zero as this one's.
+        """
+        with self._settings_lock:
+            self.left_offset = 0.0
+            self.right_offset = 0.0
+            self.save_calibration(("LEFT", "RIGHT"))
+
+        print("Centring cleared - zero both angles before calibrating")
     # def
 
     def set_scaler_and_offset(self, side, scaler=None, offset=None):
@@ -1239,11 +1359,27 @@ class FourSliderGUI:
         self.left_cal_active = False
         self.right_cal_active = False
 
+        # What each side's flow chart draws. One model per side, touched only
+        # by that side's worker; the chart is drawn from snapshots of them.
+        self.cal_flow = {"LEFT": cal_flow.SideFlow(),
+                         "RIGHT": cal_flow.SideFlow()}
+
+        # Measured by the trim stage, kept so "Log calibration" can record it.
+        # None until a calibration has actually measured one: an unmeasured
+        # backlash and a zero backlash are not the same claim.
+        self.left_backlash_deg = None
+        self.right_backlash_deg = None
+
         self.sweep_thread = None
         self.sweep_active = False
 
-        self.range_test_thread = None
-        self.range_test_active = False
+        self.measure_thread = None
+        self.measure_active = False
+
+        self.stiction_results = []
+        self.creep_points = []
+        self.curve_window = None
+        self.stiction_summary_rows = []
         self.rr_results = []
         self.rr_summary_rows = []
         self.rr_samples = []
@@ -1253,6 +1389,14 @@ class FourSliderGUI:
 
         self.drone_name_var = tk.StringVar(value="")
         self.folding_var = tk.StringVar(value="")
+
+        # Per-drone setup gate. Nothing that drives the surfaces or writes a
+        # named record may run until this drone has been named and both sides
+        # zeroed - see reset_setup_state(). Reset on every connect, so the
+        # previous airframe's name and zeros cannot be inherited.
+        self.name_is_set = False
+        self.left_zeroed = False
+        self.right_zeroed = False
 
         self.angle_neg_degs = self.position_reader.angle_neg_degs
         self.angle_pos_degs = self.position_reader.angle_pos_degs
@@ -1277,9 +1421,20 @@ class FourSliderGUI:
         status_strip.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
 
         self.build_connection_panel(status_strip)
+        self.build_setup_panel(status_strip)
 
         body = tk.Frame(main_frame)
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # The right-hand column is packed BEFORE the notebook, and the order
+        # is the whole point. pack hands out space in pack order, so whoever
+        # goes first takes its full request and whoever goes last absorbs the
+        # shortfall. With the notebook first, a 1280-wide window left this
+        # column 152 px of the 650 it asks for - survivable when it only held a
+        # log you could scroll, fatal now it holds the flow charts, which a
+        # Canvas would clip without saying anything.
+        right_col = tk.Frame(body)
+        right_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         self.notebook = ttk.Notebook(body)
         self.notebook.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1340,13 +1495,13 @@ class FourSliderGUI:
         )
         zero_angles_btn.pack(pady=2, anchor="w")
 
-        auto_both_btn = tk.Button(
+        self.auto_both_btn = tk.Button(
             angle_group,
             text="Auto calibrate",
             width=18,
             command=self.start_both_calibration
         )
-        auto_both_btn.pack(pady=2, anchor="w")
+        self.auto_both_btn.pack(pady=2, anchor="w")
 
         stop_both_btn = tk.Button(
             angle_group,
@@ -1356,13 +1511,13 @@ class FourSliderGUI:
         )
         stop_both_btn.pack(pady=2, anchor="w")
 
-        sweep_btn = tk.Button(
+        self.sweep_btn = tk.Button(
             angle_group,
             text="Sweep to CSV",
             width=18,
             command=self.start_sweep_to_csv
         )
-        sweep_btn.pack(pady=(8, 2), anchor="w")
+        self.sweep_btn.pack(pady=(8, 2), anchor="w")
 
         folding_row = tk.Frame(angle_group, bd=1, relief="groove", padx=4, pady=4)
         folding_row.pack(anchor="w", pady=(8, 2), fill=tk.X)
@@ -1392,13 +1547,13 @@ class FourSliderGUI:
         )
         left_clear_btn.pack(pady=(0, 10))
 
-        left_cal_btn = tk.Button(
+        self.left_cal_btn = tk.Button(
             left_group,
             text="Auto calibrate",
             width=18,
             command=self.start_left_calibration
         )
-        left_cal_btn.pack(pady=(0, 4))
+        self.left_cal_btn.pack(pady=(0, 4))
 
         left_stop_btn = tk.Button(
             left_group,
@@ -1470,13 +1625,13 @@ class FourSliderGUI:
         )
         right_clear_btn.pack(pady=(0, 10))
 
-        right_cal_btn = tk.Button(
+        self.right_cal_btn = tk.Button(
             right_group,
             text="Auto calibrate",
             width=18,
             command=self.start_right_calibration
         )
-        right_cal_btn.pack(pady=(0, 4))
+        self.right_cal_btn.pack(pady=(0, 4))
 
         right_stop_btn = tk.Button(
             right_group,
@@ -1537,24 +1692,42 @@ class FourSliderGUI:
         right_center_btn.pack(pady=(0, 5))
 
         rr_tab = tk.Frame(self.notebook, padx=6, pady=6)
-        self.notebook.add(rr_tab, text="  Range & rate  ")
-        self.build_range_rate_tab(rr_tab)
+        self.notebook.add(rr_tab, text="  Measure  ")
+        self.build_measure_tab(rr_tab)
+
+        # Calibration flow charts, above the log and outside the notebook for
+        # the same reason the log itself is: a run you cannot see because you
+        # are on the other tab is a run you cannot follow.
+        self.build_calibration_flow(right_col)
 
         # Instrumentation panel
-        log_group = tk.LabelFrame(body, text="Instrumentation", padx=10, pady=10)
-        log_group.pack(side=tk.LEFT, padx=10, fill=tk.BOTH, expand=True)
+        log_group = tk.LabelFrame(right_col, text="Instrumentation",
+                                  padx=10, pady=10)
+        log_group.pack(side=tk.TOP, padx=10, pady=(8, 0), fill=tk.BOTH,
+                       expand=True)
 
+        # The scrollbar is packed first on purpose. Packed after an expanding
+        # Text it is last in line for space, and under any width pressure it
+        # collapsed to about a pixel.
+        log_scroll = tk.Scrollbar(log_group)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 50 rather than 80 columns: the charts above need the width, and
+        # wrap="word" means nothing here depended on 80. The height is set so
+        # charts plus log come to about what the notebook beside them already
+        # asks for, which is what actually sets the window height.
         self.log_text = tk.Text(
             log_group,
-            width=80,
-            height=32,
+            width=50,
+            height=24,
             wrap="word"
         )
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        log_scroll = tk.Scrollbar(log_group, command=self.log_text.yview)
-        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        log_scroll.config(command=self.log_text.yview)
         self.log_text.config(yscrollcommand=log_scroll.set)
+
+        self.refresh_setup_gate()
 
         self._drain_gui_queue()
         self.update_labels()
@@ -1590,6 +1763,9 @@ class FourSliderGUI:
     def start_sweep_to_csv(self):
         if self.sweep_thread is not None and self.sweep_thread.is_alive():
             print("Sweep already running")
+            return
+
+        if not self.require_setup("a sweep"):
             return
 
         self.stop_both_calibration()
@@ -1688,12 +1864,28 @@ class FourSliderGUI:
 
     # ---- Range and rate test -------------------------------------------------
 
-    def build_range_rate_tab(self, parent):
+    def build_measure_tab(self, parent):
         left_col = tk.Frame(parent)
         left_col.pack(side=tk.LEFT, anchor="n", padx=(0, 10))
 
-        setup = tk.LabelFrame(left_col, text="What to run", padx=8, pady=6)
+        setup = tk.LabelFrame(left_col, text="What to measure", padx=8, pady=6)
         setup.pack(anchor="w", fill=tk.X)
+
+        # The two measurements share their hard-overs: a range/rate cycle already
+        # drives the surface full span to each end stop, which is exactly the
+        # swing half of the stiction comparison. Running them together therefore
+        # costs only the creeps, and the swing numbers both tests quote are then
+        # literally the same measurements rather than two runs that have to be
+        # taken on trust as comparable.
+        self.m_range_rate_var = tk.IntVar(value=1)
+        self.m_stiction_var = tk.IntVar(value=0)
+
+        for text, var in (("Range and rate", self.m_range_rate_var),
+                          ("Stiction (creep vs swing)", self.m_stiction_var)):
+            tk.Checkbutton(setup, text=text, variable=var, anchor="w",
+                           command=self.update_measure_estimate).pack(anchor="w")
+
+        tk.Frame(setup, height=1, bg=PALETTE["rule"]).pack(fill=tk.X, pady=6)
 
         # Only BOTH is on by default: driving the servos one at a time was
         # measured to give the same travel and rate as driving them together, so
@@ -1709,24 +1901,39 @@ class FourSliderGUI:
                       "BOTH": "Both together"}[phase],
                 variable=var,
                 anchor="w",
-                command=self.update_range_rate_estimate,
+                command=self.update_measure_estimate,
             ).pack(anchor="w")
 
+        tk.Frame(setup, height=1, bg=PALETTE["rule"]).pack(fill=tk.X, pady=6)
+
         self.rr_cycles_var = tk.StringVar(value=str(DEFAULT_CYCLES))
+        self.st_reps_var = tk.StringVar(value=str(DEFAULT_STICTION_REPS))
         self.rr_settle_var = tk.StringVar(value="2.0")
         self.rr_rate_var = tk.StringVar(value=str(FAST_RATE_HZ))
+        self.st_step_var = tk.StringVar(value="%.3f" % CREEP_STEP_CMD)
+        self.st_period_var = tk.StringVar(value="%.2f" % CREEP_PERIOD_S)
+        self.st_points_var = tk.StringVar(value=str(DEFAULT_CREEP_POINTS))
 
-        for label, var, width in (("Cycles", self.rr_cycles_var, 5),
-                                  ("Settle s", self.rr_settle_var, 5),
-                                  ("Rate Hz", self.rr_rate_var, 5)):
+        # Swing cycles and creep reps are separate counts on purpose: a swing is
+        # a couple of seconds and a creep from centre is a hundred steps, so
+        # tying them together would price the cheap measurement at the expensive
+        # one's rate.
+        for label, var in (("Swing cycles", self.rr_cycles_var),
+                           ("Creep reps", self.st_reps_var),
+                           ("Settle s", self.rr_settle_var),
+                           ("Rate Hz", self.rr_rate_var),
+                           ("Creep step", self.st_step_var),
+                           ("Creep s", self.st_period_var),
+                           ("Sample pts", self.st_points_var)):
             row = tk.Frame(setup)
-            row.pack(anchor="w", pady=(4, 0), fill=tk.X)
-            tk.Label(row, text=label, width=9, anchor="w").pack(side=tk.LEFT)
-            entry = tk.Entry(row, textvariable=var, width=width)
+            row.pack(anchor="w", pady=(2, 0), fill=tk.X)
+            tk.Label(row, text=label, width=11, anchor="w").pack(side=tk.LEFT)
+            entry = tk.Entry(row, textvariable=var, width=6)
             entry.pack(side=tk.LEFT)
-            entry.bind("<KeyRelease>", lambda event: self.update_range_rate_estimate())
+            entry.bind("<KeyRelease>", lambda event: self.update_measure_estimate())
 
-        self.rr_estimate_label = tk.Label(setup, text="", anchor="w", fg=PALETTE["ink_muted"])
+        self.rr_estimate_label = tk.Label(
+            setup, text="", anchor="w", justify="left", fg=PALETTE["ink_muted"])
         self.rr_estimate_label.pack(anchor="w", pady=(6, 0))
 
         run_group = tk.LabelFrame(left_col, text="Run", padx=8, pady=6)
@@ -1744,12 +1951,12 @@ class FourSliderGUI:
         button_row.pack(anchor="w", fill=tk.X)
 
         self.rr_run_btn = tk.Button(
-            button_row, text="Run test", width=11, command=self.start_range_rate_test)
+            button_row, text="Run", width=11, command=self.start_measure)
         self.rr_run_btn.pack(side=tk.LEFT)
 
         self.rr_stop_btn = tk.Button(
             button_row, text="Stop", width=8, state="disabled",
-            command=self.stop_range_rate_test)
+            command=self.stop_measure)
         self.rr_stop_btn.pack(side=tk.LEFT, padx=(6, 0))
 
         self.rr_progress = ttk.Progressbar(run_group, mode="determinate", maximum=100.0)
@@ -1781,8 +1988,15 @@ class FourSliderGUI:
         self.rr_canvas.pack(fill=tk.BOTH, expand=True)
         self.rr_canvas.bind("<Configure>", lambda event: self.redraw_range_rate_trace())
 
-        results_group = tk.LabelFrame(right_col, text="Results", padx=6, pady=6)
+        # Titled for its contents, not "Results": there are two tables now, and
+        # each one's Save button lives with it. A shared footer of three buttons
+        # made the reader work out which of them wrote which table.
+        results_group = tk.LabelFrame(right_col, text="Range and rate",
+                                      padx=6, pady=6)
         results_group.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        results_body = tk.Frame(results_group)
+        results_body.pack(fill=tk.BOTH, expand=True)
 
         # Max/min are the settled endpoints themselves, with their own spread.
         # Range is their difference and hides it: two runs can share a range
@@ -1794,7 +2008,7 @@ class FourSliderGUI:
                     "Range deg", "Travel deg", "Transit ms", "Rate deg/s", "n")
 
         self.rr_tree = ttk.Treeview(
-            results_group, columns=columns, show="headings", height=8)
+            results_body, columns=columns, show="headings", height=8)
 
         for column, heading in zip(columns, headings):
             self.rr_tree.heading(column, text=heading)
@@ -1803,9 +2017,16 @@ class FourSliderGUI:
 
         self.rr_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        tree_scroll = tk.Scrollbar(results_group, command=self.rr_tree.yview)
+        tree_scroll = tk.Scrollbar(results_body, command=self.rr_tree.yview)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.rr_tree.config(yscrollcommand=tree_scroll.set)
+
+        self.rr_export_btn = tk.Button(
+            results_group, text="Save this table", width=14, state="disabled",
+            command=self.export_range_rate_csv)
+        self.rr_export_btn.pack(anchor="e", pady=(6, 0))
+
+        self.build_stiction_results(right_col)
 
         footer = tk.Frame(right_col)
         footer.pack(fill=tk.X, pady=(6, 0))
@@ -1813,47 +2034,160 @@ class FourSliderGUI:
         self.rr_note_label = tk.Label(footer, text="", anchor="w", fg=PALETTE["warn"])
         self.rr_note_label.pack(side=tk.LEFT)
 
-        # Packed right-to-left, so "Save CSV" ends up leftmost of the pair. The
-        # summary is the usual answer; the sample dump is the one you reach for
-        # when the summary raises a question the aggregate cannot settle - such
-        # as whether scatter is a drift across the run or a few bad cycles.
+        # Neither table's raw material, but both tables' - every captured sample
+        # from the run. The one to reach for when a summary raises a question the
+        # aggregate cannot settle, such as whether scatter is a drift across the
+        # run or a few bad cycles. Hence the footer rather than either group.
         self.rr_samples_btn = tk.Button(
-            footer, text="Save samples", width=12, state="disabled",
+            footer, text="Save every sample", width=16, state="disabled",
             command=self.export_range_rate_samples_csv)
-        self.rr_samples_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        self.rr_samples_btn.pack(side=tk.RIGHT)
 
-        self.rr_export_btn = tk.Button(
-            footer, text="Save CSV", width=11, state="disabled",
-            command=self.export_range_rate_csv)
-        self.rr_export_btn.pack(side=tk.RIGHT)
+        # The creep curve belongs to neither table: it is the raw PWM/angle
+        # material the tables are silent about, and the only way to look at the
+        # shape until there is a plot.
+        self.st_curve_btn = tk.Button(
+            footer, text="Save creep curve", width=16, state="disabled",
+            command=self.export_creep_curve_csv)
+        self.st_curve_btn.pack(side=tk.RIGHT, padx=(0, 6))
 
-        self.update_range_rate_estimate()
+        # A window rather than another panel: the plot wants room, it is not
+        # needed continuously, and the main window is already as tall as the
+        # Trim tab makes it.
+        self.st_plot_btn = tk.Button(
+            footer, text="Plot curve", width=11, state="disabled",
+            command=self.show_creep_curve)
+        self.st_plot_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
+        self.update_measure_estimate()
     # def
 
-    def read_range_rate_settings(self):
-        """Parse the setup fields. Returns (phases, cycles, settle, rate)."""
-        phases = [p for p in PHASES if self.rr_phase_vars[p].get()]
+    def build_stiction_results(self, parent):
+        group = tk.LabelFrame(parent, text="Stiction", padx=6, pady=6)
+        group.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
-        cycles = max(1, self.get_int_var(self.rr_cycles_var, DEFAULT_CYCLES))
-        settle = max(0.3, self.get_float_var(self.rr_settle_var, 2.0))
-        rate = max(SLOW_RATE_HZ, self.get_int_var(self.rr_rate_var, FAST_RATE_HZ))
+        body = tk.Frame(group)
+        body.pack(fill=tk.BOTH, expand=True)
 
-        return phases, cycles, settle, rate
+        columns = ("phase", "side", "target", "creep", "swing", "stiction",
+                   "transit", "rate", "n")
+        headings = ("Phase", "Side", "Cmd", "Creep deg", "Swing deg",
+                    "Stiction deg", "Transit ms", "Rate deg/s", "n")
+
+        self.st_tree = ttk.Treeview(body, columns=columns, show="headings", height=6)
+
+        for column, heading in zip(columns, headings):
+            self.st_tree.heading(column, text=heading)
+            self.st_tree.column(
+                column, width=92 if column not in ("n", "side", "target") else 54,
+                anchor="center")
+
+        self.st_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scroll = tk.Scrollbar(body, command=self.st_tree.yview)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.st_tree.config(yscrollcommand=scroll.set)
+
+        self.st_export_btn = tk.Button(
+            group, text="Save this table", width=14, state="disabled",
+            command=self.export_stiction_csv)
+        self.st_export_btn.pack(anchor="e", pady=(6, 0))
     # def
 
-    def update_range_rate_estimate(self):
-        phases, cycles, settle, _rate = self.read_range_rate_settings()
-
-        legs = len(phases) * cycles * 2
-        seconds = len(phases) * settle + legs * (PRE_ROLL_S + settle)
-
-        self.rr_estimate_label.config(
-            text="%d hard-overs, about %d s" % (legs, int(round(seconds))))
+    def read_measure_settings(self):
+        """Everything the run needs, parsed from the setup group."""
+        return {
+            "phases": [p for p in PHASES if self.rr_phase_vars[p].get()],
+            "range_rate": bool(self.m_range_rate_var.get()),
+            "stiction": bool(self.m_stiction_var.get()),
+            "cycles": max(1, self.get_int_var(self.rr_cycles_var, DEFAULT_CYCLES)),
+            "creep_reps": max(1, self.get_int_var(self.st_reps_var,
+                                                  DEFAULT_STICTION_REPS)),
+            "settle": max(0.3, self.get_float_var(self.rr_settle_var, 2.0)),
+            "rate": max(SLOW_RATE_HZ, self.get_int_var(self.rr_rate_var,
+                                                       FAST_RATE_HZ)),
+            "creep_step": max(0.001, self.get_float_var(self.st_step_var,
+                                                        CREEP_STEP_CMD)),
+            "creep_period": max(0.05, self.get_float_var(self.st_period_var,
+                                                         CREEP_PERIOD_S)),
+            "creep_points": max(3, self.get_int_var(self.st_points_var,
+                                                    DEFAULT_CREEP_POINTS)),
+            # Snapshotted on the Tk thread: the worker needs min/max/trim to put
+            # a curve sample on a PWM axis, and a command only means anything
+            # relative to the values in force when it was issued.
+            "pwm_map": self.read_pwm_map(),
+        }
     # def
 
-    def start_range_rate_test(self):
-        if self.range_test_active:
-            print("Range/rate test already running")
+    def read_pwm_map(self):
+        """Per side, what it takes to turn a command into a PWM. Tk thread only."""
+        mapping = {}
+        for side, channel in (("LEFT", 5), ("RIGHT", 6)):
+            pwm_min, pwm_max, trim = self.read_side_param_snapshot(side)
+            mapping[side] = (pwm_min, pwm_max, trim,
+                             self.is_main_channel_reversed(channel))
+        return mapping
+    # def
+
+    def measure_plan(self, settings):
+        """(swing legs, creep legs) the settings imply.
+
+        Swings run whenever either measurement is selected - the stiction
+        comparison needs them for its swing half, and they are the whole of the
+        range/rate test. Selecting both therefore adds creeps, not swings.
+        """
+        phases = len(settings["phases"])
+        if not phases or not (settings["range_rate"] or settings["stiction"]):
+            return 0, 0
+
+        swings = phases * settings["cycles"] * 2
+        creeps = phases * settings["creep_reps"] * 2 if settings["stiction"] else 0
+        return swings, creeps
+    # def
+
+    def update_measure_estimate(self):
+        settings = self.read_measure_settings()
+        swings, creeps = self.measure_plan(settings)
+
+        if not swings and not creeps:
+            self.rr_estimate_label.config(text="Nothing selected")
+            return
+
+        settle = settings["settle"]
+        seconds = len(settings["phases"]) * settle
+        seconds += swings * (PRE_ROLL_S + settle)
+
+        if creeps:
+            # Full span now, and the sampled steps dwell instead of waiting a
+            # period, so they are counted at the dwell rather than the period.
+            walk = len(creep_commands(-1.0, 1.0, settings["creep_step"]))
+            samples = len(creep_grid(-1.0, 1.0, settings["creep_points"]))
+            seconds += creeps * (settle
+                                 + (walk - samples) * settings["creep_period"]
+                                 + samples * CREEP_SAMPLE_DWELL_S
+                                 + settle)
+
+        text = "%d hard-overs" % swings
+        if creeps:
+            text += ", %d creeps" % creeps
+        text += "\nabout %s" % self.format_duration(seconds)
+
+        self.rr_estimate_label.config(text=text)
+    # def
+
+    def format_duration(self, seconds):
+        seconds = int(round(seconds))
+        if seconds < 90:
+            return "%d s" % seconds
+        return "%d min" % int(round(seconds / 60.0))
+    # def
+
+    def start_measure(self):
+        if self.measure_active:
+            print("A measurement is already running")
+            return
+
+        if not self.require_setup("a measurement"):
             return
 
         if self.left_cal_active or self.right_cal_active or self.sweep_active:
@@ -1862,61 +2196,500 @@ class FourSliderGUI:
                 "Stop the calibration or sweep first - they drive the same actuators.")
             return
 
-        phases, cycles, settle, rate = self.read_range_rate_settings()
+        settings = self.read_measure_settings()
 
-        if not phases:
+        if not (settings["range_rate"] or settings["stiction"]):
+            messagebox.showwarning(
+                "Nothing to run", "Select range and rate, stiction, or both.")
+            return
+
+        if not settings["phases"]:
             messagebox.showwarning("Nothing to run", "Select at least one phase.")
             return
 
         if not self.drone_interface.is_connected():
             messagebox.showwarning(
-                "No link", "Connect to the flight controller before running the test.")
+                "No link", "Connect to the flight controller before measuring.")
             return
 
         if not self.position_reader.is_streaming():
             messagebox.showwarning(
-                "No position data", "The Pico is not streaming - nothing would be measured.")
+                "No position data",
+                "The Pico is not streaming - nothing would be measured.")
             return
 
-        legs = len(phases) * cycles * 2
+        swings, creeps = self.measure_plan(settings)
+
+        detail = "%d hard-overs to full deflection" % swings
+        if creeps:
+            detail += ", and %d creeps to the end stops" % creeps
 
         if not messagebox.askyesno(
                 "The surfaces will move",
-                "%d hard-overs to full deflection across %d phase(s).\n\n"
+                "%s across %d phase(s).\n\n"
                 "The first move slams to -1 from rest. Keep hands clear.\n\n"
-                "Run the test?" % (legs, len(phases))):
+                "Run the measurement?" % (detail, len(settings["phases"]))):
             return
 
         self.rr_tree.delete(*self.rr_tree.get_children())
+        self.st_tree.delete(*self.st_tree.get_children())
         self.rr_results = []
+        self.stiction_results = []
+        self.creep_points = []
         self.rr_summary_rows = []
+        self.stiction_summary_rows = []
         self.rr_samples = []
         self.rr_samples_truncated = False
-        # Stamped once here rather than at each button press, so the summary and
-        # the sample dump from one run carry the same name and pair up on disk.
+        # Stamped once here rather than at each button press, so every export
+        # from one run carries the same name and they pair up on disk.
         self.rr_run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.rr_last_trace = None
         self.rr_canvas.delete("all")
         self.rr_note_label.config(text="")
         self.rr_export_btn.config(state="disabled")
         self.rr_samples_btn.config(state="disabled")
+        self.st_export_btn.config(state="disabled")
+        self.st_curve_btn.config(state="disabled")
+        self.st_plot_btn.config(state="disabled")
 
-        self.range_test_active = True
+        self.measure_active = True
         self.rr_run_btn.config(state="disabled")
         self.rr_stop_btn.config(state="normal")
 
-        self.range_test_thread = threading.Thread(
-            target=self._range_rate_worker,
-            args=(phases, cycles, settle, rate),
-            daemon=True,
-        )
-        self.range_test_thread.start()
+        self.measure_thread = threading.Thread(
+            target=self._measure_worker, args=(settings,), daemon=True)
+        self.measure_thread.start()
     # def
 
-    def stop_range_rate_test(self):
-        if self.range_test_active:
-            print("Stopping range/rate test...")
-        self.range_test_active = False
+    def stop_measure(self):
+        if self.measure_active:
+            print("Stopping measurement...")
+        self.measure_active = False
+    # def
+
+    def _hold(self, sides, command, duration_s):
+        """Sleep, re-sending the actuator test so the FC cannot take over.
+
+        The surfaces are held by an override that lapses after about 2 s, so any
+        wait longer than that is not a wait at all - it is the FC quietly
+        resuming control part way through a measurement.
+        """
+        deadline = time.monotonic() + duration_s
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return
+            time.sleep(min(MEASURE_REFRESH_S, remaining))
+            for side in sides:
+                self.drone_interface.command_elevon(
+                    self.rr_output_function(side), command)
+    # def
+
+    def _measure_settled(self, phase, sides, command, dwell_s, cal):
+        """Hold at `command` for dwell_s and return {side: settled angle}.
+
+        One estimator for every static reading this tab takes - curve samples
+        and end stop arrivals alike. Differencing two angles measured different
+        ways would mean nothing, and the curve has to join up with the endpoint
+        value it ends at.
+
+        No collect-garbage first: that exists to keep MicroPython's stall out of
+        a 1000 Hz transit capture, and a static reading does not care. It is a
+        blocking serial round trip that retries for up to 4.5 s, which is long
+        enough on its own to lose the actuator override.
+        """
+        reader = self.position_reader
+        reader.start_capture()
+
+        # Anchor before the wait, not after: to_series() zeroes on the first
+        # sample at or after the timestamp it is given, so a post-capture time
+        # would match nothing and return an empty series.
+        t_start = time.monotonic()
+        self._hold(sides, command, dwell_s)
+        samples, _truncated = reader.stop_capture()
+
+        angles = {}
+        for side in PHASE_SIDES[phase]:
+            series = to_series(samples, t_start, cal, side)
+            angles[side] = settled_angle([a for _t, a in series])
+        return angles
+    # def
+
+    def _stiction_capture_settled(self, phase, sides, kind, rep, target, settle, cal):
+        """The end stop arrival: what the stiction comparison is built from."""
+        for side, angle in self._measure_settled(
+                phase, sides, target, settle, cal).items():
+            record = {
+                "phase": phase, "side": side, "kind": kind, "rep": rep,
+                "target": target, "final_deg": angle,
+                "ok": angle is not None,
+                "transit_s": None, "rate_deg_s": None, "travel_deg": None,
+            }
+            self.stiction_results.append(record)
+            self.post_to_gui(lambda r=record: self._st_show_leg(r))
+    # def
+
+    def _sample_creep_point(self, phase, sides, rep, target, command, cal, pwm_map):
+        """One dwelled sample part way along a creep.
+
+        Stored raw and separately from the stiction results: these are curve
+        points, and letting them into the same list would put mid-travel
+        positions into an end stop comparison.
+        """
+        direction = 1.0 if target > 0.0 else -1.0
+
+        for side, angle in self._measure_settled(
+                phase, sides, command, CREEP_SAMPLE_DWELL_S, cal).items():
+            if angle is None:
+                continue
+
+            pwm_min, pwm_max, trim, rev = pwm_map[side]
+            self.creep_points.append({
+                "phase": phase,
+                "side": side,
+                "direction": direction,
+                "rep": rep,
+                "cmd": round(command, 4),
+                "pwm_us": self.expected_pwm(command, pwm_min, pwm_max, trim, rev),
+                "angle_deg": round(angle, 3),
+            })
+    # def
+
+    def _stiction_creep_leg(self, phase, sides, rep, target, step, period,
+                            points, settle, cal, pwm_map):
+        """Creep the full span to the end stop, sampling the curve on the way.
+
+        The same increment-and-wait the trim calibration uses, but walking to a
+        command rather than to an angle: the end stop is where the command runs
+        out.
+
+        Full span, from the opposite end rather than from centre, so that the
+        two directions cover the same ground and can be differenced. Creeping
+        outward from centre gives two halves of one curve travelled in opposite
+        directions, which overlap nowhere and so cannot show hysteresis at all.
+
+        The walk pauses at each grid position for longer than the averaging
+        window and records a sample - see CREEP_SAMPLE_DWELL_S for why sampling
+        on the move would manufacture a band that is not there. The arrival at
+        the end stop is measured separately and is still the number the stiction
+        comparison uses, unchanged.
+        """
+        origin = -target
+
+        for side in sides:
+            self.drone_interface.command_elevon(self.rr_output_function(side), origin)
+        self._hold(sides, origin, settle)
+
+        grid = creep_grid(origin, target, points)
+        next_sample = 0
+
+        for command in creep_commands(origin, target, step):
+            if not self.measure_active:
+                return
+
+            for side in sides:
+                self.drone_interface.command_elevon(
+                    self.rr_output_function(side), command)
+
+            # The dwell replaces this step's wait rather than adding to it: it
+            # is already longer than the period.
+            if next_sample < len(grid) and \
+                    abs(command - grid[next_sample]) <= step / 2.0:
+                self._sample_creep_point(phase, sides, rep, target, command,
+                                         cal, pwm_map)
+                next_sample += 1
+            else:
+                time.sleep(period)
+
+        self._stiction_capture_settled(phase, sides, "creep", rep, target, settle, cal)
+    # def
+
+    def _st_show_leg(self, record):
+        if self._closing:
+            return
+
+        if record["final_deg"] is None:
+            text = "%s %s %s: no reading" % (
+                record["side"], record["kind"], record["rep"])
+        elif record["rate_deg_s"]:
+            text = "%s %s %d: %.2f deg, %.0f deg/s" % (
+                record["side"], record["kind"], record["rep"],
+                record["final_deg"], record["rate_deg_s"])
+        else:
+            text = "%s %s %d: %.2f deg" % (
+                record["side"], record["kind"], record["rep"], record["final_deg"])
+
+        self.rr_leg_label.config(text=text)
+    # def
+
+    def summarise_stiction(self):
+        """One row per phase/side/end: creep, swing, their difference, and rate.
+
+        The swing half is read straight out of the range/rate legs. A leg that
+        ran neg_to_pos ended at the +1 end stop and one that ran pos_to_neg
+        ended at -1, so the arrival each creep is compared against is the very
+        same hard-over the range/rate table reports - not a second run of them.
+        """
+        rows = []
+        arrival = {"neg_to_pos": 1.0, "pos_to_neg": -1.0}
+
+        for phase in PHASES:
+            for side in ("LEFT", "RIGHT"):
+                for target in (1.0, -1.0):
+                    creeps = [r["final_deg"] for r in self.stiction_results
+                              if r["phase"] == phase and r["side"] == side
+                              and r["target"] == target and r["ok"]
+                              and r["kind"] == "creep"]
+
+                    legs = [r for r in self.rr_results
+                            if r["phase"] == phase and r["side"] == side and r["ok"]
+                            and arrival.get(r["direction"]) == target]
+
+                    swings = [r["final_deg"] for r in legs]
+                    if not creeps or not swings:
+                        continue
+
+                    stats = stiction_stats(creeps, swings)
+                    rates = mean_sd([r["rate_deg_s"] for r in legs
+                                     if r.get("rate_deg_s")])
+                    transits = mean_sd([r["transit_s"] * 1000.0 for r in legs
+                                        if r.get("transit_s")])
+
+                    rows.append((
+                        phase, side, "%+.0f" % target,
+                        self.format_mean_sd((stats["creep_mean"], stats["creep_sd"]), "%.2f"),
+                        self.format_mean_sd((stats["swing_mean"], stats["swing_sd"]), "%.2f"),
+                        self.format_mean_sd((stats["stiction"], stats["stiction_sd"]), "%.2f"),
+                        self.format_mean_sd(transits, "%.1f"),
+                        self.format_mean_sd(rates, "%.0f"),
+                        "%d/%d" % (len(creeps), len(swings)),
+                    ))
+
+        return rows
+    # def
+
+    # ---- Creep curve plot ----------------------------------------------------
+
+    CURVE_ROLE_COLOURS = {
+        curve_plot.ROLE_UP: "accent",
+        curve_plot.ROLE_FIT_UP: "accent",
+        curve_plot.ROLE_DOWN: "bad",
+        curve_plot.ROLE_FIT_DOWN: "bad",
+        curve_plot.ROLE_TRAM: "ink_faint",
+        curve_plot.ROLE_AXIS: "ink_muted",
+    }
+
+    def show_creep_curve(self):
+        """Open (or raise) the PWM/angle plot for the captured creeps."""
+        if not self.creep_points:
+            messagebox.showinfo("No curve", "Run a stiction measurement first.")
+            return
+
+        if self.curve_window is not None and self.curve_window.winfo_exists():
+            self.curve_window.deiconify()
+            self.curve_window.lift()
+            self.redraw_creep_curve()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Creep curve - PWM against angle")
+        self.curve_window = window
+
+        controls = tk.Frame(window, padx=8, pady=6)
+        controls.pack(fill=tk.X)
+
+        sides = sorted({point["side"] for point in self.creep_points})
+        self.curve_side_var = tk.StringVar(value=sides[0])
+        for side in sides:
+            tk.Radiobutton(controls, text=side, value=side,
+                           variable=self.curve_side_var,
+                           command=self.redraw_creep_curve).pack(side=tk.LEFT)
+
+        # Deviation by default: the raw curve cannot show a 1 deg band on a
+        # 62 deg axis, which is the entire quantity of interest.
+        self.curve_mode_var = tk.StringVar(value=curve_plot.MODE_DEVIATION)
+        tk.Checkbutton(controls, text="Deviation from fit",
+                       variable=self.curve_mode_var,
+                       onvalue=curve_plot.MODE_DEVIATION,
+                       offvalue=curve_plot.MODE_CURVE,
+                       command=self.redraw_creep_curve).pack(side=tk.LEFT,
+                                                             padx=(12, 0))
+
+        for label, var, default in (("Fit order", "curve_order_var", "2"),
+                                    ("Tramline deg", "curve_tol_var", "0.5")):
+            tk.Label(controls, text=label).pack(side=tk.LEFT, padx=(12, 4))
+            variable = tk.StringVar(value=default)
+            setattr(self, var, variable)
+            entry = tk.Entry(controls, textvariable=variable, width=5)
+            entry.pack(side=tk.LEFT)
+            entry.bind("<KeyRelease>", lambda event: self.redraw_creep_curve())
+
+        tk.Button(controls, text="Save SVG",
+                  command=self.export_creep_curve_svg).pack(side=tk.RIGHT)
+
+        self.curve_canvas = tk.Canvas(window, width=780, height=470,
+                                      bg=PALETTE["paper"], highlightthickness=1,
+                                      highlightbackground=PALETTE["rule"])
+        self.curve_canvas.pack(fill=tk.BOTH, expand=True, padx=8)
+        self.curve_canvas.bind("<Configure>",
+                               lambda event: self.redraw_creep_curve())
+
+        self.curve_caption = tk.Label(window, text="", anchor="w", justify="left",
+                                      padx=8, pady=6, fg=PALETTE["ink_muted"])
+        self.curve_caption.pack(fill=tk.X)
+
+        self.redraw_creep_curve()
+    # def
+
+    def build_creep_plot(self, width, height):
+        """The geometry for the current selection, or None when unplottable."""
+        if not self.creep_points:
+            return None
+
+        series = curve_series(self.creep_points, self.curve_side_var.get())
+        return curve_plot.build_plot(
+            series,
+            order=max(1, self.get_int_var(self.curve_order_var, 2)),
+            tolerance_deg=max(0.0, self.get_float_var(self.curve_tol_var, 0.5)),
+            width=width, height=height, mode=self.curve_mode_var.get())
+    # def
+
+    def redraw_creep_curve(self):
+        if self.curve_window is None or not self.curve_window.winfo_exists():
+            return
+
+        canvas = self.curve_canvas
+        canvas.delete("all")
+
+        width = max(320, canvas.winfo_width())
+        height = max(240, canvas.winfo_height())
+
+        plot = self.build_creep_plot(width, height)
+        if plot is None:
+            canvas.create_text(width / 2, height / 2, text="Nothing to plot",
+                               fill=PALETTE["ink_muted"])
+            return
+
+        for line in plot["axes"]:
+            self._draw_plot_line(canvas, line, 1)
+
+        for line in plot["polylines"]:
+            self._draw_plot_line(canvas, line, line.get("width", 2))
+
+        for marker in plot["markers"]:
+            x, y = marker["point"]
+            colour = PALETTE[self.CURVE_ROLE_COLOURS[marker["role"]]]
+            canvas.create_oval(x - 2.5, y - 2.5, x + 2.5, y + 2.5,
+                               fill=colour, outline=colour)
+
+        for text in plot["texts"]:
+            anchor = {"middle": "n", "end": "e", "start": "w"}[text["anchor"]]
+            canvas.create_text(text["x"], text["y"], text=text["text"],
+                               anchor=anchor, fill=PALETTE["ink_muted"])
+
+        self.curve_caption.config(text=self.describe_creep_plot(plot))
+    # def
+
+    def _draw_plot_line(self, canvas, line, width):
+        colour = PALETTE[self.CURVE_ROLE_COLOURS[line["role"]]]
+        flat = []
+        for x, y in line["points"]:
+            flat.extend((x, y))
+        if len(flat) < 4:
+            return
+        canvas.create_line(*flat, fill=colour, width=width,
+                           dash=(4, 3) if line.get("dash") else None)
+    # def
+
+    def describe_creep_plot(self, plot):
+        """The numbers the picture cannot carry: fit quality and band size."""
+        stats = plot["stats"]
+        parts = []
+
+        for direction, label in ((1.0, "up"), (-1.0, "down")):
+            fit = stats["fits"].get(direction)
+            if fit and fit["rms_deg"] is not None:
+                parts.append("%s fit rms %.2f deg, worst %+.2f at %d us"
+                             % (label, fit["rms_deg"], fit["max_deg"],
+                                fit["max_pwm"]))
+
+        band = stats.get("band")
+        if band:
+            parts.append("band mean %.2f deg, max %.2f deg at %d us"
+                         % (band["mean_deg"], band["max_deg"], band["max_pwm"]))
+
+        return "\n".join(parts) if parts else "Not enough points to fit"
+    # def
+
+    def export_creep_curve_svg(self):
+        plot = self.build_creep_plot(880, 520)
+        if plot is None:
+            print("Nothing to plot")
+            return
+
+        try:
+            side = self.curve_side_var.get()
+            path = self.rr_report_path("creepcurve_%s" % side.lower())
+            path = path[:-4] + ".svg"
+
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(curve_plot.to_svg(plot, "Creep curve - %s" % side))
+
+            print("Creep curve plot written to %s" % path)
+
+        except Exception as e:
+            print("Failed to export the creep curve plot: %s" % str(e))
+    # def
+
+    def export_creep_curve_csv(self):
+        """Every dwelled sample from every creep, as PWM against angle.
+
+        One row per sample rather than a summary: the shape has not been
+        characterised yet, so anything that reduced it here would be guessing at
+        what matters. Direction is carried per row because the up and down
+        sweeps are the two halves of the hysteresis comparison and must never be
+        pooled.
+        """
+        if not self.creep_points:
+            print("No creep curve to export")
+            return
+
+        try:
+            path = self.rr_report_path("creepcurve")
+
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(CREEP_CURVE_COLUMNS)
+                for point in self.creep_points:
+                    row = [point[column] for column in CREEP_CURVE_COLUMNS]
+                    writer.writerow(row)
+
+            print("Creep curve written to %s (%d points)"
+                  % (path, len(self.creep_points)))
+
+        except Exception as e:
+            print("Failed to export the creep curve: %s" % str(e))
+    # def
+
+    def export_stiction_csv(self):
+        if not self.stiction_summary_rows:
+            print("Nothing to export")
+            return
+
+        try:
+            path = self.rr_report_path("stiction")
+
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["phase", "side", "target", "creep_deg", "swing_deg",
+                                 "stiction_deg", "transit_ms", "rate_deg_s", "n"])
+                writer.writerows(self.stiction_summary_rows)
+
+            print("Stiction summary written to %s" % path)
+
+        except Exception as e:
+            print("Failed to export stiction CSV: %s" % str(e))
     # def
 
     def _rr_status(self, text, fraction=None):
@@ -1938,77 +2711,107 @@ class FourSliderGUI:
         }
     # def
 
-    def _range_rate_worker(self, phases, cycles, settle, rate):
+    def _measure_worker(self, settings):
+        """Creeps first, then the hard-overs, per phase.
+
+        One pass drives both measurements. The hard-overs are the range/rate
+        test outright, and they are also the swing half of the stiction
+        comparison - a cycle parks at one end and drives full span to the other,
+        which is exactly the arrival the creep is being compared against. There
+        is no separate swing pass, so the two summaries quote the same legs.
+        """
         restore_rate = self.position_reader.sample_hz
+        phases = settings["phases"]
+        settle = settings["settle"]
 
         try:
-            achieved = self.position_reader.set_sample_rate(rate)
-
-            if achieved is None:
+            if self.position_reader.set_sample_rate(settings["rate"]) is None:
                 self._rr_status("Pico refused the rate - is it running sampler.py?")
-                messagebox_text = (
-                    "The Pico did not accept a rate command, so it is probably running "
-                    "the legacy 10 Hz firmware. That is far too slow to resolve a "
-                    "transit.\n\nUpload pico/sampler.py as main.py and try again.")
-                self.post_to_gui(
-                    lambda: messagebox.showerror("Old firmware", messagebox_text))
+                self.post_to_gui(lambda: messagebox.showerror(
+                    "Old firmware",
+                    "The Pico did not accept a rate command, so it is probably "
+                    "running the legacy 10 Hz firmware. That is far too slow to "
+                    "resolve a transit.\n\nUpload pico/sampler.py as main.py and "
+                    "try again."))
                 return
 
             cal = self._rr_calibration()
-
-            total_legs = len(phases) * cycles * 2
+            swings, creeps = self.measure_plan(settings)
+            total = max(1, swings + creeps)
             done = 0
 
             for phase in phases:
-                if not self.range_test_active:
+                if not self.measure_active:
                     break
 
                 sides = PHASE_SIDES[phase]
 
-                self._rr_status("%s: parking at -1" % phase, done / float(total_legs))
+                if settings["stiction"]:
+                    for target in (1.0, -1.0):
+                        for rep in range(1, settings["creep_reps"] + 1):
+                            if not self.measure_active:
+                                break
+
+                            self._rr_status(
+                                "%s: creep to %+.0f, %d/%d"
+                                % (phase, target, rep, settings["creep_reps"]),
+                                done / float(total))
+
+                            self._stiction_creep_leg(
+                                phase, sides, rep, target, settings["creep_step"],
+                                settings["creep_period"],
+                                settings["creep_points"], settle, cal,
+                                settings["pwm_map"])
+                            done += 1
+
+                self._rr_status("%s: parking at -1" % phase, done / float(total))
                 for side in sides:
                     self.drone_interface.command_elevon(
                         self.rr_output_function(side), -1.0)
-                time.sleep(settle)
+                self._hold(sides, -1.0, settle)
 
-                for cycle in range(1, cycles + 1):
-                    for direction, target in (("neg_to_pos", 1.0), ("pos_to_neg", -1.0)):
-                        if not self.range_test_active:
+                for cycle in range(1, settings["cycles"] + 1):
+                    for direction, target in (("neg_to_pos", 1.0),
+                                              ("pos_to_neg", -1.0)):
+                        if not self.measure_active:
                             break
 
                         self._rr_status(
-                            "%s: cycle %d/%d, %s" % (phase, cycle, cycles, direction),
-                            done / float(total_legs))
+                            "%s: cycle %d/%d, %s"
+                            % (phase, cycle, settings["cycles"], direction),
+                            done / float(total))
 
                         self._rr_run_leg(phase, sides, cycle, direction, target,
                                          settle, cal)
 
                         done += 1
                         self._rr_status(
-                            "%s: cycle %d/%d, %s" % (phase, cycle, cycles, direction),
-                            done / float(total_legs))
+                            "%s: cycle %d/%d, %s"
+                            % (phase, cycle, settings["cycles"], direction),
+                            done / float(total))
 
                 for side in sides:
-                    self.drone_interface.command_elevon(self.rr_output_function(side), 0.0)
+                    self.drone_interface.command_elevon(
+                        self.rr_output_function(side), 0.0)
 
         except Exception as e:
-            print("Range/rate test failed: %s" % str(e))
+            print("Measurement failed: %s" % str(e))
             self._rr_status("Failed: %s" % str(e))
 
         finally:
             # Always park the surfaces. MAV_CMD_ACTUATOR_TEST holds its value for
-            # 60 s, so an abandoned test would otherwise leave them hard over.
+            # 60 s, so an abandoned run would otherwise leave them hard over.
             try:
                 self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, 0.0)
                 self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, 0.0)
             except Exception as e:
-                print("Failed to centre elevons after the test: %s" % str(e))
+                print("Failed to centre elevons after the run: %s" % str(e))
 
             if restore_rate <= SLOW_RATE_HZ:
                 self.position_reader.set_sample_rate(SLOW_RATE_HZ)
 
-            self.range_test_active = False
-            self.post_to_gui(self._rr_finish)
+            self.measure_active = False
+            self.post_to_gui(lambda s=settings: self._measure_finish(s))
     # def
 
     def rr_output_function(self, side):
@@ -2024,6 +2827,15 @@ class FourSliderGUI:
 
         reader.start_capture()
 
+        # Refresh the parked hold before the baseline. send_command() above is a
+        # blocking serial round trip that retries for up to 4.5 s, which is long
+        # enough for the actuator override to lapse and the surface to drift off
+        # the very position the pre-roll is about to measure as the baseline.
+        # The surface is already here - a leg is always entered parked at the far
+        # end - so this moves nothing.
+        for side in sides:
+            self.drone_interface.command_elevon(self.rr_output_function(side), -target)
+
         # Baseline before the command, so t=0 has something to be measured from.
         time.sleep(PRE_ROLL_S)
 
@@ -2031,7 +2843,11 @@ class FourSliderGUI:
         for side in sides:
             self.drone_interface.command_elevon(self.rr_output_function(side), target)
 
-        time.sleep(settle)
+        # Held, not slept: the settle is longer than the override lasts, so the
+        # FC would take the surface back before the trace had finished settling
+        # and the last fifth - which is what final_deg is measured from - would
+        # be of a surface on its way somewhere else.
+        self._hold(sides, target, settle)
 
         samples, truncated = reader.stop_capture()
 
@@ -2190,18 +3006,26 @@ class FourSliderGUI:
                            anchor="e", fill="gray40")
     # def
 
-    def _rr_finish(self):
+    def _measure_finish(self, settings):
         if self._closing:
             return
 
-        self.rr_run_btn.config(state="normal")
+        # Back through the gate: the run's owner is done with the button, but
+        # a connect during the run may have closed the gate behind it.
+        self.refresh_setup_gate()
         self.rr_stop_btn.config(state="disabled")
 
-        rows = self.summarise_range_rate()
+        rows = self.summarise_range_rate() if settings["range_rate"] else []
         self.rr_summary_rows = rows
 
         for row in rows:
             self.rr_tree.insert("", tk.END, values=row)
+
+        stiction_rows = self.summarise_stiction() if settings["stiction"] else []
+        self.stiction_summary_rows = stiction_rows
+
+        for row in stiction_rows:
+            self.st_tree.insert("", tk.END, values=row)
 
         notes = []
 
@@ -2220,9 +3044,14 @@ class FourSliderGUI:
         self.rr_note_label.config(text="; ".join(notes))
         self.rr_export_btn.config(state="normal" if rows else "disabled")
         self.rr_samples_btn.config(state="normal" if self.rr_samples else "disabled")
+        self.st_export_btn.config(state="normal" if stiction_rows else "disabled")
+        enabled = "normal" if self.creep_points else "disabled"
+        self.st_curve_btn.config(state=enabled)
+        self.st_plot_btn.config(state=enabled)
 
-        self.rr_progress.config(value=100.0 if rows else 0.0)
-        self.rr_status_label.config(text="Done" if rows else "No measurements")
+        any_rows = bool(rows or stiction_rows)
+        self.rr_progress.config(value=100.0 if any_rows else 0.0)
+        self.rr_status_label.config(text="Done" if any_rows else "No measurements")
     # def
 
     def summarise_range_rate(self):
@@ -2357,6 +3186,280 @@ class FourSliderGUI:
         return entry
     # def
 
+    # ---- Calibration flow charts --------------------------------------------
+
+    # Canvas geometry. Fixed, because fixed is the point: a chart laid out with
+    # widgets would re-request its width every time a node's note changed from
+    # "attempt 3 of 10" to "1902 us  +34.92 deg", and with this column in an
+    # expanding pack chain the whole notebook would shift while a run was in
+    # flight. Coordinates cannot do that.
+    CAL_CANVAS_W = 300
+    CAL_HEADER_H = 22
+    CAL_NODE_H = 30
+    CAL_ROW_GAP = 9
+    CAL_PAD = 8
+    CAL_FORK_GAP = 8
+
+    def _cal_node_box(self, row, column):
+        """(x1, y1, x2, y2) for a node, from its row and which column it is in."""
+        y1 = self.CAL_HEADER_H + row * (self.CAL_NODE_H + self.CAL_ROW_GAP)
+        y2 = y1 + self.CAL_NODE_H
+
+        left = self.CAL_PAD
+        right = self.CAL_CANVAS_W - self.CAL_PAD
+
+        if column == "full":
+            return left, y1, right, y2
+
+        half = (right - left - self.CAL_FORK_GAP) // 2
+        if column == "left":
+            return left, y1, left + half, y2
+        return right - half, y1, right, y2
+    # def
+
+    def build_calibration_flow(self, parent):
+        """One flow chart per side, drawn rather than typed.
+
+        A Canvas and not a grid of labels: the two ends fork, and a fork is not
+        something stacked text can draw. Drawing it also means the state marks
+        are strokes rather than characters, so nothing depends on the running
+        font having a tick in it.
+        """
+        group = tk.LabelFrame(parent, text="Calibration", padx=8, pady=6)
+        group.pack(side=tk.TOP, padx=10, fill=tk.X)
+
+        rows = max(row for _k, _l, row, _c in cal_flow.NODES) + 1
+        height = (self.CAL_HEADER_H
+                  + rows * self.CAL_NODE_H
+                  + (rows - 1) * self.CAL_ROW_GAP
+                  + 4)
+
+        # Made once and kept. A tkfont.Font is a named Tcl object whose
+        # __del__ calls back into Tcl to delete it, so building them per
+        # redraw leaves a stream of them for the garbage collector - and the
+        # collector runs on whichever thread happens to allocate. A calibration
+        # worker collecting one aborts the interpreter, which is how a suite
+        # that passes file by file dies when run whole.
+        self.cal_label_font = tkfont.Font(font=("TkDefaultFont", 9))
+        self.cal_note_font = tkfont.Font(font=("TkDefaultFont", 8))
+        self.cal_header_font = tkfont.Font(font=("TkDefaultFont", 9, "bold"))
+
+        self.cal_canvas = {}
+        self.cal_detail = {}
+
+        for side in ("LEFT", "RIGHT"):
+            column = tk.Frame(group)
+            column.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+            canvas = tk.Canvas(column, width=self.CAL_CANVAS_W, height=height,
+                               bg=PALETTE["panel"], highlightthickness=1,
+                               highlightbackground=PALETTE["rule"])
+            canvas.pack(side=tk.TOP)
+            self.cal_canvas[side] = canvas
+
+            # Fixed height and wraplength, so a failure arriving mid-run cannot
+            # resize the panel and shove the log about underneath it.
+            holder = tk.Frame(column, height=104)
+            holder.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+            holder.pack_propagate(False)
+
+            detail = tk.Label(holder, text="", justify="left", anchor="nw",
+                              wraplength=self.CAL_CANVAS_W - 8,
+                              fg=PALETTE["ink_muted"], font=("TkDefaultFont", 8))
+            detail.pack(fill=tk.BOTH, expand=True)
+            self.cal_detail[side] = detail
+
+            self.draw_calibration_flow(
+                side, self.cal_flow[side].snapshot(time.monotonic()))
+    # def
+
+    def _cal_mark(self, canvas, state, x, y):
+        """The state's mark, drawn at (x, y). Strokes, never glyphs."""
+        if state == cal_flow.DONE:
+            canvas.create_line(x - 5, y, x - 2, y + 4, x + 5, y - 5,
+                               fill=PALETTE["ok"], width=2)
+        elif state == cal_flow.FAILED:
+            canvas.create_line(x - 4, y - 4, x + 4, y + 4,
+                               fill=PALETTE["bad"], width=2)
+            canvas.create_line(x + 4, y - 4, x - 4, y + 4,
+                               fill=PALETTE["bad"], width=2)
+        elif state == cal_flow.WARNED:
+            canvas.create_line(x, y - 5, x, y + 1, fill=PALETTE["warn"], width=2)
+            canvas.create_line(x, y + 4, x, y + 5, fill=PALETTE["warn"], width=2)
+        elif state == cal_flow.RUNNING:
+            canvas.create_arc(x - 5, y - 5, x + 5, y + 5, start=90, extent=-270,
+                              style="pieslice", fill=PALETTE["accent"],
+                              outline=PALETTE["accent"])
+    # def
+
+    def draw_calibration_flow(self, side, snapshot):
+        """Repaint one side's chart from a snapshot. GUI thread only.
+
+        Redrawn whole rather than patched, the way redraw_range_rate_trace
+        already works - there is nothing here expensive enough to be worth
+        tracking item ids for.
+        """
+        if self._closing:
+            return
+
+        canvas = self.cal_canvas.get(side)
+        if canvas is None:
+            return
+
+        verdict, elapsed, rows, failure = snapshot
+        canvas.delete("all")
+
+        label_font = self.cal_label_font
+        note_font = self.cal_note_font
+
+        states = {key: state for key, _l, _r, _c, state, _n in rows}
+        boxes = {key: self._cal_node_box(row, column)
+                 for key, _l, row, column, _s, _n in rows}
+
+        canvas.create_text(self.CAL_PAD, self.CAL_HEADER_H // 2 + 1,
+                           text=side.lower(), anchor="w",
+                           fill=PALETTE["ink"], font=self.cal_header_font)
+        canvas.create_text(self.CAL_CANVAS_W - self.CAL_PAD,
+                           self.CAL_HEADER_H // 2 + 1,
+                           text=cal_flow.header_text(verdict, elapsed),
+                           anchor="e", fill=PALETTE["ink_faint"],
+                           font=self.cal_note_font)
+
+        # Edges first, so the nodes sit on top of where they meet.
+        for source, target in cal_flow.EDGES:
+            sx1, _sy1, sx2, sy2 = boxes[source]
+            tx1, ty1, tx2, _ty2 = boxes[target]
+            colour = (PALETTE["ok"] if states[source] == cal_flow.DONE
+                      else PALETTE["rule"])
+            dash = (3, 3) if states[target] == cal_flow.SKIPPED else ()
+            mid_y = (sy2 + ty1) // 2
+            sx = (sx1 + sx2) // 2
+            tx = (tx1 + tx2) // 2
+            canvas.create_line(sx, sy2, sx, mid_y, tx, mid_y, tx, ty1,
+                               fill=colour, dash=dash, width=1)
+
+        for key, label, _row, _column, state, note in rows:
+            x1, y1, x2, y2 = boxes[key]
+            outline, fill, text_key, width = cal_flow.STYLE[state]
+            dash = (3, 3) if state == cal_flow.SKIPPED else ()
+
+            canvas.create_rectangle(x1, y1, x2, y2, outline=PALETTE[outline],
+                                    fill=PALETTE[fill], width=width, dash=dash)
+            # Every string is cut to the node it is drawn in. The notes are
+            # the variable ones - "attempt 3 of 10" becomes "1902 us  +34.92
+            # deg" becomes a failure - and an uncut one runs over its own
+            # border and through the state mark.
+            room = (x2 - 12) - (x1 + 7)
+            canvas.create_text(x1 + 7, y1 + 10,
+                               text=cal_flow.fit(label, label_font.measure, room),
+                               anchor="w", fill=PALETTE[text_key],
+                               font=label_font)
+            if note:
+                canvas.create_text(x1 + 7, y1 + 22,
+                                   text=cal_flow.fit(note, note_font.measure, room),
+                                   anchor="w", fill=PALETTE["ink_faint"],
+                                   font=note_font)
+            self._cal_mark(canvas, state, x2 - 10, (y1 + y2) // 2)
+
+        detail = self.cal_detail.get(side)
+        if detail is not None:
+            if failure is None:
+                detail.config(text="", fg=PALETTE["ink_muted"])
+            else:
+                # The headline is already drawn in the node that failed, so
+                # the box gives the node its full name and then the detail,
+                # rather than saying the same sentence twice.
+                node_label, _headline, text, _reason = failure
+                detail.config(text="%s\n%s" % (node_label, text),
+                              fg=PALETTE["bad"])
+    # def
+
+    def _cal_publish(self, side):
+        """Snapshot on this thread, draw on the Tk one. Safe from any thread.
+
+        The snapshot is taken here, on the worker, and the callback only draws
+        it. Handing the model across instead would let the Tk thread iterate
+        state the worker is still writing; _drain_gui_queue swallows the
+        RuntimeError that produces, and the chart would freeze with no sign of
+        why - the exact thing a chart is meant to prevent.
+        """
+        snapshot = self.cal_flow[side].snapshot(time.monotonic())
+        self.post_to_gui(lambda: self.draw_calibration_flow(side, snapshot))
+    # def
+
+    def _cal_start_step(self, side, key, note=""):
+        self.cal_flow[side].start(key, note)
+        self._cal_publish(side)
+    # def
+
+    def _cal_note(self, side, key, note):
+        self.cal_flow[side].note(key, note)
+        self._cal_publish(side)
+    # def
+
+    def _cal_done_step(self, side, key, note=""):
+        self.cal_flow[side].finish(key, note)
+        self._cal_publish(side)
+    # def
+
+    def _cal_warn_step(self, side, key, note=""):
+        self.cal_flow[side].warn(key, note)
+        self._cal_publish(side)
+    # def
+
+    def _cal_fail(self, side, key, reason, **fields):
+        """Record why this side stopped, and skip whatever it never reached.
+
+        Called beside the print that already reports the fault, never instead
+        of it: the log is the detailed record and several tests read it. This
+        is the summary the chart draws.
+        """
+        self.cal_flow[side].fail(key, reason, time.monotonic(), **fields)
+        self._cal_publish(side)
+    # def
+
+    def _cal_stopped(self, side):
+        self.cal_flow[side].stop(time.monotonic())
+        self._cal_publish(side)
+    # def
+
+    def _cal_failed_already(self, side):
+        return self.cal_flow[side].verdict == cal_flow.FAILED
+    # def
+
+    def _cal_verify_step(self, side, key, targets, reached):
+        """Report a verify pass as the two angles it measured.
+
+        Amber when an end is outside tolerance, but never a failure: a verify
+        that disagrees is telling you something, not grounds for throwing the
+        calibration away.
+        """
+        note = cal_flow.reached_note(targets, reached)
+        worst = cal_flow.worst_error(targets, reached)
+
+        if worst is None or worst > ENDPOINT_TOLERANCE_DEG:
+            self._cal_warn_step(side, key, note)
+        else:
+            self._cal_done_step(side, key, note)
+    # def
+
+    def _cal_fail_running(self, side, message):
+        """Blame whatever node was live. For faults with no site of their own.
+
+        An unexpected exception can surface anywhere, so there is no fixed node
+        to attach it to - but leaving it unattached would leave that node
+        spinning, which is the one thing a chart must never do.
+        """
+        flow = self.cal_flow[side]
+        if flow.verdict == cal_flow.FAILED:
+            return
+
+        running = [key for key in cal_flow.NODE_KEYS
+                   if flow.states[key] == cal_flow.RUNNING]
+        key = running[-1] if running else cal_flow.NODE_KEYS[0]
+        self._cal_fail(side, key, "unexpected", error=message)
+    # def
+
     def build_connection_panel(self, parent):
         """Link state, laid out horizontally so it can live above the notebook.
 
@@ -2418,6 +3521,36 @@ class FourSliderGUI:
             command=self.connect_mavlink
         )
         self.connect_btn.pack(side=tk.LEFT, padx=(6, 0))
+    # def
+
+    def build_setup_panel(self, parent):
+        """What this drone still needs before it may be driven.
+
+        Beside Connection rather than in the Trim tab: the gate stops the Run
+        button on the Measure tab too, and a disabled button with no stated
+        reason is the thing this panel exists to prevent.
+        """
+        group = tk.LabelFrame(parent, text="Setup", padx=6, pady=4)
+        group.pack(fill=tk.X, pady=(6, 0))
+
+        # "Not ready" is the wider of the two - fixed, so the items beside it
+        # do not shuffle sideways when the last one is ticked.
+        self.setup_state_label = tk.Label(
+            group, text="Not ready", anchor="w", width=9, fg=PALETTE["bad"])
+        self.setup_state_label.pack(side=tk.LEFT, padx=(0, 14))
+
+        # Same reasoning per item: the width is the ticked text, so flipping
+        # the marker cannot move its neighbours.
+        width = max(len("[x] %s" % text) for _key, text in SETUP_ITEMS)
+
+        self.setup_item_labels = {}
+
+        for key, text in SETUP_ITEMS:
+            label = tk.Label(
+                group, text="[ ] %s" % text, anchor="w", width=width,
+                fg=PALETTE["bad"])
+            label.pack(side=tk.LEFT, padx=(0, 10))
+            self.setup_item_labels[key] = label
     # def
 
     def update_pico_rate_label(self):
@@ -2557,7 +3690,7 @@ class FourSliderGUI:
                     # Remember the port before the long param refresh, so a
                     # mid-refresh failure doesn't lose a known-good port.
                     self.position_reader.set_remembered_ports(drone_port=drone_device)
-                    self.refresh_params_from_drone(clear_name=True)
+                    self.refresh_params_from_drone(reset_setup=True)
                 elif self.drone_interface.last_error_kind == "open":
                     drone_text = "cannot open %s" % drone_device
                 else:
@@ -2668,7 +3801,7 @@ class FourSliderGUI:
         return value
     # def
 
-    def refresh_params_from_drone(self, clear_name=False):
+    def refresh_params_from_drone(self, reset_setup=False):
         """Read UID and the six elevon params from the FCU and populate the UI.
 
         Safe to call from a worker thread: every widget write is marshalled
@@ -2683,10 +3816,11 @@ class FourSliderGUI:
             self.set_var_on_gui_thread(self.uid_var, "--" if ident is None else str(ident))
             print("PX4 UID = %s" % str(ident))
 
-            if clear_name:
-                self.set_var_on_gui_thread(self.drone_name_var, "")
-                self.position_reader.drone_name = ""
-                print("Drone name cleared after connect")
+            if reset_setup:
+                # Drop the stale centring off-thread, then let the Tk thread
+                # clear the name field and re-arm the gate.
+                self.position_reader.clear_center()
+                self.post_to_gui(self.reset_setup_state)
 
             left_min_param = self.drone_interface.get_param(self.LEFT_MIN_PARAM, int)
             left_max_param = self.drone_interface.get_param(self.LEFT_MAX_PARAM, int)
@@ -2729,7 +3863,91 @@ class FourSliderGUI:
         self.centre_right()
     # def
 
+    def reset_setup_state(self):
+        """Forget this session's name and zeros. GUI thread only."""
+        self.name_is_set = False
+        self.left_zeroed = False
+        self.right_zeroed = False
+        self.drone_name_var.set("")
+        self.position_reader.drone_name = ""
+        self.refresh_setup_gate()
+        print("Drone name cleared and angles unzeroed after connect")
+    # def
+
+    def setup_done(self):
+        """Which SETUP_ITEMS are satisfied, by key."""
+        return {
+            "name": self.name_is_set,
+            "left": self.left_zeroed,
+            "right": self.right_zeroed,
+        }
+    # def
+
+    def setup_blockers(self):
+        """What still has to happen before this drone may be driven."""
+        done = self.setup_done()
+        return [text for key, text in SETUP_ITEMS if not done[key]]
+    # def
+
+    def is_setup_complete(self):
+        return not self.setup_blockers()
+    # def
+
+    def refresh_setup_gate(self):
+        """Enable or disable everything behind the setup gate. GUI thread only."""
+        state = "normal" if self.is_setup_complete() else "disabled"
+
+        for btn in (self.auto_both_btn, self.left_cal_btn,
+                    self.right_cal_btn, self.sweep_btn):
+            btn.config(state=state)
+
+        # A side already calibrating stays shut whatever the gate says. This
+        # method re-enables everything unconditionally and is called from
+        # apply_drone_name and reset_setup_state, either of which can fire in
+        # the middle of a run - so the starter cannot own the button state, the
+        # same reason rr_run_btn is exempted below.
+        if self.is_calibration_active("LEFT"):
+            self.left_cal_btn.config(state="disabled")
+        if self.is_calibration_active("RIGHT"):
+            self.right_cal_btn.config(state="disabled")
+        if self.is_calibration_active("LEFT") or self.is_calibration_active("RIGHT"):
+            self.auto_both_btn.config(state="disabled")
+
+        # The measurement button has an owner while a run is in flight; leave
+        # its state to start_measure/_measure_worker rather than fighting them.
+        if not self.measure_active:
+            self.rr_run_btn.config(state=state)
+
+        done = self.setup_done()
+
+        for key, text in SETUP_ITEMS:
+            self.setup_item_labels[key].config(
+                text="%s %s" % ("[x]" if done[key] else "[ ]", text),
+                fg=PALETTE["ok"] if done[key] else PALETTE["bad"])
+
+        ready = all(done.values())
+        self.setup_state_label.config(
+            text="Ready" if ready else "Not ready",
+            fg=PALETTE["ok"] if ready else PALETTE["bad"])
+    # def
+
+    def require_setup(self, what):
+        """True if `what` may run; otherwise warn and return False."""
+        missing = self.setup_blockers()
+        if not missing:
+            return True
+
+        messagebox.showwarning(
+            "Drone not set up",
+            "Before running %s:\n\n  - %s" % (what, "\n  - ".join(missing)))
+        print("%s blocked - %s" % (what, ", ".join(missing)))
+        return False
+    # def
+
     def start_both_calibration(self):
+        if not self.require_setup("automatic calibration"):
+            return
+
         print("Starting automatic calibration on both sides...")
         self.zero_both_sliders()
         self._start_left_calibration_worker()
@@ -2746,6 +3964,11 @@ class FourSliderGUI:
         try:
             name = self.drone_name_var.get().strip()
             self.position_reader.drone_name = str(name)
+            # A blank name does not count as set: it is the state the connect
+            # reset leaves behind, and every named export would fall back to
+            # "drone" and overwrite the last one.
+            self.name_is_set = name != ""
+            self.refresh_setup_gate()
             print("drone_name = %s" % name)
         except Exception as e:
             print("Invalid drone name: %s" % str(e))
@@ -2776,6 +3999,71 @@ class FourSliderGUI:
             print("angle_trim_degs = %.2f" % self.angle_trim_degs)
         except Exception as e:
             print("Invalid angle_trim: %s" % str(e))
+    # def
+
+    def backlash_for_log(self, side):
+        """The measured backlash, or blank if this session never measured one.
+
+        Blank rather than 0.0: an unmeasured backlash and a backlash of zero
+        are not the same claim, and a log that cannot tell them apart is worse
+        than one with a gap in it.
+        """
+        lash = self.side_backlash(side)
+        return "" if lash is None else "%.2f" % float(lash)
+    # def
+
+    def migrate_calibration_log(self):
+        """Bring an older log file up to the current columns. True if usable.
+
+        The backlash columns were added after this file had real rows in it.
+        Appending wider rows under a narrower header would leave the new values
+        under no heading at all, which is how a log stops being readable, so
+        the file is rewritten once: current header, existing rows padded.
+
+        The original is kept alongside as .bak before anything is written.
+        """
+        try:
+            with open(self.calibration_log_file, "r", newline="", encoding="utf-8") as f:
+                rows = list(csv.reader(f))
+        except Exception as e:
+            print("Could not read %s to check its columns: %s"
+                  % (self.calibration_log_file, str(e)))
+            return False
+
+        if not rows:
+            return True
+
+        header = rows[0]
+
+        if header == CAL_LOG_COLUMNS:
+            return True
+
+        # Only ever widen a header this file is already a prefix of. Anything
+        # else is a file this code did not write, and guessing what its columns
+        # mean would corrupt it.
+        if header != CAL_LOG_COLUMNS[:len(header)]:
+            print("Refusing to touch %s: its header is not one this version "
+                  "recognises (%s)" % (self.calibration_log_file, ",".join(header)))
+            return False
+
+        width = len(CAL_LOG_COLUMNS)
+        padded = [row + [""] * (width - len(row)) for row in rows[1:]]
+        backup = self.calibration_log_file + ".bak"
+
+        try:
+            shutil.copyfile(self.calibration_log_file, backup)
+            with open(self.calibration_log_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(CAL_LOG_COLUMNS)
+                writer.writerows(padded)
+        except Exception as e:
+            print("Failed to bring %s up to the current columns: %s"
+                  % (self.calibration_log_file, str(e)))
+            return False
+
+        print("Added %d columns to %s (%d rows padded, original kept as %s)"
+              % (width - len(header), self.calibration_log_file, len(padded), backup))
+        return True
     # def
 
     def log_calibration(self):
@@ -2825,6 +4113,8 @@ class FourSliderGUI:
                 right_max,
                 right_trim,
                 folding,
+                self.backlash_for_log("LEFT"),
+                self.backlash_for_log("RIGHT"),
             ]
 
             # The header and the row drifted apart once already; refuse rather
@@ -2836,6 +4126,9 @@ class FourSliderGUI:
                 return
 
             file_exists = os.path.exists(self.calibration_log_file)
+
+            if file_exists and not self.migrate_calibration_log():
+                return
 
             with open(self.calibration_log_file, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -2900,7 +4193,15 @@ class FourSliderGUI:
     # def
 
     def set_side_param_and_refresh(self, side, param_name, py_type, value):
+        """Write a parameter and show what the FC read back. False if it failed.
+
+        Callers must check the result. A failed MIN or MAX write leaves the
+        calibration computing endpoints against a span the FC is not using, and
+        every number after it is wrong with nothing to show for it.
+        """
         ok = self.drone_interface.set_param_value(param_name, py_type, value)
+        if not ok:
+            print("%s calibration: failed to write %s" % (side, param_name))
         self.refresh_side_param_vars_from_drone(side)
         return ok
     # def
@@ -3063,12 +4364,15 @@ class FourSliderGUI:
 
     def centre_left(self):
         print("Centering LEFT...")
-        self.position_reader.set_center("LEFT")
+        # Only a centring that had data to work with clears the gate.
+        self.left_zeroed = bool(self.position_reader.set_center("LEFT"))
+        self.refresh_setup_gate()
     # def
 
     def centre_right(self):
         print("Centering RIGHT...")
-        self.position_reader.set_center("RIGHT")
+        self.right_zeroed = bool(self.position_reader.set_center("RIGHT"))
+        self.refresh_setup_gate()
     # def
 
     def get_side_angle(self, side):
@@ -3118,9 +4422,12 @@ class FourSliderGUI:
         pwm_max = max(pwm_neg, pwm_pos)
 
         print("%s automatic calibration loading Min[%d] Max[%d]" % (side, pwm_min, pwm_max))
-        self.set_side_param_and_refresh(side, min_param, int, pwm_min)
-        self.set_side_param_and_refresh(side, max_param, int, pwm_max)
-        return True
+
+        # Checked, not fired and forgotten: everything downstream assumes the FC
+        # is using this span.
+        if not self.set_side_param_and_refresh(side, min_param, int, pwm_min):
+            return False
+        return self.set_side_param_and_refresh(side, max_param, int, pwm_max)
     # def
 
     def get_side_expected_pwm(self, side, cmd):
@@ -3176,12 +4483,15 @@ class FourSliderGUI:
         result = self.drone_interface.command_elevon(output_function, 0.0, wait_ack=True)
 
         if self.actuator_test_rejected(side, result):
+            self._cal_fail(side, "sweep", "actuator_refused",
+                           refusal=self.drone_interface.describe_mav_result(result))
             return None
 
         time.sleep(1.0)
 
         cmd = 0.0
         ticks = 0
+        last_angle = None
         deadline = time.time() + 60.0
 
         while time.time() < deadline:
@@ -3193,8 +4503,11 @@ class FourSliderGUI:
             angle_deg = self.get_side_angle(side)
 
             if angle_deg is None:
+                last_angle = None
                 time.sleep(0.25)
                 continue
+
+            last_angle = angle_deg
 
             print("%s calibration move: cmd=%.3f angle_deg=%.2f deg target=%.2f deg" %
                   (side, cmd, angle_deg, target_angle_deg))
@@ -3227,114 +4540,826 @@ class FourSliderGUI:
                 output_function, cmd, wait_ack=check_ack, ack_timeout=0.3)
 
             if check_ack and self.actuator_test_rejected(side, result):
+                self._cal_fail(side, "sweep", "actuator_refused",
+                               refusal=self.drone_interface.describe_mav_result(result))
                 return None
 
             if (inc_angle_deg < 0.0 and cmd <= -1.0) or (inc_angle_deg > 0.0 and cmd >= 1.0):
                 print("%s calibration move: hit command limit before reaching target" % side)
+                self._cal_fail(side, "sweep", "command_exhausted",
+                               target=target_angle_deg, command=cmd,
+                               angle=angle_deg)
                 return None
 
             time.sleep(0.25)
 
         print("%s calibration move: timed out before reaching target" % side)
+        if last_angle is None:
+            self._cal_fail(side, "sweep", "no_angle")
+        else:
+            self._cal_fail(side, "sweep", "creep_timeout",
+                           target=target_angle_deg, angle=last_angle)
         return None
     # def
 
-    def _left_calibration_worker(self):
-        self.left_cal_active = True
-        side = "LEFT"
-        output_function = self.LEFT_OUTPUT_FUNCTION
-        min_param = self.LEFT_MIN_PARAM
-        max_param = self.LEFT_MAX_PARAM
-        trim_param = self.LEFT_TRIM_PARAM
+    # ---- End stop calibration (the procedure in SERVO_SETTING.md) ------------
+
+    def side_calibration_params(self, side):
+        if side == "LEFT":
+            return (self.LEFT_OUTPUT_FUNCTION, self.LEFT_MIN_PARAM,
+                    self.LEFT_MAX_PARAM, self.LEFT_TRIM_PARAM)
+        return (self.RIGHT_OUTPUT_FUNCTION, self.RIGHT_MIN_PARAM,
+                self.RIGHT_MAX_PARAM, self.RIGHT_TRIM_PARAM)
+    # def
+
+    def set_calibration_active(self, side, active):
+        if side == "LEFT":
+            self.left_cal_active = active
+        else:
+            self.right_cal_active = active
+    # def
+
+    def set_side_backlash(self, side, lash_deg):
+        if side == "LEFT":
+            self.left_backlash_deg = lash_deg
+        else:
+            self.right_backlash_deg = lash_deg
+    # def
+
+    def side_backlash(self, side):
+        return self.left_backlash_deg if side == "LEFT" else self.right_backlash_deg
+    # def
+
+    def _cal_write_param(self, side, output_function, param_name, py_type,
+                         value, hold_command):
+        """Write a parameter, then put the surface back where it belongs.
+
+        A write is a set plus its verify plus three readback round trips, which
+        takes longer than the ~2 s the actuator override survives, so the FC
+        reclaims the outputs part way through and parks the surface. Nothing can
+        hold it across a blocking write, but re-commanding immediately
+        afterwards means the next move starts from a known place instead of
+        wherever the FC left it.
+        """
+        ok = self.set_side_param_and_refresh(side, param_name, py_type, value)
+        self.drone_interface.command_elevon(output_function, hold_command)
+        return ok
+    # def
+
+    def _cal_approach(self, side, output_function, which, rev,
+                      dwell_s=ENDPOINT_DWELL_S):
+        """Park at the far end, then drive to `which` in one move and measure.
+
+        Self-contained deliberately. How far a surface travelled to reach an end
+        stop changes where it settles - by 1.7 deg on one airframe and about
+        5 deg on another - so two measurements taken after different run-ups are
+        not comparable, and a calibration that mixes them will accept one and be
+        contradicted by the next.
+
+        Parking here rather than relying on the caller's sequencing means every
+        measurement in the procedure - refinement and verification alike - is
+        taken the same way, whatever order the calibration happens to visit the
+        ends in.
+        """
+        far = "MIN" if which == "MAX" else "MAX"
+        return self._cal_approach_command(side, output_function,
+                                          endpoint_command(which, rev),
+                                          endpoint_command(far, rev), dwell_s)
+    # def
+
+    def _cal_approach_command(self, side, output_function, command,
+                              park_command, dwell_s=ENDPOINT_DWELL_S):
+        """Park, then drive to `command` in one move and measure there.
+
+        The one implementation of measure-after-a-run-up. The end stops park at
+        the opposite end stop; the trim point parks at cmd -1 or cmd +1 to
+        measure the same command from each side. Either way the reading is
+        taken after a full traverse, which is the only way two of them are
+        comparable.
+        """
+        self._cal_measure(side, output_function, park_command, dwell_s)
+        return self._cal_measure(side, output_function, command, dwell_s)
+    # def
+
+    def _cal_measure(self, side, output_function, command,
+                     dwell_s=ENDPOINT_DWELL_S):
+        """Drive to a command in one motion, hold, and read the settled angle.
+
+        The dwell is longer than POSITION_WINDOW_S so the trailing mean contains
+        only post-move samples, and the hold re-sends the command so the FC
+        cannot take the surface back part way through - the override lapses
+        after about 2 s whatever timeout is requested.
+
+        Short by design. Lingering on a surface that may be against a mechanical
+        stop is exactly what the back-off probe exists to avoid.
+        """
+        self.drone_interface.command_elevon(output_function, command)
+        self._hold([side], command, dwell_s)
+        return self.get_side_angle(side)
+    # def
+
+    def _cal_probe_breakaway(self, side, output_function, which, span,
+                             rev, cmd_endpoint, angle_at_endpoint):
+        """Back off inward until the elevon moves. (microseconds, angle there).
+
+        Answers two questions at once. Whether the surface still has authority
+        at this end stop - if a range of PWM values all produce the same angle
+        it is jammed and the value written there means nothing - and what the
+        local deg/us gain is, which is what the correction needs. Taking the
+        gain from the probe rather than assuming it means the sign falls out of
+        the measurement, so nothing has to know which way the servo is wired.
+
+        Every step is a full dwell, so a probe that runs to the ceiling costs
+        twenty of them - about sixteen seconds. That is why it reports each
+        step to the chart rather than only its result: sixteen seconds of a
+        node sitting still is indistinguishable from a hung run.
+        """
+        pwm_min, pwm_max = span
+        backed = 0.0
+        node = cal_flow.node_for(which, "travel")
+
+        while backed < BACKOFF_CEILING_US:
+            if not self.is_calibration_active(side):
+                return None, None
+
+            backed += BACKOFF_STEP_US
+            self._cal_note(side, node, "backed off %.0f us" % backed)
+            delta = command_delta_for_pwm(inward_sign(which) * backed,
+                                          pwm_min, pwm_max, rev)
+            command = self.clamp(cmd_endpoint + delta, -1.0, 1.0)
+
+            angle = self._cal_measure(side, output_function, command)
+            if angle is None:
+                print("%s calibration: no angle while probing %s" % (side, which))
+                # Distinguished from the ceiling case below, which returns the
+                # same pair. A surface the reader lost sight of has said
+                # nothing about whether it can move, and blaming stiction for
+                # what is a sensor or link fault sends the operator to the
+                # wrong end of the rig.
+                self._cal_fail(side, node, "no_angle_at_stop", which=which.title())
+                return None, None
+
+            if abs(angle - angle_at_endpoint) >= MOVEMENT_THRESHOLD_DEG:
+                return backed, angle
+
+        return None, None
+    # def
+
+    def _cal_evaluate_endpoint(self, side, output_function, which, pwm_now,
+                               targets, span, rev, anchor_pwm=None):
+        """One rapid approach: measure, probe if it is worth it, and decide.
+
+        anchor_pwm is where the coarse creep put this end. Every new value is
+        clamped against it, against the servo band, and against the other end -
+        see clamp_endpoint().
+        """
+        command = endpoint_command(which, rev)
+        target_deg = targets[which]
+        other_deg = targets["MIN" if which == "MAX" else "MAX"]
+        other_pwm = span[1] if which == "MIN" else span[0]
+        nominal = nominal_gain_deg_per_us(targets["MAX"], targets["MIN"],
+                                          span[0], span[1])
+
+        def bounded(value):
+            return clamp_endpoint(value, which, other_pwm, anchor_pwm)
+
+        angle = self._cal_approach(side, output_function, which, rev)
+        if angle is None:
+            print("%s calibration: no angle at the %s end stop" % (side, which))
+            self._cal_fail(side, cal_flow.node_for(which, "find"),
+                           "no_angle_at_stop", which=which.title())
+            return None
+
+        # Past target: it has travel to spare, so there is nothing a stop check
+        # could tell us and the correction is already determined. Pull it in on
+        # the average gain and measure properly on the next pass, which lands
+        # near target.
+        if overshot_target(angle, target_deg, other_deg):
+            gain = nominal
+            shift = limit_correction(correction_us(angle, target_deg, gain))
+            # stop_kind stays free even though breakaway_us is None: this
+            # branch never probed. Reading "no breakaway" off the None here is
+            # how a healthy endpoint several corrections from target would get
+            # blamed for stiction.
+            result = {"which": which, "angle_deg": angle,
+                      "target_deg": target_deg, "hard_stop": False,
+                      "stop_kind": STOP_FREE,
+                      "breakaway_us": None, "probed": False, "gain": gain,
+                      "new_pwm": None, "accepted": False}
+
+            if shift is None:
+                print("%s calibration: %s has no usable span" % (side, which))
+                self._cal_fail(side, cal_flow.node_for(which, "find"), "no_gain")
+                return result
+
+            result["new_pwm"] = bounded(pwm_now + shift)
+            print("%s calibration: %s at %+.2f deg, %+.2f past target - "
+                  "shifting %+.0f us without a stop check"
+                  % (side, which, angle, angle - target_deg, shift))
+            return result
+
+        breakaway, angle_backed = self._cal_probe_breakaway(
+            side, output_function, which, span, rev, command, angle)
+
+        if not self.is_calibration_active(side):
+            return None
+
+        stop_kind, pull_in = stop_verdict(breakaway)
+        is_hard_stop = stop_kind != STOP_FREE
+        probed = (None if breakaway is None
+                  else angle_gain_per_us(angle, angle_backed, breakaway, which))
+        gain, gain_source = usable_gain(probed, nominal)
+        if gain_source.startswith("nominal (") and probed:
+            print("%s calibration: %s probe gave %+.4f deg/us against %+.4f "
+                  "nominal - correcting on the nominal gain"
+                  % (side, which, probed, nominal))
+
+        result = {"which": which, "angle_deg": angle, "target_deg": target_deg,
+                  "hard_stop": is_hard_stop, "stop_kind": stop_kind,
+                  "breakaway_us": breakaway,
+                  "probed": True, "gain": gain, "new_pwm": None,
+                  "accepted": endpoint_accepted(angle, target_deg, is_hard_stop)}
+
+        travel_node = cal_flow.node_for(which, "travel")
+
+        if result["accepted"]:
+            print("%s calibration: %s at %+.2f deg (target %+.2f) - set"
+                  % (side, which, angle, target_deg))
+            self._cal_done_step(side, travel_node,
+                                "broke away at %.0f us" % breakaway)
+            return result
+
+        if is_hard_stop:
+            result["new_pwm"] = bounded(pwm_now + inward_sign(which) * pull_in)
+            print("%s calibration: %s is against a stop - %s of inward travel did "
+                  "not move it. Pulling in %.0f us."
+                  % (side, which,
+                     "no amount" if breakaway is None else "%.0f us" % breakaway,
+                     pull_in))
+            if stop_kind == STOP_UNCONFIRMED:
+                self._cal_warn_step(side, travel_node,
+                                    "unconfirmed - pulled in %.0f us" % pull_in)
+            else:
+                self._cal_warn_step(side, travel_node,
+                                    "against a stop at %.0f us" % breakaway)
+            return result
+
+        self._cal_done_step(side, travel_node,
+                            "broke away at %.0f us" % breakaway)
+
+        shift = limit_correction(correction_us(angle, target_deg, gain))
+        if shift is None:
+            print("%s calibration: %s gave no usable gain" % (side, which))
+            self._cal_fail(side, cal_flow.node_for(which, "find"), "no_gain")
+            return result
+
+        result["new_pwm"] = bounded(pwm_now + shift)
+        print("%s calibration: %s at %+.2f deg, %+.2f out - shifting %+.0f us"
+              % (side, which, angle, angle - target_deg, shift))
+        return result
+    # def
+
+    def _cal_refine_endpoints(self, side, output_function, min_param, max_param,
+                              endpoints, rev):
+        """Alternate MAX, MIN until both are set. Endpoints, or None on failure.
+
+        Alternating costs nothing: the traverse across to the other end *is* the
+        next rapid approach. It is also primed with one unmeasured traverse, so
+        the opening measurement has the same full-span run-up as every later
+        one - approach distance was measured to be worth 1.7 deg.
+        """
+        pwm = {which: value for which, (value, _target) in endpoints.items()}
+        targets = {which: target for which, (_value, target) in endpoints.items()}
+        anchors = dict(pwm)
+
+        attempts = {"MAX": 0, "MIN": 0}
+        accepted = {"MAX": False, "MIN": False}
+        last_error = {"MAX": None, "MIN": None}
+        growths = {"MAX": 0, "MIN": 0}
+        unconfirmed = {"MAX": 0, "MIN": 0}
+        best_error = {"MAX": None, "MIN": None}
+
+        self._cal_measure(side, output_function, endpoint_command("MIN", rev))
+
+        for which in ("MAX", "MIN"):
+            self._cal_start_step(side, cal_flow.node_for(which, "find"),
+                                 "waiting to start")
+
+        for which in alternating_order(MAX_ATTEMPTS):
+            if accepted["MAX"] and accepted["MIN"]:
+                break
+            if accepted[which]:
+                continue
+            if not self.is_calibration_active(side):
+                return None
+
+            find_node = cal_flow.node_for(which, "find")
+            travel_node = cal_flow.node_for(which, "travel")
+
+            attempts[which] += 1
+            if attempts[which] > MAX_ATTEMPTS:
+                print("%s calibration: %s did not settle in %d attempts"
+                      % (side, which, MAX_ATTEMPTS))
+                self._cal_fail(side, find_node, "no_settle",
+                               attempts=MAX_ATTEMPTS, which=which.title(),
+                               error=abs(best_error[which] or 0.0),
+                               tolerance=ENDPOINT_TOLERANCE_DEG)
+                return None
+
+            self._cal_start_step(side, find_node,
+                                 "attempt %d of %d" % (attempts[which],
+                                                       MAX_ATTEMPTS))
+            self._cal_start_step(side, travel_node, "approaching")
+
+            span = (pwm["MIN"], pwm["MAX"])
+            result = self._cal_evaluate_endpoint(
+                side, output_function, which, pwm[which], targets, span, rev,
+                anchors[which])
+
+            if result is None:
+                # Either a stop, or a failure the evaluation already named.
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
+                return None
+
+            if result["accepted"]:
+                accepted[which] = True
+                last_error[which] = 0.0
+                best_error[which] = 0.0
+                growths[which] = 0
+                self._cal_done_step(
+                    side, find_node,
+                    "%d us  %+.2f deg" % (pwm[which], result["angle_deg"]))
+                continue
+
+            # Two probes in a row that could not confirm the surface moved,
+            # the second taken after the endpoint has already been pulled in
+            # by the full ceiling. A pinned end stop would have come free over
+            # that distance; a surface that still will not move is held by
+            # friction, and pulling the end stop in again would only throw
+            # away another 210 us of travel to hide it.
+            if result.get("stop_kind") == STOP_UNCONFIRMED:
+                unconfirmed[which] += 1
+                if unconfirmed[which] >= UNCONFIRMED_ATTEMPTS:
+                    print("%s calibration: %s could not be confirmed off its "
+                          "stop %d times running - stiction, not a stop"
+                          % (side, which, unconfirmed[which]))
+                    self._cal_fail(side, travel_node, "free_travel_unconfirmed",
+                                   ceiling=BACKOFF_CEILING_US,
+                                   threshold=MOVEMENT_THRESHOLD_DEG)
+                    return None
+            else:
+                unconfirmed[which] = 0
+
+            # A correction that leaves the end stop further out than it found it
+            # is the correction going the wrong way, and it does not get better
+            # by being applied again. One growth can be noise on a surface that
+            # is nearly there; two in a row ends the run while the endpoint is
+            # still somewhere sane.
+            error = result["angle_deg"] - result["target_deg"]
+            previous = last_error[which]
+            growths[which] = (growths[which] + 1
+                              if error_grew(previous, error) else 0)
+            last_error[which] = error
+            if best_error[which] is None or abs(error) < abs(best_error[which]):
+                best_error[which] = error
+
+            if has_diverged(growths[which]):
+                print("%s calibration: %s is diverging - %+.2f deg out after "
+                      "%+.2f deg on the previous attempt. Stopping with the end "
+                      "stops where they are." % (side, which, error, previous))
+                self._cal_fail(side, find_node, "diverging",
+                               error=error, previous=previous)
+                return None
+
+            if result["new_pwm"] is None:
+                if not self._cal_failed_already(side):
+                    self._cal_fail(side, find_node, "no_gain")
+                return None
+
+            if result["new_pwm"] == pwm[which]:
+                print("%s calibration: %s is against its limit at %d us and "
+                      "still %+.2f deg out" % (side, which, pwm[which], error))
+                self._cal_fail(side, find_node, "at_limit", which=which.title(),
+                               pwm=pwm[which], error=error,
+                               target=result["target_deg"])
+                return None
+
+            pwm[which] = result["new_pwm"]
+            self._cal_note(side, find_node,
+                           "attempt %d - moving to %d us"
+                           % (attempts[which], pwm[which]))
+            param = max_param if which == "MAX" else min_param
+            if not self._cal_write_param(side, output_function, param, int,
+                                         pwm[which], endpoint_command(which, rev)):
+                self._cal_fail(side, find_node, "param_write",
+                               param=param, value=str(pwm[which]))
+                return None
+
+        if not (accepted["MAX"] and accepted["MIN"]):
+            print("%s calibration: ran out of attempts" % side)
+            which = "MAX" if not accepted["MAX"] else "MIN"
+            self._cal_fail(side, cal_flow.node_for(which, "find"), "no_settle",
+                           attempts=MAX_ATTEMPTS, which=which.title(),
+                           error=abs(best_error[which] or 0.0),
+                           tolerance=ENDPOINT_TOLERANCE_DEG)
+            return None
+
+        return pwm
+    # def
+
+    def _cal_trim_point(self, side, output_function, targets, rev):
+        """Find the command that sits on the trim angle. (command, lash) or None.
+
+        Set from one approach direction, TRIM_APPROACH_CMD, because these
+        servos have more backlash than any band worth accepting could close.
+        Requiring both directions to land on target would loop until it ran
+        out of attempts and write nothing. So the trim point *is* the angle
+        reached arriving from that side, and the other side is measured once at
+        the end and reported as the lash it is.
+
+        Every reading is taken after a full traverse out to the approach
+        command, for the same reason the end stops are: an angle held while
+        creeping up to it is not the angle that command produces when the
+        surface is driven there, and the creep this replaces was out by about
+        4 deg on that alone.
+
+        Runs with trim 0 still in the flight controller. Once a trim is written
+        cmd +-1 no longer reaches the end stops and the parks this depends on
+        would stop being parks, so the command is carried here and only written
+        once it is accepted.
+        """
+        target = self.angle_trim_degs
+
+        # The two accepted end stops are known (command, angle) pairs at cmd -1
+        # and cmd +1. Reversed, cmd -1 is the MAX end - which is why the
+        # estimate is given the angles by command, not by end stop name.
+        angle_at_neg = targets["MAX"] if rev else targets["MIN"]
+        angle_at_pos = targets["MIN"] if rev else targets["MAX"]
+
+        nominal = command_gain_deg(angle_at_neg, angle_at_pos)
+        cmd_trim = trim_estimate(target, angle_at_neg, angle_at_pos)
+
+        if cmd_trim is None:
+            print("%s trim: the end stops give no usable travel" % side)
+            return None
+
+        print("%s trim: target %+.2f deg, approaching from cmd %+.0f, "
+              "starting at cmd %+.3f"
+              % (side, target, TRIM_APPROACH_CMD, cmd_trim))
+
+        previous_cmd = None
+        previous_angle = None
+        last_error = None
+        growths = 0
+
+        for attempt in range(1, TRIM_ATTEMPTS + 1):
+            if not self.is_calibration_active(side):
+                return None
+
+            angle = self._cal_approach_command(side, output_function, cmd_trim,
+                                               TRIM_APPROACH_CMD)
+            if angle is None:
+                print("%s trim: no angle at the trim point" % side)
+                return None
+
+            error = angle - target
+            print("%s trim: attempt %d at cmd %+.3f reached %+.2f deg, "
+                  "%+.2f out" % (side, attempt, cmd_trim, angle, error))
+
+            if trim_accepted(angle, target):
+                # A backlash that could not be read leaves the trim standing:
+                # it is a measurement taken after the fact, not a condition of
+                # the trim being right, and it logs blank.
+                lash = self._cal_measure_backlash(side, output_function,
+                                                  cmd_trim, angle)
+                print("%s trim: set at cmd %+.3f - %+.2f deg from cmd %+.0f, "
+                      "within %.2f deg of %+.2f"
+                      % (side, cmd_trim, angle, TRIM_APPROACH_CMD,
+                         TRIM_TOLERANCE_DEG, target))
+                return cmd_trim, lash
+
+            previous_error = last_error
+            growths = growths + 1 if trim_error_grew(last_error, error) else 0
+            last_error = error
+
+            if trim_has_diverged(growths):
+                print("%s trim: diverging - %+.2f deg out after %+.2f deg on "
+                      "the previous attempt. Stopping."
+                      % (side, error, previous_error))
+                self._cal_fail(side, "trim", "trim_diverging",
+                               error=error, previous=previous_error)
+                return None
+
+            gain = trim_gain_deg(previous_cmd, previous_angle, cmd_trim, angle,
+                                 nominal)
+            delta = limit_trim_correction(trim_correction(angle, target, gain))
+
+            if delta is None:
+                print("%s trim: no usable gain" % side)
+                self._cal_fail(side, "trim", "no_gain")
+                return None
+
+            new_cmd = clamp_trim(cmd_trim + delta)
+
+            if abs(new_cmd - cmd_trim) < 1e-6:
+                print("%s trim: pinned at cmd %+.3f and still %+.2f deg out"
+                      % (side, cmd_trim, error))
+                self._cal_fail(side, "trim", "trim_pinned",
+                               command=cmd_trim, error=error)
+                return None
+
+            previous_cmd, previous_angle = cmd_trim, angle
+            cmd_trim = new_cmd
+
+        print("%s trim: did not settle in %d attempts" % (side, TRIM_ATTEMPTS))
+        self._cal_fail(side, "trim", "trim_no_settle", attempts=TRIM_ATTEMPTS,
+                       error=abs(last_error if last_error is not None else 0.0),
+                       tolerance=TRIM_TOLERANCE_DEG)
+        return None
+    # def
+
+    def _cal_measure_backlash(self, side, output_function, cmd_trim,
+                              angle_from_approach):
+        """Drive to the same command from the other side and report the lash.
+
+        Measured once, after the trim is accepted, rather than every attempt:
+        it plays no part in the acceptance, so measuring it each time round
+        would be two traverses spent on a number that does not change.
+
+        This is the figure that says where the surface actually sits when it
+        arrives the other way. It is a property of the servo and the linkage -
+        no trim value makes it smaller - so it is logged, not corrected.
+        """
+        opposite = -TRIM_APPROACH_CMD
+        angle = self._cal_approach_command(side, output_function, cmd_trim,
+                                           opposite)
+
+        if angle is None:
+            print("%s trim: no angle approaching from cmd %+.0f" % (side, opposite))
+            return None
+
+        lash = backlash_deg(angle_from_approach, angle)
+        print("%s trim: backlash %+.2f deg - the same command reads %+.2f deg "
+              "arriving from cmd %+.0f against %+.2f from cmd %+.0f"
+              % (side, lash, angle, opposite, angle_from_approach,
+                 TRIM_APPROACH_CMD))
+        return lash
+    # def
+
+    def _cal_report_trim_cost(self, side, cmd_trim, pwm, rev):
+        """What the written trim costs the travel, in the units it costs it in.
+
+        PX4 computes clamp(cmd + trim, -1, +1), so a trim shortens one end and
+        deafens the other. Both are expected; neither should have to be worked
+        out from the verify that follows.
+        """
+        span = abs(float(pwm["MAX"]) - float(pwm["MIN"]))
+        lost = travel_lost_us(cmd_trim, span)
+        short_end = shortened_endpoint(cmd_trim, rev)
+
+        if short_end is None or lost <= 0.0:
+            print("%s trim: zero trim, the full span is still reached" % side)
+            return
+
+        print("%s trim: cmd %+.3f gives up %.0f us of the %.0f us span at the "
+              "%s end (%.1f%%), and the last %.0f%% of command travel at the "
+              "other end now produces no movement."
+              % (side, cmd_trim, lost, span, short_end, 100.0 * lost / span,
+                 100.0 * dead_band_cmd(cmd_trim)))
+    # def
+
+    def _cal_verify_endpoints(self, side, output_function, pwm, targets, rev,
+                              note=""):
+        """Re-measure both end stops after the fact and report the error.
+
+        A calibration marking its own work proves nothing. This drives each end
+        once more, from the far side, and says what it actually reached - which
+        is the number that says whether the end stops are repeatable.
+
+        Run a second time once the trim is written, where one end is expected
+        to read OUT by the shortfall _cal_report_trim_cost has already printed:
+        that is the trim being paid for, not the end stop being wrong. `note`
+        labels which pass this is.
+        """
+        print("%s calibration: verifying%s" % (side, note))
+        reached = {}
+
+        for which in ("MAX", "MIN"):
+            if not self.is_calibration_active(side):
+                return None
+            angle = self._cal_approach(side, output_function, which, rev)
+            if angle is None:
+                print("%s verify: no angle at %s" % (side, which))
+                return None
+
+            reached[which] = angle
+            error = angle - targets[which]
+            print("%s verify: %s pwm %d reached %+.2f deg, target %+.2f, "
+                  "error %+.2f%s"
+                  % (side, which, pwm[which], angle, targets[which], error,
+                     "" if abs(error) <= ENDPOINT_TOLERANCE_DEG else "  OUT"))
+
+        # The angles themselves, not a single worst-case error: what the
+        # operator wants off this step is what the end stops now reach.
+        return reached
+    # def
+
+    def _calibration_worker(self, side):
+        """Coarse creep to get close, then set each end stop by rapid approach.
+
+        The creep is only ever used to get roughly into range; nothing it
+        measures is committed. An angle held while creeping up to it is not the
+        angle that PWM produces when the surface is driven there normally - on
+        this airframe the two differ by about 4 deg - so every value written
+        here is measured the way the surface is actually used.
+
+        The trim stage below is unchanged and still runs on the narrowed range.
+        It is known to eat travel and is deliberately left alone until the end
+        stops are repeatable; see SERVO_SETTING.md.
+        """
+        self.set_calibration_active(side, True)
+        self.cal_flow[side].reset(time.monotonic())
+        self._cal_publish(side)
+        self.post_to_gui(self.refresh_setup_gate)
+
+        output_function, min_param, max_param, trim_param = \
+            self.side_calibration_params(side)
+        rev = self.is_main_channel_reversed(5 if side == "LEFT" else 6)
+
         try:
             print("%s automatic calibration started" % side)
 
-            self.set_side_param_and_refresh(side, min_param, int, 900)
-            self.set_side_param_and_refresh(side, max_param, int, 2100)
-            self.set_side_param_and_refresh(side, trim_param, float, 0.0)
+            self._cal_start_step(side, "open_range", "opening to 900 / 2100 us")
+            for param, py_type, value in ((min_param, int, COARSE_MIN),
+                                          (max_param, int, COARSE_MAX),
+                                          (trim_param, float, 0.0)):
+                if not self._cal_write_param(side, output_function, param,
+                                             py_type, value, 0.0):
+                    self._cal_fail(side, "open_range", "param_write",
+                                   param=param, value=str(value))
+                    return
+            self._cal_done_step(side, "open_range", "900 / 2100 us")
 
-            if not self.left_cal_active:
+            if not self.is_calibration_active(side):
                 print("%s automatic calibration stopped" % side)
+                self._cal_stopped(side)
                 return
 
-            cmd_neg = self.move_elevon_to_angle(side, output_function, self.angle_neg_degs, -0.01)
-            if not self.left_cal_active or cmd_neg is None:
+            self._cal_start_step(side, "sweep",
+                                 "finding %+.1f deg" % self.angle_neg_degs)
+            cmd_neg = self.move_elevon_to_angle(side, output_function,
+                                                self.angle_neg_degs, -0.01)
+            if not self.is_calibration_active(side) or cmd_neg is None:
                 print("%s automatic calibration stopped before negative endpoint completed" % side)
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
                 return
             pwm_neg = self.get_side_expected_pwm(side, cmd_neg)
 
-            cmd_pos = self.move_elevon_to_angle(side, output_function, self.angle_pos_degs, 0.01)
-            if not self.left_cal_active or cmd_pos is None:
+            self._cal_note(side, "sweep",
+                           "finding %+.1f deg" % self.angle_pos_degs)
+            cmd_pos = self.move_elevon_to_angle(side, output_function,
+                                                self.angle_pos_degs, 0.01)
+            if not self.is_calibration_active(side) or cmd_pos is None:
                 print("%s automatic calibration stopped before positive endpoint completed" % side)
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
                 return
             pwm_pos = self.get_side_expected_pwm(side, cmd_pos)
+            self._cal_done_step(side, "sweep",
+                                "%+.1f and %+.1f deg found"
+                                % (self.angle_neg_degs, self.angle_pos_degs))
 
-            if not self.load_endpoint_params(side, min_param, max_param, pwm_neg, pwm_pos):
+            # load_endpoint_params is borrowed unbound by the StubGUI in
+            # tests/test_calibration_endpoints.py, so it must not reach for
+            # anything on self that a stub would not have. Its reasons are
+            # recorded here instead, from what it returns.
+            self._cal_start_step(side, "load_coarse", "writing min and max")
+            if pwm_neg is None or pwm_pos is None:
+                self.load_endpoint_params(side, min_param, max_param,
+                                          pwm_neg, pwm_pos)
+                self._cal_fail(side, "load_coarse", "pwm_convert")
+                return
+            if not self.load_endpoint_params(side, min_param, max_param,
+                                             pwm_neg, pwm_pos):
+                self._cal_fail(side, "load_coarse", "endpoint_load")
+                return
+            self._cal_done_step(side, "load_coarse",
+                                "%d / %d us" % (min(pwm_neg, pwm_pos),
+                                                max(pwm_neg, pwm_pos)))
+
+            # Which end carries which angle target comes from the measurement,
+            # not from the reverse bit: on a reversed channel the negative angle
+            # sits at the high PWM end, and assuming otherwise mirrors the
+            # calibration silently.
+            if pwm_neg >= pwm_pos:
+                endpoints = {"MAX": (max(pwm_neg, pwm_pos), self.angle_neg_degs),
+                             "MIN": (min(pwm_neg, pwm_pos), self.angle_pos_degs)}
+            else:
+                endpoints = {"MAX": (max(pwm_neg, pwm_pos), self.angle_pos_degs),
+                             "MIN": (min(pwm_neg, pwm_pos), self.angle_neg_degs)}
+
+            targets = {which: target for which, (_v, target) in endpoints.items()}
+
+            pwm = self._cal_refine_endpoints(side, output_function, min_param,
+                                             max_param, endpoints, rev)
+            if pwm is None:
+                print("%s automatic calibration did not set the end stops" % side)
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
                 return
 
-            trim_step = -0.01 if self.angle_trim_degs < 0.0 else 0.01
-            cmd_trim = self.move_elevon_to_angle(side, output_function, self.angle_trim_degs, trim_step)
+            print("%s end stops set: MIN=%d MAX=%d" % (side, pwm["MIN"], pwm["MAX"]))
 
-            if not self.left_cal_active or cmd_trim is None:
+            self._cal_start_step(side, "verify", "re-measuring both ends")
+            reached = self._cal_verify_endpoints(side, output_function, pwm,
+                                                 targets, rev)
+
+            if not self.is_calibration_active(side):
+                self._cal_stopped(side)
+                return
+
+            # Verify has never failed a run and does not start now: it reports
+            # what the ends actually reach, and being out is worth a look
+            # rather than a reason to throw the calibration away.
+            self._cal_verify_step(side, "verify", targets, reached)
+
+            # The trim is found the same way the end stops are - driven to and
+            # measured settled, from a named direction. The creep that used to
+            # set it has the fault this whole procedure exists to fix, and the
+            # trim inherited every degree of it.
+            self._cal_start_step(side, "trim", "approaching from cmd %+.1f"
+                                 % TRIM_APPROACH_CMD)
+            found = self._cal_trim_point(side, output_function, targets, rev)
+
+            if not self.is_calibration_active(side) or found is None:
                 print("%s automatic calibration stopped before trim completed" % side)
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
                 return
 
-            print("%s automatic calibration loading Trim[%.2f]" % (side, cmd_trim))
-            self.set_side_param_and_refresh(side, trim_param, float, cmd_trim)
+            cmd_trim, lash = found
+            self.set_side_backlash(side, lash)
+            self._cal_done_step(side, "trim", "cmd %+.3f, lash %s"
+                                % (cmd_trim,
+                                   "--" if lash is None else "%+.2f deg" % lash))
+
+            print("%s automatic calibration loading Trim[%.3f]" % (side, cmd_trim))
+            self._cal_start_step(side, "write_trim", "writing %s" % trim_param)
+            if not self._cal_write_param(side, output_function, trim_param,
+                                         float, cmd_trim, cmd_trim):
+                self._cal_fail(side, "write_trim", "param_write",
+                               param=trim_param, value="%+.3f" % cmd_trim)
+                return
+            self._cal_done_step(side, "write_trim", "%+.3f" % cmd_trim)
+
+            # What the trim costs, then what the ends actually reach with it
+            # applied. One of them is expected to read OUT by the shortfall
+            # reported here - that is the price of the trim, printed before the
+            # verify rather than left to be inferred from it.
+            self._cal_report_trim_cost(side, cmd_trim, pwm, rev)
+            self._cal_start_step(side, "verify_trim", "re-measuring both ends")
+            reached = self._cal_verify_endpoints(side, output_function, pwm,
+                                                 targets, rev,
+                                                 note=" with the trim applied")
+
+            # One end is expected to fall short here, by exactly the travel the
+            # trim spent - which is why this reports both angles rather than an
+            # error. "MAX +35.0->+28.4" says what the surface now reaches; a
+            # worst-case error would leave the reader to work that out.
+            self._cal_verify_step(side, "verify_trim", targets, reached)
 
             print("%s automatic calibration finished" % side)
+            self.cal_flow[side].complete(time.monotonic())
+            self._cal_publish(side)
+
+        except Exception as e:
+            # Without this the traceback goes to the real stderr, which the
+            # print shim does not capture, and the run simply stops being
+            # mentioned. That was survivable while the log was the only
+            # display; a node left spinning on the chart is not.
+            print("%s automatic calibration failed: %s" % (side, str(e)))
+            traceback.print_exc()
+            self._cal_fail_running(side, str(e))
         finally:
-            self.left_cal_active = False
-            self.drone_interface.command_elevon(output_function, 0.0)
+            # Marked before the elevon command, which can raise once the window
+            # has closed and drone_interface is shut - an exception escaping
+            # the finally would replace the one being recorded.
+            self.set_calibration_active(side, False)
+            self.post_to_gui(self.refresh_setup_gate)
+            try:
+                self.drone_interface.command_elevon(output_function, 0.0)
+            except Exception as e:
+                print("%s could not centre after calibration: %s" % (side, str(e)))
+    # def
+
+    def _left_calibration_worker(self):
+        self._calibration_worker("LEFT")
     # def
 
     def _right_calibration_worker(self):
-        self.right_cal_active = True
-        side = "RIGHT"
-        output_function = self.RIGHT_OUTPUT_FUNCTION
-        min_param = self.RIGHT_MIN_PARAM
-        max_param = self.RIGHT_MAX_PARAM
-        trim_param = self.RIGHT_TRIM_PARAM
-        try:
-            print("%s automatic calibration started" % side)
-
-            self.set_side_param_and_refresh(side, min_param, int, 900)
-            self.set_side_param_and_refresh(side, max_param, int, 2100)
-            self.set_side_param_and_refresh(side, trim_param, float, 0.0)
-
-            if not self.right_cal_active:
-                print("%s automatic calibration stopped" % side)
-                return
-
-            cmd_neg = self.move_elevon_to_angle(side, output_function, self.angle_neg_degs, -0.01)
-            if not self.right_cal_active or cmd_neg is None:
-                print("%s automatic calibration stopped before negative endpoint completed" % side)
-                return
-            pwm_neg = self.get_side_expected_pwm(side, cmd_neg)
-
-            cmd_pos = self.move_elevon_to_angle(side, output_function, self.angle_pos_degs, 0.01)
-            if not self.right_cal_active or cmd_pos is None:
-                print("%s automatic calibration stopped before positive endpoint completed" % side)
-                return
-            pwm_pos = self.get_side_expected_pwm(side, cmd_pos)
-
-            if not self.load_endpoint_params(side, min_param, max_param, pwm_neg, pwm_pos):
-                return
-
-            trim_step = -0.01 if self.angle_trim_degs < 0.0 else 0.01
-            cmd_trim = self.move_elevon_to_angle(side, output_function, self.angle_trim_degs, trim_step)
-
-            if not self.right_cal_active or cmd_trim is None:
-                print("%s automatic calibration stopped before trim completed" % side)
-                return
-
-            print("%s automatic calibration loading Trim[%.2f]" % (side, cmd_trim))
-            self.set_side_param_and_refresh(side, trim_param, float, cmd_trim)
-
-            print("%s automatic calibration finished" % side)
-        finally:
-            self.right_cal_active = False
-            self.drone_interface.command_elevon(output_function, 0.0)
+        self._calibration_worker("RIGHT")
     # def
 
     def _start_left_calibration_worker(self):
@@ -3364,11 +5389,17 @@ class FourSliderGUI:
     # def
 
     def start_left_calibration(self):
+        if not self.require_setup("automatic calibration"):
+            return
+
         self.zero_side_slider("LEFT")
         self._start_left_calibration_worker()
     # def
 
     def start_right_calibration(self):
+        if not self.require_setup("automatic calibration"):
+            return
+
         self.zero_side_slider("RIGHT")
         self._start_right_calibration_worker()
     # def
@@ -3679,12 +5710,12 @@ class FourSliderGUI:
 
         try:
             if not self.left_cal_active and not self.sweep_active \
-                    and not self.range_test_active:
+                    and not self.measure_active:
                 left_cmd = float(self.left_pos.get())
                 self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, left_cmd)
 
             if not self.right_cal_active and not self.sweep_active \
-                    and not self.range_test_active:
+                    and not self.measure_active:
                 right_cmd = float(self.right_pos.get())
                 self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, right_cmd)
 
@@ -3723,10 +5754,10 @@ class FourSliderGUI:
         self.left_cal_active = False
         self.right_cal_active = False
         self.sweep_active = False
-        self.range_test_active = False
+        self.measure_active = False
 
         for thread in (self.left_cal_thread, self.right_cal_thread,
-                       self.sweep_thread, self.range_test_thread):
+                       self.sweep_thread, self.measure_thread):
             if thread is not None and thread.is_alive():
                 thread.join(2.0)
 
