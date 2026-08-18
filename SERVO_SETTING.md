@@ -1,11 +1,13 @@
 # Servo end stop setting procedure
 
-How the elevon PWM end stops are set on the Manta rig, and why the procedure is
-built the way it is. This describes the two-stage method implemented in
-`endpoint_cal.py`. It replaces the single-pass creep in `MantaTrimmer.py`, which
-is still in place and still has the fault described below.
+How the elevon PWM end stops and the trim point are set on the Manta rig, and
+why the procedure is built the way it is. It replaces the single-pass creep the
+calibration used to do, which has the fault described below.
 
-Trim is deliberately out of scope. See [Trim](#trim-is-not-covered).
+Stages 1 and 2 set the end stops and run in both the trim tab of
+`MantaTrimmer.py` and the `endpoint_cal.py` diagnostic, from the same decision
+logic in `endpoint_logic.py`. [Stage 3](#stage-3--the-trim-point) sets the trim
+point and is the trim tab only, from `trim_logic.py`.
 
 ---
 
@@ -192,6 +194,78 @@ It also stops early, on the same terms, when:
 
 ---
 
+## Stage 3 — the trim point
+
+The trim used to be set by the same creep as the old end stops, and inherited
+the same fault: about 4° between the angle a surface holds while being crept up
+to and the angle that command produces when it is driven there.
+
+It is now found the same way the end stops are — driven to, from a known
+direction, and measured settled.
+
+### One direction, not two
+
+**The trim point is defined as the angle reached arriving from `cmd +1`.**
+
+Requiring both approach directions to land on target was tried and cannot be
+met: there is more backlash in these servos than any band worth accepting could
+close, so a two-sided test loops until it runs out of attempts and writes
+nothing. The opposite approach is measured once, at the end, and **reported as
+backlash** — it is a property of the servo and the linkage, and no trim value
+makes it smaller.
+
+### The procedure
+
+1. Runs with **trim 0 still in the flight controller**. Once a trim is written
+   `cmd ±1` no longer reaches the end stops, and the parks this depends on stop
+   being parks. The command is carried through the search and only written when
+   it is accepted.
+2. The **starting estimate** comes from the two accepted end stops — they are
+   known (command, angle) pairs at `cmd −1` and `cmd +1`, so the trim command
+   falls straight out of them. No creep needed to find it.
+3. Each attempt: traverse out to `cmd +1`, then drive to the trim command in
+   one move and measure it settled.
+4. Correct by `−error ÷ gain`. The first attempt uses the gain implied by the
+   two end stops; after that the **secant** between consecutive attempts, which
+   measures the gain where the trim actually sits. Both readings come from the
+   same approach, so the lash is common to them and cancels in the difference.
+   The secant is checked against the nominal gain exactly as the back-off
+   probe's is — same sign, within 0.3× to 3×.
+5. **Accepted at 0.25°** on that approach. Then one traverse to `cmd −1` and
+   back to the same command to measure the backlash.
+
+### Failure
+
+Eight attempts. It also stops early when the error grows on two consecutive
+attempts, or when the correction is pinned against its bound and the trim is
+still out. Nothing is written in either case.
+
+### What the trim costs
+
+PX4 computes `clamp(cmd + trim, −1, +1)`, so a written trim always costs
+travel, and the calibration prints what it cost before verifying:
+
+- the end at the far side of the trim **falls short by `|trim| ÷ 2 × span`**
+- the end the trim leans toward is reached early, so the last `|trim|` of
+  command travel there **produces no movement at all**
+
+A −0.29 trim on an 810 µs span gives up 117 µs — 14.4% — at one end and
+deafens the last 29% of the command range at the other.
+
+Both ends are then **verified a second time with the trim applied**. One of
+them is expected to read `OUT` by exactly the shortfall printed above. That is
+the trim being paid for, not the end stop being wrong.
+
+### Backlash is logged
+
+The measured backlash goes into `calibration_log.csv` as `left_backlash_deg`
+and `right_backlash_deg`. A log file written before those columns existed is
+widened once on the next write — current header, existing rows padded, the
+original kept as `.bak`. A blank means no calibration in that session measured
+one, which is not the same claim as a backlash of zero.
+
+---
+
 ## Verification
 
 `endpoint_cal.py verify` re-measures both ends at whatever `MIN`/`MAX` are
@@ -230,36 +304,21 @@ Two cautions when reading its output:
 | probed gain accepted within | 0.3×–3× nominal | linkage gain varies about 2:1 end to end |
 | coarse range | 900–2100 µs | wide enough to bracket any endpoint |
 | coarse creep step | 6 µs | matches the existing calibration |
-
----
-
-## Trim is not covered
-
-Stage 2 runs at trim 0, so it sets the end stops reached by `cmd ±1` with no
-trim applied. Writing a non-zero trim afterwards changes what those commands
-reach, because PX4 computes `clamp(cmd + trim, −1, +1)`.
-
-Measured on both channels, the effect is exact:
-
-- throw from the trim point to `cmd +1` is always **half the span**
-- throw from the trim point to `cmd −1` is **`(1 − |trim|) ÷ 2 × span`**
-
-So a −0.29 trim removes 117 µs of an 810 µs span from one end — 14.4% — and
-creates a dead band where the last 29% of the command range on the other side
-produces no movement at all.
-
-That the full range is not reached after trimming is expected. What has **not**
-been settled is whether the end stops should be set before the trim, after it,
-or solved algebraically so the post-trim positions land on target. Until that is
-decided, set the end stops with this procedure at trim 0 and treat the trim as a
-separate, later question.
+| trim approach | `cmd +1` | the direction the trim point is defined from |
+| trim acceptance band | 0.25° | on that approach only |
+| max trim shift per attempt | 0.15 cmd | about 5° on this airframe |
+| trim attempts | 8 | |
+| trim command limit | ±0.9 | beyond it the trim eats half the travel |
 
 ---
 
 ## Related
 
-- `endpoint_cal.py` — implements this procedure. `set` writes parameters,
-  `verify` does not.
+- `endpoint_logic.py`, `trim_logic.py` — the decision logic, with nothing
+  attached to it. Every number in this document is a constant in one of them.
+- The trim tab in `MantaTrimmer.py` — runs all three stages against the rig.
+- `endpoint_cal.py` — stages 1 and 2 as a standalone diagnostic. `set` writes
+  parameters, `verify` does not.
 - `servo_probe.py` — read-only diagnostic. Confirms commanded PWM against what
   the FC actually drives, and can replay the old creep at varying step periods.
   A bolt-on: delete it and its test when the investigation is closed.

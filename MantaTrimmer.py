@@ -24,6 +24,7 @@ import os
 import serial
 import serial.tools.list_ports
 import csv
+import shutil
 from datetime import datetime
 
 from manta_theme import PALETTE, apply_theme
@@ -81,6 +82,24 @@ from endpoint_logic import (
     inward_sign,
     limit_correction,
     usable_gain,
+)
+from trim_logic import (
+    TRIM_APPROACH_CMD,
+    TRIM_ATTEMPTS,
+    TRIM_TOLERANCE_DEG,
+    backlash_deg,
+    clamp_trim,
+    command_gain_deg,
+    dead_band_cmd,
+    limit_trim_correction,
+    shortened_endpoint,
+    travel_lost_us,
+    trim_accepted,
+    trim_correction,
+    trim_error_grew,
+    trim_estimate,
+    trim_gain_deg,
+    trim_has_diverged,
 )
 from range_test import (
     MIN_TRAVEL_DEG,
@@ -195,6 +214,8 @@ CAL_LOG_COLUMNS = [
     "right_max",
     "right_trim",
     "Folding?",
+    "left_backlash_deg",
+    "right_backlash_deg",
 ]
 
 
@@ -1302,6 +1323,12 @@ class FourSliderGUI:
         self.right_cal_thread = None
         self.left_cal_active = False
         self.right_cal_active = False
+
+        # Measured by the trim stage, kept so "Log calibration" can record it.
+        # None until a calibration has actually measured one: an unmeasured
+        # backlash and a zero backlash are not the same claim.
+        self.left_backlash_deg = None
+        self.right_backlash_deg = None
 
         self.sweep_thread = None
         self.sweep_active = False
@@ -3495,6 +3522,71 @@ class FourSliderGUI:
             print("Invalid angle_trim: %s" % str(e))
     # def
 
+    def backlash_for_log(self, side):
+        """The measured backlash, or blank if this session never measured one.
+
+        Blank rather than 0.0: an unmeasured backlash and a backlash of zero
+        are not the same claim, and a log that cannot tell them apart is worse
+        than one with a gap in it.
+        """
+        lash = self.side_backlash(side)
+        return "" if lash is None else "%.2f" % float(lash)
+    # def
+
+    def migrate_calibration_log(self):
+        """Bring an older log file up to the current columns. True if usable.
+
+        The backlash columns were added after this file had real rows in it.
+        Appending wider rows under a narrower header would leave the new values
+        under no heading at all, which is how a log stops being readable, so
+        the file is rewritten once: current header, existing rows padded.
+
+        The original is kept alongside as .bak before anything is written.
+        """
+        try:
+            with open(self.calibration_log_file, "r", newline="", encoding="utf-8") as f:
+                rows = list(csv.reader(f))
+        except Exception as e:
+            print("Could not read %s to check its columns: %s"
+                  % (self.calibration_log_file, str(e)))
+            return False
+
+        if not rows:
+            return True
+
+        header = rows[0]
+
+        if header == CAL_LOG_COLUMNS:
+            return True
+
+        # Only ever widen a header this file is already a prefix of. Anything
+        # else is a file this code did not write, and guessing what its columns
+        # mean would corrupt it.
+        if header != CAL_LOG_COLUMNS[:len(header)]:
+            print("Refusing to touch %s: its header is not one this version "
+                  "recognises (%s)" % (self.calibration_log_file, ",".join(header)))
+            return False
+
+        width = len(CAL_LOG_COLUMNS)
+        padded = [row + [""] * (width - len(row)) for row in rows[1:]]
+        backup = self.calibration_log_file + ".bak"
+
+        try:
+            shutil.copyfile(self.calibration_log_file, backup)
+            with open(self.calibration_log_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(CAL_LOG_COLUMNS)
+                writer.writerows(padded)
+        except Exception as e:
+            print("Failed to bring %s up to the current columns: %s"
+                  % (self.calibration_log_file, str(e)))
+            return False
+
+        print("Added %d columns to %s (%d rows padded, original kept as %s)"
+              % (width - len(header), self.calibration_log_file, len(padded), backup))
+        return True
+    # def
+
     def log_calibration(self):
         try:
             drone_name = self.drone_name_var.get().strip()
@@ -3542,6 +3634,8 @@ class FourSliderGUI:
                 right_max,
                 right_trim,
                 folding,
+                self.backlash_for_log("LEFT"),
+                self.backlash_for_log("RIGHT"),
             ]
 
             # The header and the row drifted apart once already; refuse rather
@@ -3553,6 +3647,9 @@ class FourSliderGUI:
                 return
 
             file_exists = os.path.exists(self.calibration_log_file)
+
+            if file_exists and not self.migrate_calibration_log():
+                return
 
             with open(self.calibration_log_file, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -3984,6 +4081,17 @@ class FourSliderGUI:
             self.right_cal_active = active
     # def
 
+    def set_side_backlash(self, side, lash_deg):
+        if side == "LEFT":
+            self.left_backlash_deg = lash_deg
+        else:
+            self.right_backlash_deg = lash_deg
+    # def
+
+    def side_backlash(self, side):
+        return self.left_backlash_deg if side == "LEFT" else self.right_backlash_deg
+    # def
+
     def _cal_write_param(self, side, output_function, param_name, py_type,
                          value, hold_command):
         """Write a parameter, then put the surface back where it belongs.
@@ -4016,10 +4124,23 @@ class FourSliderGUI:
         ends in.
         """
         far = "MIN" if which == "MAX" else "MAX"
-        self._cal_measure(side, output_function, endpoint_command(far, rev),
-                          dwell_s)
-        return self._cal_measure(side, output_function,
-                                 endpoint_command(which, rev), dwell_s)
+        return self._cal_approach_command(side, output_function,
+                                          endpoint_command(which, rev),
+                                          endpoint_command(far, rev), dwell_s)
+    # def
+
+    def _cal_approach_command(self, side, output_function, command,
+                              park_command, dwell_s=ENDPOINT_DWELL_S):
+        """Park, then drive to `command` in one move and measure there.
+
+        The one implementation of measure-after-a-run-up. The end stops park at
+        the opposite end stop; the trim point parks at cmd -1 or cmd +1 to
+        measure the same command from each side. Either way the reading is
+        taken after a full traverse, which is the only way two of them are
+        comparable.
+        """
+        self._cal_measure(side, output_function, park_command, dwell_s)
+        return self._cal_measure(side, output_function, command, dwell_s)
     # def
 
     def _cal_measure(self, side, output_function, command,
@@ -4249,14 +4370,173 @@ class FourSliderGUI:
         return pwm
     # def
 
-    def _cal_verify_endpoints(self, side, output_function, pwm, targets, rev):
+    def _cal_trim_point(self, side, output_function, targets, rev):
+        """Find the command that sits on the trim angle. (command, lash) or None.
+
+        Set from one approach direction, TRIM_APPROACH_CMD, because these
+        servos have more backlash than any band worth accepting could close.
+        Requiring both directions to land on target would loop until it ran
+        out of attempts and write nothing. So the trim point *is* the angle
+        reached arriving from that side, and the other side is measured once at
+        the end and reported as the lash it is.
+
+        Every reading is taken after a full traverse out to the approach
+        command, for the same reason the end stops are: an angle held while
+        creeping up to it is not the angle that command produces when the
+        surface is driven there, and the creep this replaces was out by about
+        4 deg on that alone.
+
+        Runs with trim 0 still in the flight controller. Once a trim is written
+        cmd +-1 no longer reaches the end stops and the parks this depends on
+        would stop being parks, so the command is carried here and only written
+        once it is accepted.
+        """
+        target = self.angle_trim_degs
+
+        # The two accepted end stops are known (command, angle) pairs at cmd -1
+        # and cmd +1. Reversed, cmd -1 is the MAX end - which is why the
+        # estimate is given the angles by command, not by end stop name.
+        angle_at_neg = targets["MAX"] if rev else targets["MIN"]
+        angle_at_pos = targets["MIN"] if rev else targets["MAX"]
+
+        nominal = command_gain_deg(angle_at_neg, angle_at_pos)
+        cmd_trim = trim_estimate(target, angle_at_neg, angle_at_pos)
+
+        if cmd_trim is None:
+            print("%s trim: the end stops give no usable travel" % side)
+            return None
+
+        print("%s trim: target %+.2f deg, approaching from cmd %+.0f, "
+              "starting at cmd %+.3f"
+              % (side, target, TRIM_APPROACH_CMD, cmd_trim))
+
+        previous_cmd = None
+        previous_angle = None
+        last_error = None
+        growths = 0
+
+        for attempt in range(1, TRIM_ATTEMPTS + 1):
+            if not self.is_calibration_active(side):
+                return None
+
+            angle = self._cal_approach_command(side, output_function, cmd_trim,
+                                               TRIM_APPROACH_CMD)
+            if angle is None:
+                print("%s trim: no angle at the trim point" % side)
+                return None
+
+            error = angle - target
+            print("%s trim: attempt %d at cmd %+.3f reached %+.2f deg, "
+                  "%+.2f out" % (side, attempt, cmd_trim, angle, error))
+
+            if trim_accepted(angle, target):
+                # A backlash that could not be read leaves the trim standing:
+                # it is a measurement taken after the fact, not a condition of
+                # the trim being right, and it logs blank.
+                lash = self._cal_measure_backlash(side, output_function,
+                                                  cmd_trim, angle)
+                print("%s trim: set at cmd %+.3f - %+.2f deg from cmd %+.0f, "
+                      "within %.2f deg of %+.2f"
+                      % (side, cmd_trim, angle, TRIM_APPROACH_CMD,
+                         TRIM_TOLERANCE_DEG, target))
+                return cmd_trim, lash
+
+            previous_error = last_error
+            growths = growths + 1 if trim_error_grew(last_error, error) else 0
+            last_error = error
+
+            if trim_has_diverged(growths):
+                print("%s trim: diverging - %+.2f deg out after %+.2f deg on "
+                      "the previous attempt. Stopping."
+                      % (side, error, previous_error))
+                return None
+
+            gain = trim_gain_deg(previous_cmd, previous_angle, cmd_trim, angle,
+                                 nominal)
+            delta = limit_trim_correction(trim_correction(angle, target, gain))
+
+            if delta is None:
+                print("%s trim: no usable gain" % side)
+                return None
+
+            new_cmd = clamp_trim(cmd_trim + delta)
+
+            if abs(new_cmd - cmd_trim) < 1e-6:
+                print("%s trim: pinned at cmd %+.3f and still %+.2f deg out"
+                      % (side, cmd_trim, error))
+                return None
+
+            previous_cmd, previous_angle = cmd_trim, angle
+            cmd_trim = new_cmd
+
+        print("%s trim: did not settle in %d attempts" % (side, TRIM_ATTEMPTS))
+        return None
+    # def
+
+    def _cal_measure_backlash(self, side, output_function, cmd_trim,
+                              angle_from_approach):
+        """Drive to the same command from the other side and report the lash.
+
+        Measured once, after the trim is accepted, rather than every attempt:
+        it plays no part in the acceptance, so measuring it each time round
+        would be two traverses spent on a number that does not change.
+
+        This is the figure that says where the surface actually sits when it
+        arrives the other way. It is a property of the servo and the linkage -
+        no trim value makes it smaller - so it is logged, not corrected.
+        """
+        opposite = -TRIM_APPROACH_CMD
+        angle = self._cal_approach_command(side, output_function, cmd_trim,
+                                           opposite)
+
+        if angle is None:
+            print("%s trim: no angle approaching from cmd %+.0f" % (side, opposite))
+            return None
+
+        lash = backlash_deg(angle_from_approach, angle)
+        print("%s trim: backlash %+.2f deg - the same command reads %+.2f deg "
+              "arriving from cmd %+.0f against %+.2f from cmd %+.0f"
+              % (side, lash, angle, opposite, angle_from_approach,
+                 TRIM_APPROACH_CMD))
+        return lash
+    # def
+
+    def _cal_report_trim_cost(self, side, cmd_trim, pwm, rev):
+        """What the written trim costs the travel, in the units it costs it in.
+
+        PX4 computes clamp(cmd + trim, -1, +1), so a trim shortens one end and
+        deafens the other. Both are expected; neither should have to be worked
+        out from the verify that follows.
+        """
+        span = abs(float(pwm["MAX"]) - float(pwm["MIN"]))
+        lost = travel_lost_us(cmd_trim, span)
+        short_end = shortened_endpoint(cmd_trim, rev)
+
+        if short_end is None or lost <= 0.0:
+            print("%s trim: zero trim, the full span is still reached" % side)
+            return
+
+        print("%s trim: cmd %+.3f gives up %.0f us of the %.0f us span at the "
+              "%s end (%.1f%%), and the last %.0f%% of command travel at the "
+              "other end now produces no movement."
+              % (side, cmd_trim, lost, span, short_end, 100.0 * lost / span,
+                 100.0 * dead_band_cmd(cmd_trim)))
+    # def
+
+    def _cal_verify_endpoints(self, side, output_function, pwm, targets, rev,
+                              note=""):
         """Re-measure both end stops after the fact and report the error.
 
         A calibration marking its own work proves nothing. This drives each end
         once more, from the far side, and says what it actually reached - which
         is the number that says whether the end stops are repeatable.
+
+        Run a second time once the trim is written, where one end is expected
+        to read OUT by the shortfall _cal_report_trim_cost has already printed:
+        that is the trim being paid for, not the end stop being wrong. `note`
+        labels which pass this is.
         """
-        print("%s calibration: verifying" % side)
+        print("%s calibration: verifying%s" % (side, note))
         worst = 0.0
 
         for which in ("MAX", "MIN"):
@@ -4355,16 +4635,31 @@ class FourSliderGUI:
             if not self.is_calibration_active(side):
                 return
 
-            trim_step = -0.01 if self.angle_trim_degs < 0.0 else 0.01
-            cmd_trim = self.move_elevon_to_angle(side, output_function,
-                                                 self.angle_trim_degs, trim_step)
+            # The trim is found the same way the end stops are - driven to and
+            # measured settled, from a named direction. The creep that used to
+            # set it has the fault this whole procedure exists to fix, and the
+            # trim inherited every degree of it.
+            found = self._cal_trim_point(side, output_function, targets, rev)
 
-            if not self.is_calibration_active(side) or cmd_trim is None:
+            if not self.is_calibration_active(side) or found is None:
                 print("%s automatic calibration stopped before trim completed" % side)
                 return
 
-            print("%s automatic calibration loading Trim[%.2f]" % (side, cmd_trim))
-            self.set_side_param_and_refresh(side, trim_param, float, cmd_trim)
+            cmd_trim, lash = found
+            self.set_side_backlash(side, lash)
+
+            print("%s automatic calibration loading Trim[%.3f]" % (side, cmd_trim))
+            if not self._cal_write_param(side, output_function, trim_param,
+                                         float, cmd_trim, cmd_trim):
+                return
+
+            # What the trim costs, then what the ends actually reach with it
+            # applied. One of them is expected to read OUT by the shortfall
+            # reported here - that is the price of the trim, printed before the
+            # verify rather than left to be inferred from it.
+            self._cal_report_trim_cost(side, cmd_trim, pwm, rev)
+            self._cal_verify_endpoints(side, output_function, pwm, targets, rev,
+                                       note=" with the trim applied")
 
             print("%s automatic calibration finished" % side)
         finally:

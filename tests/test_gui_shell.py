@@ -7,6 +7,7 @@ display is available - these need a real Tk window, so run them under Xvfb:
     xvfb-run -a python3 -m pytest tests/test_gui_shell.py -v
 """
 
+import csv
 import os
 import sys
 import time
@@ -167,3 +168,75 @@ def test_status_labels_fit_the_longest_message(app):
         assert len(text) <= label.cget("width"), \
             "%r (%d chars) will clip at width %d" % (text, len(text), label.cget("width"))
 # def
+
+
+def _write_log(path, header, rows):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+# def
+
+
+OLD_COLUMNS = MT.CAL_LOG_COLUMNS[:-2]
+OLD_ROW = ["03/04/2026", "11:57:54", "SN020", "3.69E+18", "-33", "35", "-5",
+           "1170", "1902", "-0.25", "1092", "1848", "-0.22", "y"]
+
+
+def test_an_older_log_is_widened_to_the_current_columns(app, tmp_path, capsys):
+    """The backlash columns were added after this file had real rows in it.
+    Appending wider rows under a narrower header is how a log stops being
+    readable, so the file is brought up to date once, keeping the original."""
+    gui, _pico = app
+    log = tmp_path / "calibration_log.csv"
+    gui.calibration_log_file = str(log)
+    _write_log(log, OLD_COLUMNS, [OLD_ROW, OLD_ROW])
+
+    assert gui.migrate_calibration_log() is True
+
+    with open(log, newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+
+    assert rows[0] == MT.CAL_LOG_COLUMNS
+    assert len(rows) == 3
+    assert rows[1] == OLD_ROW + ["", ""], "padded, not guessed at"
+    assert os.path.exists(str(log) + ".bak"), "the original is kept"
+    assert "Added 2 columns" in capsys.readouterr().out
+
+
+def test_a_current_log_is_left_alone(app, tmp_path):
+    gui, _pico = app
+    log = tmp_path / "calibration_log.csv"
+    gui.calibration_log_file = str(log)
+    _write_log(log, MT.CAL_LOG_COLUMNS, [OLD_ROW + ["-0.80", "-0.74"]])
+    before = log.read_text()
+
+    assert gui.migrate_calibration_log() is True
+    assert log.read_text() == before
+    assert not os.path.exists(str(log) + ".bak"), "nothing to migrate, nothing copied"
+
+
+def test_a_log_this_version_does_not_recognise_is_refused(app, tmp_path, capsys):
+    """Only ever widen a header this file is already a prefix of. Anything else
+    is a file this code did not write, and guessing at its columns would
+    corrupt it."""
+    gui, _pico = app
+    log = tmp_path / "calibration_log.csv"
+    gui.calibration_log_file = str(log)
+    _write_log(log, ["when", "what", "who"], [["a", "b", "c"]])
+    before = log.read_text()
+
+    assert gui.migrate_calibration_log() is False
+    assert log.read_text() == before
+    assert "not one this version recognises" in capsys.readouterr().out
+
+
+def test_an_unmeasured_backlash_is_logged_blank(app):
+    """Blank rather than 0.0: never measured and measured as zero are not the
+    same claim."""
+    gui, _pico = app
+
+    assert gui.backlash_for_log("LEFT") == ""
+    gui.set_side_backlash("LEFT", -0.8)
+    assert gui.backlash_for_log("LEFT") == "-0.80"
+    assert gui.backlash_for_log("RIGHT") == ""

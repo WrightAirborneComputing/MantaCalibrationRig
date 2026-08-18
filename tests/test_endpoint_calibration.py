@@ -52,11 +52,16 @@ STICTION_DEG = 1.6
 
 
 class SimServo:
-    """PWM in, angle out, with stiction and optional hard stops."""
+    """PWM in, angle out, with stiction, lash and optional hard stops."""
 
-    def __init__(self, stop_low_deg=None, stop_high_deg=None):
+    def __init__(self, stop_low_deg=None, stop_high_deg=None, lash_deg=0.0):
         self.stop_low_deg = stop_low_deg
         self.stop_high_deg = stop_high_deg
+        # Backlash: the surface lands short of where it was driven, on the side
+        # it came from, so the same command reads 2 x lash_deg apart depending
+        # on the approach. Zero by default, so every test that predates it sees
+        # exactly the servo it saw before.
+        self.lash_deg = lash_deg
         self.angle = 0.0
         self.last_pwm = None
 
@@ -76,6 +81,9 @@ class SimServo:
             direction = 1.0 if target > self.angle else -1.0
             shortfall = min(STICTION_DEG, abs(target - self.angle))
             self.angle = target - direction * shortfall
+        elif self.lash_deg:
+            direction = 1.0 if target > self.angle else -1.0
+            self.angle = target - direction * self.lash_deg
         else:
             self.angle = target
 
@@ -542,3 +550,139 @@ def test_an_end_stop_that_keeps_getting_worse_ends_the_run(rig, capsys):
     # Two attempts' worth of damage, not ten, and nowhere near MAX.
     assert drone.params["PWM_MAIN_MIN5"] <= 1192 + 200
     assert drone.params["PWM_MAIN_MIN5"] < drone.params["PWM_MAIN_MAX5"]
+
+
+def _trim_param(drone):
+    return drone.params["CA_SV_CS0_TRIM"]
+# def
+
+
+def test_the_trim_is_set_from_one_approach_and_the_lash_is_reported(rig, capsys):
+    """The trim point is the angle reached arriving from one direction.
+
+    With 0.4 deg of lash each way the same command reads 0.8 deg apart
+    depending on the approach, which is wider than any acceptance band worth
+    having - so the procedure converges the approach it is set from and reports
+    the other as backlash rather than trying to close it.
+    """
+    gui, drone, servo = rig
+    servo.lash_deg = 0.4
+    gui.angle_trim_degs = -5.0
+
+    run_calibration(gui)
+    output = capsys.readouterr().out
+
+    assert "did not settle" not in output
+    assert "backlash" in output
+
+    # Driven to the written trim from the set direction, the surface must sit
+    # on target. That is what the trim point means here.
+    pwm = gui.expected_pwm(0.0, drone.params["PWM_MAIN_MIN5"],
+                           drone.params["PWM_MAIN_MAX5"], _trim_param(drone),
+                           False)
+    servo.last_pwm = None
+    servo.angle = 40.0                      # arriving from the positive side
+    assert servo.drive(pwm) == pytest.approx(-5.0, abs=0.25)
+
+    # And the lash is 2 x 0.4 deg, on the record rather than corrected away.
+    assert gui.left_backlash_deg == pytest.approx(-0.8, abs=0.1)
+
+
+def test_the_trim_approaches_from_the_set_direction_every_time(rig):
+    """Every reading is taken after a full traverse out to the approach
+    command - the same invariant the end stops rest on."""
+    gui, drone, servo = rig
+    gui.left_cal_active = True
+    gui.angle_trim_degs = -5.0
+    path = _drive_path(servo)
+
+    found = gui._cal_trim_point("LEFT", gui.LEFT_OUTPUT_FUNCTION,
+                                {"MAX": 30.0, "MIN": -30.0}, False)
+
+    assert found is not None
+    cmd_trim, _lash = found
+
+    high = gui.expected_pwm(MT.TRIM_APPROACH_CMD, drone.params["PWM_MAIN_MIN5"],
+                            drone.params["PWM_MAIN_MAX5"], 0.0, False)
+    low = gui.expected_pwm(-MT.TRIM_APPROACH_CMD, drone.params["PWM_MAIN_MIN5"],
+                           drone.params["PWM_MAIN_MAX5"], 0.0, False)
+
+    assert path[0] == high, "parked at the approach command first"
+    # The last two moves are the backlash measurement: out to the far side,
+    # then back to the same command.
+    assert path[-2] == low
+    assert path[-1] == path[-3], "the same trim command, arrived at both ways"
+    assert -1.0 < cmd_trim < 0.0
+
+
+def test_a_trim_that_will_not_settle_writes_nothing(rig, capsys):
+    """A wandering reading must leave the trim alone rather than write a
+    number that means nothing."""
+    gui, drone, _servo = rig
+    gui.left_cal_active = True
+    gui.angle_trim_degs = -5.0
+
+    before = _trim_param(drone)
+    angles = iter([-5.0 + 3.0 * n for n in range(1, 40)])
+    gui.get_side_angle = lambda side: next(angles)
+
+    found = gui._cal_trim_point("LEFT", gui.LEFT_OUTPUT_FUNCTION,
+                                {"MAX": 30.0, "MIN": -30.0}, False)
+
+    assert found is None
+    assert "diverging" in capsys.readouterr().out
+    assert _trim_param(drone) == before
+
+
+def test_the_trim_cost_is_reported_before_the_second_verify(rig, capsys):
+    """A trim gives up travel at one end and deafens the other. Both are
+    expected; neither should have to be worked out from the verify."""
+    gui, drone, _servo = rig
+
+    span = drone.params["PWM_MAIN_MAX5"] - drone.params["PWM_MAIN_MIN5"]
+    gui._cal_report_trim_cost("LEFT", -0.29,
+                              {"MIN": drone.params["PWM_MAIN_MIN5"],
+                               "MAX": drone.params["PWM_MAIN_MAX5"]}, False)
+
+    output = capsys.readouterr().out
+    assert "%.0f us" % (0.29 / 2.0 * span) in output
+    assert "MAX end" in output, "a negative trim shortens the cmd +1 end"
+    assert "29%" in output, "the dead band at the other end"
+
+
+def test_the_run_verifies_again_with_the_trim_applied(rig, capsys):
+    gui, _drone, _servo = rig
+    gui.angle_trim_degs = -5.0
+
+    run_calibration(gui)
+    output = capsys.readouterr().out
+
+    assert "verifying with the trim applied" in output
+    assert output.count("verify: ") >= 4, "both ends, both passes"
+
+
+def test_a_backlash_that_cannot_be_read_still_leaves_the_trim_set(rig, capsys):
+    """It is measured after the fact, not a condition of the trim being right."""
+    gui, drone, _servo = rig
+    gui.left_cal_active = True
+    gui.angle_trim_degs = 0.0
+    gui._cal_measure_backlash = lambda *args: None
+
+    found = gui._cal_trim_point("LEFT", gui.LEFT_OUTPUT_FUNCTION,
+                                {"MAX": 30.0, "MIN": -30.0}, False)
+
+    assert found is not None
+    cmd_trim, lash = found
+    assert lash is None
+
+    # 1500 us is deliberately not 0 deg on this servo, so the trim lands a
+    # little off centre - what matters is that it landed at all.
+    servo = _servo
+    servo.last_pwm = None
+    servo.angle = 40.0
+    pwm = gui.expected_pwm(cmd_trim, drone.params["PWM_MAIN_MIN5"],
+                           drone.params["PWM_MAIN_MAX5"], 0.0, False)
+    assert servo.drive(pwm) == pytest.approx(0.0, abs=0.25)
+
+    gui.set_side_backlash("LEFT", lash)
+    assert gui.backlash_for_log("LEFT") == "", "logged blank, not zero"
