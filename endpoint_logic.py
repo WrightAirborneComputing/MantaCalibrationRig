@@ -23,18 +23,19 @@ BACKOFF_CEILING_US = 200.0         # give up looking for breakaway past here
 ENDPOINT_DWELL_S = 0.8             # one 0.5 s averaging window plus margin
 MAX_ATTEMPTS = 10
 
-# The wide-open range the coarse creep crosses. Wider than the band a refined
-# endpoint is held to below: the creep is looking for the stops, the refinement
-# is placing a value the servo has to live at.
+# The wide-open range the coarse creep crosses, and with it the band a refined
+# endpoint may be written in - the same numbers deliberately. The calibration
+# opens the range to these before it creeps, so an endpoint outside them is one
+# the creep could not have found in the first place.
 COARSE_MIN = 900
 COARSE_MAX = 2100
 
-# Refuse to write an endpoint outside this band, whatever the maths says. These
+# Refuse to write an endpoint outside that band, whatever the maths says. These
 # are servo limits, not PX4 limits - PWM_MAIN_MIN accepts 800 quite happily, and
 # a RIGHT run that wrote 800 drove the elevon so far past its stop that the
 # flight controller browned out mid-calibration.
-PWM_FLOOR = 1000
-PWM_CEILING = 2000
+PWM_FLOOR = COARSE_MIN
+PWM_CEILING = COARSE_MAX
 
 # MIN and MAX must stay this far apart. PX4 silently swaps them at param load
 # when MIN > MAX, so a crossed pair does not fail - it quietly calibrates

@@ -167,8 +167,10 @@ Four of them, narrowest wins:
 
 - **200 µs per attempt.** A gain that passes the check above can still be off by
   a factor of two, and another attempt costs one traverse.
-- **1000–2000 µs.** A servo limit, not a PX4 one: `PWM_MAIN_MIN` accepts 800
-  quite happily, and writing it is what browned out the FC.
+- **900–2100 µs**, the same range the coarse stage opens up to before it
+  creeps — an endpoint outside it is one the creep could not have found. A
+  servo limit, not a PX4 one: `PWM_MAIN_MIN` accepts 800 quite happily, and
+  writing it is what browned out the FC.
 - **±300 µs of the coarse creep's finding.** The creep is rough but measured; an
   endpoint 300 µs away from it is a symptom, not a correction.
 - **MIN and MAX stay 200 µs apart.** PX4 swaps them at param load when
@@ -298,7 +300,7 @@ Two cautions when reading its output:
 | attempts per end | 10 | |
 | consecutive growing errors allowed | 1 | two in a row is a runaway, not noise |
 | max shift per attempt | 200 µs | |
-| endpoint band | 1000–2000 µs | servo limit; 800 µs browned out the FC |
+| endpoint band | 900–2100 µs | the coarse range; 800 µs browned out the FC |
 | max drift from the coarse value | 300 µs | |
 | minimum MIN–MAX separation | 200 µs | PX4 swaps a crossed pair silently |
 | probed gain accepted within | 0.3×–3× nominal | linkage gain varies about 2:1 end to end |

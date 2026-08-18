@@ -238,11 +238,15 @@ def test_an_endpoint_stays_near_where_the_coarse_creep_found_it():
 
 def test_the_servo_band_is_the_outer_bound():
     """800 us is a PX4 limit, not a servo one. Writing it drove the elevon so
-    far past its stop that the flight controller browned out."""
-    assert endpoint_logic.PWM_FLOOR == 1000
-    assert endpoint_logic.PWM_CEILING == 2000
-    assert endpoint_logic.clamp_endpoint(800, "MIN", 1893, 900) == 1000
-    assert endpoint_logic.clamp_endpoint(2200, "MAX", 1000, 2100) == 2000
+    far past its stop that the flight controller browned out.
+
+    The band is the range the calibration opens up to before it creeps, so an
+    endpoint outside it is one the coarse stage could not have found.
+    """
+    assert endpoint_logic.PWM_FLOOR == endpoint_logic.COARSE_MIN == 900
+    assert endpoint_logic.PWM_CEILING == endpoint_logic.COARSE_MAX == 2100
+    assert endpoint_logic.clamp_endpoint(800, "MIN", 1893, 900) == 900
+    assert endpoint_logic.clamp_endpoint(2200, "MAX", 1000, 2100) == 2100
 
 
 def test_a_growing_error_is_only_called_divergence_after_two_of_them():
