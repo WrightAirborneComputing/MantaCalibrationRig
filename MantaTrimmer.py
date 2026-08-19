@@ -1,6 +1,5 @@
 try:
     import tkinter as tk
-    import tkinter.font as tkfont
     from tkinter import messagebox, ttk
 except ImportError:
     raise SystemExit(
@@ -30,6 +29,12 @@ import shutil
 from datetime import datetime
 
 from manta_theme import PALETTE, apply_theme
+
+# Font specifiers for the calibration charts. Tuples rather than tkfont.Font
+# objects - see FourSliderGUI._cal_text_width for why that matters.
+CAL_LABEL_FONT = ("TkDefaultFont", 9)
+CAL_NOTE_FONT = ("TkDefaultFont", 8)
+CAL_HEADER_FONT = ("TkDefaultFont", 9, "bold")
 
 from manta_common import (
     APP_DIR,
@@ -89,6 +94,7 @@ from endpoint_logic import (
     UNCONFIRMED_ATTEMPTS,
 )
 import cal_flow
+import rig_sync
 from trim_logic import (
     TRIM_APPROACH_CMD,
     TRIM_ATTEMPTS,
@@ -1359,10 +1365,42 @@ class FourSliderGUI:
         self.left_cal_active = False
         self.right_cal_active = False
 
+        # What update_actuators commands a side with while the *other* side is
+        # calibrating: the slider value from the last tick before the run
+        # started. Held rather than read live so a slider dragged mid-run
+        # cannot move a surface and shake the rig during someone's settle
+        # window. Refreshed every quiet tick, so it is never stale.
+        self._idle_hold_cmd = {}
+
+        # Where the two calibration workers meet so that neither reads an angle
+        # while the other is moving the rig. See rig_sync.py. The callbacks are
+        # lambdas rather than bound methods because drone_interface is replaced
+        # after construction - by the port picker, and by the test rig - and a
+        # method bound now would keep commanding the interface that has gone.
+        self.rig_arbiter = rig_sync.RigArbiter(
+            command=lambda side, cmd: self.drone_interface.command_elevon(
+                self.rr_output_function(side), cmd),
+            hold=lambda commands, dwell_s: self._hold_commands(commands, dwell_s),
+            read=lambda side: self.get_side_angle(side),
+            # Resolved per call, not bound now: the tests swap the clock after
+            # the window is built, and a monotonic captured here would be the
+            # one real clock in a run that has otherwise left wall time behind.
+            now=lambda: time.monotonic(),
+            refresh_s=MEASURE_REFRESH_S,
+            on_contended=self._cal_contended)
+
         # What each side's flow chart draws. One model per side, touched only
         # by that side's worker; the chart is drawn from snapshots of them.
         self.cal_flow = {"LEFT": cal_flow.SideFlow(),
                          "RIGHT": cal_flow.SideFlow()}
+        self._cal_width_cache = {}
+        self._cal_pending = {}
+
+        # The node each side is currently reporting against. The arbiter can
+        # say a reading was taken unguarded but has no idea which step asked
+        # for it, and a contention note filed against nothing is a note nobody
+        # ever sees.
+        self._cal_last_node = {}
 
         # Measured by the trim stage, kept so "Log calibration" can record it.
         # None until a calibration has actually measured one: an unmeasured
@@ -2274,6 +2312,18 @@ class FourSliderGUI:
         wait longer than that is not a wait at all - it is the FC quietly
         resuming control part way through a measurement.
         """
+        self._hold_commands({side: command for side in sides}, duration_s)
+    # def
+
+    def _hold_commands(self, commands, duration_s):
+        """The same hold, with each side at its own command.
+
+        The calibration rendezvous holds both surfaces through one shared dwell
+        and the two sides are rarely at the same command - one may be parking
+        for a run-up while the other steps its breakaway probe. The
+        single-command form above stays as it was, because the range and
+        stiction tabs genuinely do drive both sides to the same place.
+        """
         deadline = time.monotonic() + duration_s
 
         while True:
@@ -2281,7 +2331,7 @@ class FourSliderGUI:
             if remaining <= 0.0:
                 return
             time.sleep(min(MEASURE_REFRESH_S, remaining))
-            for side in sides:
+            for side, command in commands.items():
                 self.drone_interface.command_elevon(
                     self.rr_output_function(side), command)
     # def
@@ -3199,6 +3249,32 @@ class FourSliderGUI:
     CAL_ROW_GAP = 9
     CAL_PAD = 8
     CAL_FORK_GAP = 8
+    CAL_DETAIL_H = 104   # room for the longest failure in cal_flow.FAILURES
+
+    def _cal_text_width(self, font_spec, text):
+        """How wide `text` draws, asked of Tcl directly. GUI thread only.
+
+        Deliberately not a tkfont.Font. That is a Python object holding a named
+        Tcl font, and its __del__ calls back into Tcl to delete it - so once
+        one becomes garbage, whichever thread happens to run the collector
+        makes a Tcl call. A calibration worker doing that aborts the
+        interpreter outright, and no except can catch a Tcl panic. A raw call
+        leaves nothing behind to finalise.
+
+        Cached because fit() measures once per character it trims, and the
+        same handful of strings are redrawn constantly.
+        """
+        key = (font_spec, text)
+        width = self._cal_width_cache.get(key)
+        if width is None:
+            width = int(self.root.tk.call("font", "measure", font_spec, text))
+            # Notes carry live numbers, so the key space is unbounded. Dropping
+            # the lot is fine - it costs one Tcl call per string to refill.
+            if len(self._cal_width_cache) > 512:
+                self._cal_width_cache.clear()
+            self._cal_width_cache[key] = width
+        return width
+    # def
 
     def _cal_node_box(self, row, column):
         """(x1, y1, x2, y2) for a node, from its row and which column it is in."""
@@ -3234,16 +3310,6 @@ class FourSliderGUI:
                   + (rows - 1) * self.CAL_ROW_GAP
                   + 4)
 
-        # Made once and kept. A tkfont.Font is a named Tcl object whose
-        # __del__ calls back into Tcl to delete it, so building them per
-        # redraw leaves a stream of them for the garbage collector - and the
-        # collector runs on whichever thread happens to allocate. A calibration
-        # worker collecting one aborts the interpreter, which is how a suite
-        # that passes file by file dies when run whole.
-        self.cal_label_font = tkfont.Font(font=("TkDefaultFont", 9))
-        self.cal_note_font = tkfont.Font(font=("TkDefaultFont", 8))
-        self.cal_header_font = tkfont.Font(font=("TkDefaultFont", 9, "bold"))
-
         self.cal_canvas = {}
         self.cal_detail = {}
 
@@ -3259,13 +3325,13 @@ class FourSliderGUI:
 
             # Fixed height and wraplength, so a failure arriving mid-run cannot
             # resize the panel and shove the log about underneath it.
-            holder = tk.Frame(column, height=104)
+            holder = tk.Frame(column, height=self.CAL_DETAIL_H)
             holder.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
             holder.pack_propagate(False)
 
             detail = tk.Label(holder, text="", justify="left", anchor="nw",
                               wraplength=self.CAL_CANVAS_W - 8,
-                              fg=PALETTE["ink_muted"], font=("TkDefaultFont", 8))
+                              fg=PALETTE["ink_muted"], font=CAL_NOTE_FONT)
             detail.pack(fill=tk.BOTH, expand=True)
             self.cal_detail[side] = detail
 
@@ -3309,8 +3375,14 @@ class FourSliderGUI:
         verdict, elapsed, rows, failure = snapshot
         canvas.delete("all")
 
-        label_font = self.cal_label_font
-        note_font = self.cal_note_font
+        label_font = CAL_LABEL_FONT
+        note_font = CAL_NOTE_FONT
+
+        def label_width(text):
+            return self._cal_text_width(label_font, text)
+
+        def note_width(text):
+            return self._cal_text_width(note_font, text)
 
         states = {key: state for key, _l, _r, _c, state, _n in rows}
         boxes = {key: self._cal_node_box(row, column)
@@ -3318,12 +3390,12 @@ class FourSliderGUI:
 
         canvas.create_text(self.CAL_PAD, self.CAL_HEADER_H // 2 + 1,
                            text=side.lower(), anchor="w",
-                           fill=PALETTE["ink"], font=self.cal_header_font)
+                           fill=PALETTE["ink"], font=CAL_HEADER_FONT)
         canvas.create_text(self.CAL_CANVAS_W - self.CAL_PAD,
                            self.CAL_HEADER_H // 2 + 1,
                            text=cal_flow.header_text(verdict, elapsed),
                            anchor="e", fill=PALETTE["ink_faint"],
-                           font=self.cal_note_font)
+                           font=CAL_NOTE_FONT)
 
         # Edges first, so the nodes sit on top of where they meet.
         for source, target in cal_flow.EDGES:
@@ -3351,12 +3423,12 @@ class FourSliderGUI:
             # border and through the state mark.
             room = (x2 - 12) - (x1 + 7)
             canvas.create_text(x1 + 7, y1 + 10,
-                               text=cal_flow.fit(label, label_font.measure, room),
+                               text=cal_flow.fit(label, label_width, room),
                                anchor="w", fill=PALETTE[text_key],
                                font=label_font)
             if note:
                 canvas.create_text(x1 + 7, y1 + 22,
-                                   text=cal_flow.fit(note, note_font.measure, room),
+                                   text=cal_flow.fit(note, note_width, room),
                                    anchor="w", fill=PALETTE["ink_faint"],
                                    font=note_font)
             self._cal_mark(canvas, state, x2 - 10, (y1 + y2) // 2)
@@ -3383,18 +3455,84 @@ class FourSliderGUI:
         RuntimeError that produces, and the chart would freeze with no sign of
         why - the exact thing a chart is meant to prevent.
         """
-        snapshot = self.cal_flow[side].snapshot(time.monotonic())
-        self.post_to_gui(lambda: self.draw_calibration_flow(side, snapshot))
+        # Only the newest snapshot for a side is worth drawing. The back-off
+        # probe reports twenty steps in a row, and without this every one of
+        # them queues a full canvas rebuild that the Tk thread then works
+        # through in order to arrive at the picture the last one describes.
+        self._cal_pending[side] = self.cal_flow[side].snapshot(time.monotonic())
+        self.post_to_gui(lambda: self._cal_draw_pending(side))
+    # def
+
+    def _cal_draw_pending(self, side):
+        """Draw this side's latest snapshot, if another callback has not.
+
+        pop is what makes the coalescing safe: whichever callback runs first
+        draws the newest snapshot and takes it, and the ones behind it find
+        nothing to do.
+        """
+        snapshot = self._cal_pending.pop(side, None)
+        if snapshot is not None:
+            self.draw_calibration_flow(side, snapshot)
     # def
 
     def _cal_start_step(self, side, key, note=""):
+        self._cal_last_node[side] = key
         self.cal_flow[side].start(key, note)
         self._cal_publish(side)
     # def
 
     def _cal_note(self, side, key, note):
+        self._cal_last_node[side] = key
         self.cal_flow[side].note(key, note)
         self._cal_publish(side)
+    # def
+
+    def _cal_contended(self, side, note="rig contended"):
+        """The other side did not turn up. Say so on the chart.
+
+        Not a failure. The run went ahead because a wedged partner must not be
+        able to stall a calibration for ever. But a reading that may have been
+        taken while the rig was moving, or a phase entered without the other
+        side having finished its own, must not look afterwards exactly like one
+        that was not.
+        """
+        print("%s calibration: %s - proceeding without the other side" % (side, note))
+        key = self._cal_last_node.get(side)
+        if key is not None:
+            self._cal_note(side, key, note)
+    # def
+
+    def _cal_barrier(self, side, output_function, name):
+        """Park at centre, then wait for the other side to reach this phase.
+
+        Rendezvous alone keeps the two sides out of each other's measurements
+        but lets them drift into different phases, which they do - refinement
+        takes a different number of attempts per side. This puts them back in
+        step at the boundaries.
+
+        The park is an ordinary measurement so the move to centre happens
+        inside a shared window like every other move; its angle is discarded,
+        only the position matters. Centre rather than wherever the phase left
+        the surface, because a side can sit here for as long as the other one's
+        phase takes, and lingering against an end stop is the thing the
+        back-off probe exists to avoid. Nothing is lost by it: every phase
+        after this establishes its own run-up - refinement primes with an
+        unmeasured traverse, verification and trim both approach from the far
+        end.
+
+        Returns whether the run should carry on, which is a question about the
+        stop button and not about the barrier: a barrier that times out is
+        recorded and stepped over, not treated as a reason to abandon a side.
+        """
+        if not self.is_calibration_active(side):
+            return False
+
+        self._cal_measure(side, output_function, 0.0)
+
+        if not self.rig_arbiter.barrier(side, name):
+            self._cal_contended(side, "waited out %s alone" % name)
+
+        return self.is_calibration_active(side)
     # def
 
     def _cal_done_step(self, side, key, note=""):
@@ -3950,6 +4088,16 @@ class FourSliderGUI:
 
         print("Starting automatic calibration on both sides...")
         self.zero_both_sliders()
+
+        # Both sides are declared before either thread runs. A side that joins
+        # after the other has already started is a side the first one did not
+        # wait for at the boundary it has just gone through - and from there
+        # the two run a phase apart, each releasing the other from the barrier
+        # behind. Who is in the run is known here; it is not the workers' to
+        # discover one at a time.
+        for side in ("LEFT", "RIGHT"):
+            self.rig_arbiter.join(side, at=0.0)
+
         self._start_left_calibration_worker()
         self._start_right_calibration_worker()
     # def
@@ -4450,6 +4598,17 @@ class FourSliderGUI:
     # def
 
     def is_calibration_active(self, side):
+        """May this side keep going? Polled at every step of the procedure.
+
+        A closing window ends the run. on_close joins each worker for 2 s while
+        a single back-off probe takes about sixteen, so without this the worker
+        outlives the window it was driving - and goes on allocating, which
+        means going on running the garbage collector, on a thread where the
+        orphaned Tk objects it collects call into a Tcl interpreter that is
+        being torn down. That aborts the process outright.
+        """
+        if self._closing:
+            return False
         if side == "LEFT":
             return self.left_cal_active
         elif side == "RIGHT":
@@ -4500,11 +4659,14 @@ class FourSliderGUI:
                 self.drone_interface.command_elevon(output_function, 0.0)
                 return None
 
-            angle_deg = self.get_side_angle(side)
+            # Through the rendezvous like every other reading: both sides
+            # step and settle together, so the angle this decides on was not
+            # taken while the other elevon was swinging. It costs nothing - the
+            # shared dwell is the step the creep waited out on its own anyway.
+            angle_deg = self.rig_arbiter.measure(side, cmd, CREEP_PERIOD_S)
 
             if angle_deg is None:
                 last_angle = None
-                time.sleep(0.25)
                 continue
 
             last_angle = angle_deg
@@ -4535,14 +4697,20 @@ class FourSliderGUI:
                 cmd = 1.0
 
             ticks += 1
-            check_ack = (ticks % 8 == 0)
-            result = self.drone_interface.command_elevon(
-                output_function, cmd, wait_ack=check_ack, ack_timeout=0.3)
 
-            if check_ack and self.actuator_test_rejected(side, result):
-                self._cal_fail(side, "sweep", "actuator_refused",
-                               refusal=self.drone_interface.describe_mav_result(result))
-                return None
+            # The step itself is issued by the next measure() above. This is
+            # only the periodic ack check, kept because a refused actuator test
+            # is otherwise indistinguishable from a surface that will not move:
+            # re-sending the command it is about to be sent anyway costs one
+            # packet every eighth tick and moves nothing.
+            if ticks % 8 == 0:
+                result = self.drone_interface.command_elevon(
+                    output_function, cmd, wait_ack=True, ack_timeout=0.3)
+
+                if self.actuator_test_rejected(side, result):
+                    self._cal_fail(side, "sweep", "actuator_refused",
+                                   refusal=self.drone_interface.describe_mav_result(result))
+                    return None
 
             if (inc_angle_deg < 0.0 and cmd <= -1.0) or (inc_angle_deg > 0.0 and cmd >= 1.0):
                 print("%s calibration move: hit command limit before reaching target" % side)
@@ -4550,8 +4718,6 @@ class FourSliderGUI:
                                target=target_angle_deg, command=cmd,
                                angle=angle_deg)
                 return None
-
-            time.sleep(0.25)
 
         print("%s calibration move: timed out before reaching target" % side)
         if last_angle is None:
@@ -4601,8 +4767,12 @@ class FourSliderGUI:
         afterwards means the next move starts from a known place instead of
         wherever the FC left it.
         """
-        ok = self.set_side_param_and_refresh(side, param_name, py_type, value)
-        self.drone_interface.command_elevon(output_function, hold_command)
+        # Declared busy for its whole length: the park the FC performs part
+        # way through cannot be prevented, only kept out of the window the
+        # other side may be settling in. See rig_sync.RigArbiter.busy.
+        with self.rig_arbiter.busy(side, at=hold_command):
+            ok = self.set_side_param_and_refresh(side, param_name, py_type, value)
+            self.drone_interface.command_elevon(output_function, hold_command)
         return ok
     # def
 
@@ -4652,10 +4822,21 @@ class FourSliderGUI:
 
         Short by design. Lingering on a surface that may be against a mechanical
         stop is exactly what the back-off probe exists to avoid.
+
+        The three steps happen in the arbiter rather than here, because the
+        other elevon has to take them at the same time. The rig is one frame:
+        a surface swinging on one side arrives at the opposite pot as angle, so
+        a reading taken while the other side moves is not a measurement. See
+        rig_sync.py. With one side calibrating this is the same three steps it
+        always was.
         """
-        self.drone_interface.command_elevon(output_function, command)
-        self._hold([side], command, dwell_s)
-        return self.get_side_angle(side)
+        # The arbiter maps side to channel itself, since it drives both
+        # surfaces. Checking the caller's function against that map rather than
+        # dropping the argument keeps a side/channel mix-up - the failure the
+        # reverse-bit handling in the worker exists to prevent - from being
+        # silent here.
+        assert output_function == self.rr_output_function(side), side
+        return self.rig_arbiter.measure(side, command, dwell_s)
     # def
 
     def _cal_probe_breakaway(self, side, output_function, which, span,
@@ -4689,6 +4870,14 @@ class FourSliderGUI:
             command = self.clamp(cmd_endpoint + delta, -1.0, 1.0)
 
             angle = self._cal_measure(side, output_function, command)
+
+            # Before blaming the sensor. A side dropped from the rendezvous by
+            # the stop button also comes back with no angle, and reporting that
+            # as a surface the reader lost sight of sends the operator to the
+            # wrong end of the rig for a button they just pressed.
+            if not self.is_calibration_active(side):
+                return None, None
+
             if angle is None:
                 print("%s calibration: no angle while probing %s" % (side, which))
                 # Distinguished from the ceiling case below, which returns the
@@ -5179,6 +5368,11 @@ class FourSliderGUI:
         stops are repeatable; see SERVO_SETTING.md.
         """
         self.set_calibration_active(side, True)
+        # Before anything moves. From here the other side waits for this one at
+        # every measurement and at every phase boundary, and this one waits for
+        # it. Centre is where update_actuators has been holding this surface up
+        # to now, so it is where a first measurement that has to wait is held.
+        self.rig_arbiter.join(side, at=0.0)
         self.cal_flow[side].reset(time.monotonic())
         self._cal_publish(side)
         self.post_to_gui(self.refresh_setup_gate)
@@ -5201,9 +5395,10 @@ class FourSliderGUI:
                     return
             self._cal_done_step(side, "open_range", "900 / 2100 us")
 
-            if not self.is_calibration_active(side):
+            if not self._cal_barrier(side, output_function, "open_range"):
                 print("%s automatic calibration stopped" % side)
-                self._cal_stopped(side)
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
                 return
 
             self._cal_start_step(side, "sweep",
@@ -5216,6 +5411,12 @@ class FourSliderGUI:
                     self._cal_stopped(side)
                 return
             pwm_neg = self.get_side_expected_pwm(side, cmd_neg)
+
+            if not self._cal_barrier(side, output_function, "sweep_neg"):
+                print("%s automatic calibration stopped" % side)
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
+                return
 
             self._cal_note(side, "sweep",
                            "finding %+.1f deg" % self.angle_pos_degs)
@@ -5230,6 +5431,12 @@ class FourSliderGUI:
             self._cal_done_step(side, "sweep",
                                 "%+.1f and %+.1f deg found"
                                 % (self.angle_neg_degs, self.angle_pos_degs))
+
+            if not self._cal_barrier(side, output_function, "sweep"):
+                print("%s automatic calibration stopped" % side)
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
+                return
 
             # load_endpoint_params is borrowed unbound by the StubGUI in
             # tests/test_calibration_endpoints.py, so it must not reach for
@@ -5248,6 +5455,12 @@ class FourSliderGUI:
             self._cal_done_step(side, "load_coarse",
                                 "%d / %d us" % (min(pwm_neg, pwm_pos),
                                                 max(pwm_neg, pwm_pos)))
+
+            if not self._cal_barrier(side, output_function, "load_coarse"):
+                print("%s automatic calibration stopped" % side)
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
+                return
 
             # Which end carries which angle target comes from the measurement,
             # not from the reverse bit: on a reversed channel the negative angle
@@ -5272,6 +5485,12 @@ class FourSliderGUI:
 
             print("%s end stops set: MIN=%d MAX=%d" % (side, pwm["MIN"], pwm["MAX"]))
 
+            if not self._cal_barrier(side, output_function, "refine"):
+                print("%s automatic calibration stopped" % side)
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
+                return
+
             self._cal_start_step(side, "verify", "re-measuring both ends")
             reached = self._cal_verify_endpoints(side, output_function, pwm,
                                                  targets, rev)
@@ -5284,6 +5503,12 @@ class FourSliderGUI:
             # what the ends actually reach, and being out is worth a look
             # rather than a reason to throw the calibration away.
             self._cal_verify_step(side, "verify", targets, reached)
+
+            if not self._cal_barrier(side, output_function, "verify"):
+                print("%s automatic calibration stopped" % side)
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
+                return
 
             # The trim is found the same way the end stops are - driven to and
             # measured settled, from a named direction. The creep that used to
@@ -5313,6 +5538,12 @@ class FourSliderGUI:
                                param=trim_param, value="%+.3f" % cmd_trim)
                 return
             self._cal_done_step(side, "write_trim", "%+.3f" % cmd_trim)
+
+            if not self._cal_barrier(side, output_function, "write_trim"):
+                print("%s automatic calibration stopped" % side)
+                if not self._cal_failed_already(side):
+                    self._cal_stopped(side)
+                return
 
             # What the trim costs, then what the ends actually reach with it
             # applied. One of them is expected to read OUT by the shortfall
@@ -5347,6 +5578,10 @@ class FourSliderGUI:
             # has closed and drone_interface is shut - an exception escaping
             # the finally would replace the one being recorded.
             self.set_calibration_active(side, False)
+            # Before the centring command, and before anything that can raise:
+            # a side that stays in the arbiter after its worker has gone is one
+            # the surviving side waits a full timeout for at every reading.
+            self.rig_arbiter.leave(side)
             self.post_to_gui(self.refresh_setup_gate)
             try:
                 self.drone_interface.command_elevon(output_function, 0.0)
@@ -5410,6 +5645,11 @@ class FourSliderGUI:
         else:
             print("LEFT automatic calibration is not running")
         self.left_cal_active = False
+        # The worker clears this too, on its way out, but it cannot get there
+        # while it is parked at a rendezvous waiting for the other side. This
+        # is what lets a stop take effect at once rather than at the far end of
+        # the partner's next dwell.
+        self.rig_arbiter.leave("LEFT")
         try:
             self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, 0.0)
         except Exception as e:
@@ -5422,6 +5662,7 @@ class FourSliderGUI:
         else:
             print("RIGHT automatic calibration is not running")
         self.right_cal_active = False
+        self.rig_arbiter.leave("RIGHT")
         try:
             self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, 0.0)
         except Exception as e:
@@ -5705,24 +5946,72 @@ class FourSliderGUI:
     # def
 
     def update_actuators(self):
+        """Drive each elevon from its slider, ten times a second.
+
+        Two rules, and the second is the one that is easy to miss.
+
+        A side a procedure is driving is left alone: two senders at different
+        values fight, and the surface follows whichever spoke last. That is the
+        sweep and measure guard, and the calibrating side.
+
+        A side no procedure is driving still has to be commanded, though, or
+        the actuator override lapses after about 2 s and the flight controller
+        takes the surface back - and parks it, which is motion, arriving in the
+        middle of the other side's settle window. So during a calibration this
+        keeps commanding the idle side, but at the value it held when the run
+        began rather than at the live slider: the surface stays alive and
+        still, and dragging its slider mid-run cannot shake the rig out from
+        under the side being measured. The re-send is the same command every
+        time, which moves nothing - the rendezvous holds its own participants
+        in exactly this way while they wait.
+
+        The slider itself is not fought over. It keeps whatever the user set,
+        and the surface goes there on the first tick after the run ends.
+
+        Sweep and measure keep the blanket skip they always had, because on a
+        BOTH phase they drive both surfaces themselves. A single-sided phase
+        leaves the other side to lapse in the way described above, but that is
+        the measure tab's own gap: which sides its worker owns is decided per
+        phase, inside the worker, and is not published anywhere this timer
+        could read it.
+        """
         if self._closing:
             return
 
         try:
-            if not self.left_cal_active and not self.sweep_active \
-                    and not self.measure_active:
-                left_cmd = float(self.left_pos.get())
-                self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, left_cmd)
-
-            if not self.right_cal_active and not self.sweep_active \
-                    and not self.measure_active:
-                right_cmd = float(self.right_pos.get())
-                self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, right_cmd)
+            # Not an early return: the reschedule below is what keeps this
+            # timer alive, and a run that skipped it would never tick again.
+            if not (self.sweep_active or self.measure_active):
+                self.command_idle_elevons()
 
         except Exception as e:
             print("Actuator update error: %s" % str(e))
 
         self.root.after(100, self.update_actuators)
+    # def
+
+    def command_idle_elevons(self):
+        """The per-side half of the rule above, once the procedures are out."""
+        calibrating = (self.is_calibration_active("LEFT")
+                       or self.is_calibration_active("RIGHT"))
+
+        for side, output_function, pos in (
+                ("LEFT", self.LEFT_OUTPUT_FUNCTION, self.left_pos),
+                ("RIGHT", self.RIGHT_OUTPUT_FUNCTION, self.right_pos)):
+
+            if self.is_calibration_active(side):
+                continue
+
+            cmd = float(pos.get())
+            if calibrating:
+                # setdefault rather than a plain read: a calibration that
+                # starts before this timer has ever ticked still gets a value
+                # to hold instead of following the slider.
+                cmd = self._idle_hold_cmd.setdefault(side, cmd)
+            else:
+                self._idle_hold_cmd[side] = cmd
+
+            self.drone_interface.command_elevon(output_function, cmd)
     # def
 
     def update_log_window(self):

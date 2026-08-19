@@ -31,6 +31,44 @@ def test_backing_off_moves_the_pwm_into_the_range():
     assert endpoint_logic.command_delta_for_pwm(-10.0, 1116, 1926, rev=True) == -delta
 
 
+def test_stop_verdict_separates_a_proven_stop_from_an_unproven_one():
+    """The three-way split the two-way verdict could not make.
+
+    A surface that broke away at 145 us moved, and the distance says where the
+    stop is. A surface that never moved has said only that it never moved -
+    which is what a stop past its reach looks like, and equally what a surface
+    too stiff to break away on a 10 us step looks like.
+    """
+    assert endpoint_logic.stop_verdict(20.0) == (endpoint_logic.STOP_FREE, 0.0)
+    assert endpoint_logic.stop_verdict(50.0) == (endpoint_logic.STOP_FREE, 0.0)
+
+    kind, pull = endpoint_logic.stop_verdict(145.0)
+    assert kind == endpoint_logic.STOP_HARD
+    assert pull == 145.0 + endpoint_logic.HARD_STOP_MARGIN_US
+
+    kind, pull = endpoint_logic.stop_verdict(None)
+    assert kind == endpoint_logic.STOP_UNCONFIRMED
+    assert pull == (endpoint_logic.BACKOFF_CEILING_US
+                    + endpoint_logic.HARD_STOP_MARGIN_US)
+
+
+def test_an_unconfirmed_probe_still_recovers_the_way_it_always_did():
+    """One of them could still be an end stop written past the surface. The
+    pull-in is unchanged; it is the second one in a row that means something."""
+    assert (endpoint_logic.stop_verdict(None)[1]
+            == endpoint_logic.hard_stop_verdict(None)[1])
+    assert endpoint_logic.UNCONFIRMED_ATTEMPTS == 2
+
+
+def test_hard_stop_verdict_still_answers_the_two_way_question():
+    """endpoint_cal.py reads it, and "may this be accepted" really is two-way:
+    an unproven stop is no more acceptable than a proven one."""
+    for breakaway in (None, 20.0, 50.0, 60.0, 145.0):
+        kind, pull = endpoint_logic.stop_verdict(breakaway)
+        assert endpoint_logic.hard_stop_verdict(breakaway) == (
+            kind != endpoint_logic.STOP_FREE, pull)
+
+
 def test_hard_stop_verdict_at_the_50_us_boundary():
     assert endpoint_logic.hard_stop_verdict(20.0) == (False, 0.0)
     assert endpoint_logic.hard_stop_verdict(50.0) == (False, 0.0)
