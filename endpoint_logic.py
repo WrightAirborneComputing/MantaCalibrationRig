@@ -64,6 +64,13 @@ GAIN_SANITY_HIGH = 3.0
 DIVERGENCE_ATTEMPTS = 2
 DIVERGENCE_MARGIN_DEG = MOVEMENT_THRESHOLD_DEG
 
+# Consecutive probes at one end that could not confirm the surface moved at
+# all before stiction is blamed. One can still be an end stop written far past
+# the surface's reach, and pulling in BACKOFF_CEILING_US + margin is the
+# recovery for that. A second one, taken after the endpoint has already moved
+# that far inward, is not a pin - a pinned surface would have come free.
+UNCONFIRMED_ATTEMPTS = 2
+
 
 def endpoint_command(which, rev):
     """The command that drives the output to MAX or MIN at trim 0.
@@ -95,19 +102,50 @@ def command_delta_for_pwm(delta_us, pwm_min, pwm_max, rev):
 # def
 
 
-def hard_stop_verdict(breakaway_us):
-    """Is the endpoint jammed, and if so how far in should it be pulled?
+# What the back-off probe found, beyond just "jammed or not".
+STOP_FREE = "free"                # broke away soon enough to have authority
+STOP_HARD = "hard"                # broke away, but only after a long pull in
+STOP_UNCONFIRMED = "unconfirmed"  # never broke away at all
+
+
+def stop_verdict(breakaway_us):
+    """What the back-off probe proved, and how far in to pull. (kind, us).
 
     breakaway_us is how far inward the output had to travel before the elevon
     moved by MOVEMENT_THRESHOLD_DEG, or None if it never moved within
     BACKOFF_CEILING_US. Within HARD_STOP_LIMIT_US the servo still has authority
     at the endpoint, which is the whole point of the test.
+
+    The three-way split is the difference between a measurement and a guess. A
+    surface that broke away at 145 us is against something: it moved, and the
+    distance says where the stop is. A surface that never moved says only that
+    it never moved - which is what a stop past its reach looks like, and also
+    what a surface stiff enough not to break away on a 10 us step looks like.
+    Calling both of those a hard stop is how a free but sticky elevon gets its
+    end stop pulled in by 210 us with nothing said about it.
+
+    Both non-free kinds still return the same pull-in, so one unconfirmed probe
+    is recovered from exactly as before. It is the second one at the same end
+    that means something - see UNCONFIRMED_ATTEMPTS.
     """
     if breakaway_us is None:
-        return True, BACKOFF_CEILING_US + HARD_STOP_MARGIN_US
+        return STOP_UNCONFIRMED, BACKOFF_CEILING_US + HARD_STOP_MARGIN_US
     if breakaway_us <= HARD_STOP_LIMIT_US:
-        return False, 0.0
-    return True, breakaway_us + HARD_STOP_MARGIN_US
+        return STOP_FREE, 0.0
+    return STOP_HARD, breakaway_us + HARD_STOP_MARGIN_US
+# def
+
+
+def hard_stop_verdict(breakaway_us):
+    """Is the endpoint jammed, and if so how far in should it be pulled?
+
+    The older two-way form of stop_verdict, kept because endpoint_cal.py - the
+    disposable diagnostic - reads it, and because "may this endpoint be
+    accepted" genuinely is a two-way question: an unconfirmed probe is no more
+    acceptable than a confirmed stop.
+    """
+    kind, pull_in = stop_verdict(breakaway_us)
+    return kind != STOP_FREE, pull_in
 # def
 
 

@@ -27,6 +27,7 @@ tk = pytest.importorskip("tkinter")
 
 from fake_pico import FakePico
 
+import cal_flow
 import endpoint_logic
 import MantaTrimmer as MT
 
@@ -54,9 +55,13 @@ STICTION_DEG = 1.6
 class SimServo:
     """PWM in, angle out, with stiction, lash and optional hard stops."""
 
-    def __init__(self, stop_low_deg=None, stop_high_deg=None, lash_deg=0.0):
+    def __init__(self, stop_low_deg=None, stop_high_deg=None, lash_deg=0.0,
+                 stiction_deg=STICTION_DEG):
         self.stop_low_deg = stop_low_deg
         self.stop_high_deg = stop_high_deg
+        # Per instance so a test can wind it up. The module default is what
+        # every test that predates this saw, so none of them change.
+        self.stiction_deg = stiction_deg
         # Backlash: the surface lands short of where it was driven, on the side
         # it came from, so the same command reads 2 x lash_deg apart depending
         # on the approach. Zero by default, so every test that predates it sees
@@ -79,7 +84,7 @@ class SimServo:
 
         if self.last_pwm is not None and abs(pwm - self.last_pwm) <= 25:
             direction = 1.0 if target > self.angle else -1.0
-            shortfall = min(STICTION_DEG, abs(target - self.angle))
+            shortfall = min(self.stiction_deg, abs(target - self.angle))
             self.angle = target - direction * shortfall
         elif self.lash_deg:
             direction = 1.0 if target > self.angle else -1.0
@@ -302,6 +307,132 @@ def test_a_free_end_stop_is_not_called_jammed(rig):
     assert result["hard_stop"] is False
     assert result["breakaway_us"] <= endpoint_logic.HARD_STOP_LIMIT_US
     assert result["gain"] is not None
+
+
+def test_a_sticky_surface_is_not_called_a_hard_stop(rig):
+    """The verdict this whole change turns on.
+
+    A free surface with no mechanical stop anywhere, stiff enough that no 10 us
+    probe step moves it within the 200 us ceiling. Nothing was learned about
+    whether it can move, and saying so is the point - the old two-way verdict
+    called it jammed and pulled the end stop in by 210 us.
+
+    Driven through the evaluation directly rather than a whole run: the coarse
+    sweep steps 6-18 us, so every step of it takes the stiction branch too, and
+    a servo stiff enough to fail the probe cannot complete the sweep. The
+    window where both happen is about 0.4 deg wide.
+    """
+    gui, drone, servo = rig
+    servo.stiction_deg = 20.0
+    gui.left_cal_active = True
+
+    result = gui._cal_evaluate_endpoint(
+        "LEFT", gui.LEFT_OUTPUT_FUNCTION, "MIN", drone.params["PWM_MAIN_MIN5"],
+        {"MAX": 41.6, "MIN": -41.6},
+        (drone.params["PWM_MAIN_MIN5"], drone.params["PWM_MAIN_MAX5"]), False)
+
+    assert result["breakaway_us"] is None
+    assert result["stop_kind"] == endpoint_logic.STOP_UNCONFIRMED
+    assert result["stop_kind"] != endpoint_logic.STOP_HARD, \
+        "nothing here proved there is a stop"
+
+
+def test_moderate_stiction_still_reads_as_a_stop_but_says_so_in_the_chart(rig):
+    """Honest about what this change does not fix.
+
+    70 us of friction and 70 us of mechanical pin are the same measurement, so
+    this stays a hard stop. What it gains is a visible amber node instead of
+    one line among hundreds.
+    """
+    gui, drone, servo = rig
+    servo.stiction_deg = 5.0
+    gui.left_cal_active = True
+
+    result = gui._cal_evaluate_endpoint(
+        "LEFT", gui.LEFT_OUTPUT_FUNCTION, "MIN", drone.params["PWM_MAIN_MIN5"],
+        {"MAX": 41.6, "MIN": -41.6},
+        (drone.params["PWM_MAIN_MIN5"], drone.params["PWM_MAIN_MAX5"]), False)
+
+    assert result["stop_kind"] == endpoint_logic.STOP_HARD
+    assert result["breakaway_us"] > endpoint_logic.HARD_STOP_LIMIT_US
+
+    states = dict((key, state) for key, _l, _r, _c, state, _n
+                  in gui.cal_flow["LEFT"].snapshot(0.0)[2])
+    assert states["travel_min"] == cal_flow.WARNED
+    assert gui.cal_flow["LEFT"].verdict != cal_flow.FAILED, "the run goes on"
+
+
+def test_two_unconfirmed_probes_at_one_end_end_the_side_for_stiction(rig, capsys):
+    """One is recoverable, two is friction.
+
+    The first pull-in is the recovery for an end stop written past the
+    surface's reach. If the surface still will not move after the endpoint has
+    travelled the full ceiling inward, there was no stop there to come off.
+    """
+    gui, drone, servo = rig
+    servo.stiction_deg = 20.0
+    gui.left_cal_active = True
+    before = drone.params["PWM_MAIN_MIN5"]
+
+    endpoints = {"MAX": (drone.params["PWM_MAIN_MAX5"], 41.6),
+                 "MIN": (before, -41.6)}
+    result = gui._cal_refine_endpoints(
+        "LEFT", gui.LEFT_OUTPUT_FUNCTION, "PWM_MAIN_MIN5", "PWM_MAIN_MAX5",
+        endpoints, False)
+
+    assert result is None
+    flow = gui.cal_flow["LEFT"]
+    assert flow.verdict == cal_flow.FAILED
+    assert flow.failure[3] == "free_travel_unconfirmed"
+    assert "Stiction is likely too high" in flow.failure[2]
+
+    # Pulled in once, for the attempt that could still have been a stop, and
+    # not again. Pulling in twice is 420 us of travel thrown away on a surface
+    # that was never against anything.
+    pull_ins = [pwm for name, pwm in drone.writes if name == "PWM_MAIN_MIN5"]
+    assert len(pull_ins) == 1, "pulled in %d times: %r" % (len(pull_ins), pull_ins)
+
+    assert "stiction, not a stop" in capsys.readouterr().out
+
+
+def test_an_overshooting_endpoint_is_never_blamed_for_stiction(rig):
+    """It reports no breakaway because it never probed, not because nothing moved.
+
+    Reading "unconfirmed" off that None is how a healthy end stop several
+    corrections from target would be failed for friction it does not have.
+    """
+    gui, drone, servo = rig
+    gui.left_cal_active = True
+
+    # cmd -1 reaches -41.6 deg against a -25 deg target: well past it.
+    result = gui._cal_evaluate_endpoint(
+        "LEFT", gui.LEFT_OUTPUT_FUNCTION, "MIN", drone.params["PWM_MAIN_MIN5"],
+        {"MAX": 25.0, "MIN": -25.0},
+        (drone.params["PWM_MAIN_MIN5"], drone.params["PWM_MAIN_MAX5"]), False)
+
+    assert result["probed"] is False
+    assert result["breakaway_us"] is None
+    assert result["stop_kind"] == endpoint_logic.STOP_FREE
+
+
+def test_a_lost_reading_at_the_end_stop_is_not_reported_as_stiction(rig):
+    """The probe returns the same pair for a sensor dropout as for a ceiling.
+
+    Blaming friction for a link fault sends the operator to the wrong end of
+    the rig.
+    """
+    gui, drone, servo = rig
+    gui.left_cal_active = True
+
+    gui._cal_measure = lambda *a, **k: None
+
+    breakaway, angle = gui._cal_probe_breakaway(
+        "LEFT", gui.LEFT_OUTPUT_FUNCTION, "MIN",
+        (drone.params["PWM_MAIN_MIN5"], drone.params["PWM_MAIN_MAX5"]),
+        False, -1.0, -30.0)
+
+    assert breakaway is None and angle is None
+    assert gui.cal_flow["LEFT"].failure[3] == "no_angle_at_stop"
 
 
 def test_verification_runs_and_reports_both_ends(rig, capsys):
