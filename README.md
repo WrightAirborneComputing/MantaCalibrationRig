@@ -23,7 +23,7 @@ ports are detected automatically — see [Port detection](#port-detection).
 | `settings.json` | Persisted pot scalers/offsets, target angles, and last-used ports. |
 | `calibration_log.csv` | Append-only record of every logged calibration. Tracked on purpose, so it stays at the top level rather than in `reports/`. |
 | `reports/` | Per-run CSV artefacts: sweep captures, range/rate summaries and sample dumps. Gitignored — clear it out whenever you like. |
-| `tests/` | Host-side tests. No hardware needed: `python3 -m pytest tests/`. |
+| `tests/` | Host-side tests. No hardware needed: `python3 -m pytest tests/` — see [Tests](#tests). |
 | `SERVO_SETTING.md` | The end stop setting procedure, and the measurements behind it. |
 | `endpoint_cal.py` | Implements that procedure offline. `set` writes parameters; `verify` does not. |
 | `servo_probe.py` | Read-only PWM diagnostic. A bolt-on - delete it when the investigation closes. |
@@ -59,6 +59,28 @@ Log out and back in for it to take effect.
 Install Python from python.org with the Tcl/Tk option enabled (it is on by
 default), then `pip install -r requirements.txt`. No driver setup is needed —
 both devices enumerate as USB CDC.
+
+### Tests
+
+No hardware needed — the Pico and the flight controller are both faked:
+
+```bash
+python3 -m pytest tests/
+```
+
+The GUI tests build real Tk windows and pump the event loop, so a few dozen
+windows flash up over the run and steal focus while they do. On Linux, hand them
+a throwaway X server instead of yours:
+
+```bash
+xvfb-run -a python3 -m pytest tests/
+```
+
+Same tests, same result, nothing on screen. `-a` picks a free display number, so
+parallel runs do not collide. On Debian/Ubuntu it comes from `sudo apt install
+xvfb`. Unsetting `DISPLAY` is not the same thing: the
+windowed tests fail rather than skip, because `tkinter` imports fine and only
+`tk.Tk()` needs the server.
 
 ## Running
 
