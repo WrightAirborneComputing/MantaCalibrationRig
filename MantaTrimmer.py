@@ -2523,11 +2523,10 @@ class FourSliderGUI:
 
     CURVE_ROLE_COLOURS = {
         curve_plot.ROLE_UP: "accent",
-        curve_plot.ROLE_FIT_UP: "accent",
         curve_plot.ROLE_DOWN: "bad",
-        curve_plot.ROLE_FIT_DOWN: "bad",
         curve_plot.ROLE_TRAM: "ink_faint",
         curve_plot.ROLE_AXIS: "ink_muted",
+        curve_plot.ROLE_BAND: "accent_lo",
     }
 
     def show_creep_curve(self):
@@ -2549,12 +2548,10 @@ class FourSliderGUI:
         controls = tk.Frame(window, padx=8, pady=6)
         controls.pack(fill=tk.X)
 
-        sides = sorted({point["side"] for point in self.creep_points})
-        self.curve_side_var = tk.StringVar(value=sides[0])
-        for side in sides:
-            tk.Radiobutton(controls, text=side, value=side,
-                           variable=self.curve_side_var,
-                           command=self.redraw_creep_curve).pack(side=tk.LEFT)
+        # No side selector: both sides are panels in the one figure now. A
+        # drone that sticks on one elevon and not the other is the thing this
+        # plot is read for, and that is invisible when the sides are shown one
+        # at a time behind a radio button.
 
         # Deviation by default: the raw curve cannot show a 1 deg band on a
         # 62 deg axis, which is the entire quantity of interest.
@@ -2578,7 +2575,7 @@ class FourSliderGUI:
         tk.Button(controls, text="Save SVG",
                   command=self.export_creep_curve_svg).pack(side=tk.RIGHT)
 
-        self.curve_canvas = tk.Canvas(window, width=780, height=470,
+        self.curve_canvas = tk.Canvas(window, width=780, height=660,
                                       bg=PALETTE["paper"], highlightthickness=1,
                                       highlightbackground=PALETTE["rule"])
         self.curve_canvas.pack(fill=tk.BOTH, expand=True, padx=8)
@@ -2597,9 +2594,11 @@ class FourSliderGUI:
         if not self.creep_points:
             return None
 
-        series = curve_series(self.creep_points, self.curve_side_var.get())
-        return curve_plot.build_plot(
-            series,
+        sides = sorted({point["side"] for point in self.creep_points})
+        series_by_side = {side: curve_series(self.creep_points, side)
+                          for side in sides}
+        return curve_plot.build_figure(
+            series_by_side,
             order=max(1, self.get_int_var(self.curve_order_var, 2)),
             tolerance_deg=max(0.0, self.get_float_var(self.curve_tol_var, 0.5)),
             width=width, height=height, mode=self.curve_mode_var.get())
@@ -2620,6 +2619,11 @@ class FourSliderGUI:
             canvas.create_text(width / 2, height / 2, text="Nothing to plot",
                                fill=PALETTE["ink_muted"])
             return
+
+        # The band goes down first: it is what the curves are drawn on, and a
+        # Tk polygon has no alpha to see the tramlines through.
+        for shape in plot["polygons"]:
+            self._draw_plot_polygon(canvas, shape)
 
         for line in plot["axes"]:
             self._draw_plot_line(canvas, line, 1)
@@ -2652,39 +2656,55 @@ class FourSliderGUI:
                            dash=(4, 3) if line.get("dash") else None)
     # def
 
+    def _draw_plot_polygon(self, canvas, shape):
+        colour = PALETTE[self.CURVE_ROLE_COLOURS[shape["role"]]]
+        flat = []
+        for x, y in shape["points"]:
+            flat.extend((x, y))
+        if len(flat) < 6:
+            return
+        canvas.create_polygon(*flat, fill=colour, outline="")
+    # def
+
     def describe_creep_plot(self, plot):
-        """The numbers the picture cannot carry: fit quality and band size."""
-        stats = plot["stats"]
-        parts = []
+        """The band summary per panel: mean, spread and worst point.
 
-        for direction, label in ((1.0, "up"), (-1.0, "down")):
-            fit = stats["fits"].get(direction)
-            if fit and fit["rms_deg"] is not None:
-                parts.append("%s fit rms %.2f deg, worst %+.2f at %d us"
-                             % (label, fit["rms_deg"], fit["max_deg"],
-                                fit["max_pwm"]))
+        The fit residuals used to be reported here too. They described how well
+        a polynomial matched each sweep, which is a property of the fit rather
+        than of the servo, and it read as the headline number when the band is
+        the measurement. The fit curves are no longer drawn either, but the
+        residuals stay in stats["fits"] for anything that wants them.
+        """
+        lines = []
 
-        band = stats.get("band")
-        if band:
-            parts.append("band mean %.2f deg, max %.2f deg at %d us"
-                         % (band["mean_deg"], band["max_deg"], band["max_pwm"]))
+        for panel in plot["panels"]:
+            band = panel["stats"].get("band")
+            summary = curve_plot.format_band(band, separator=", ").lstrip(", ")
 
-        return "\n".join(parts) if parts else "Not enough points to fit"
+            if summary:
+                lines.append("%s: %s at %d us, over %d PWM points"
+                             % (panel["side"], summary, band["max_pwm"],
+                                band["n"]))
+            else:
+                lines.append("%s: the two sweeps share no PWM to compare"
+                             % panel["side"])
+
+        return "\n".join(lines) if lines else "Nothing measured"
     # def
 
     def export_creep_curve_svg(self):
-        plot = self.build_creep_plot(880, 520)
+        plot = self.build_creep_plot(880, 720)
         if plot is None:
             print("Nothing to plot")
             return
 
         try:
-            side = self.curve_side_var.get()
-            path = self.rr_report_path("creepcurve_%s" % side.lower())
+            # One file for the whole figure now, not one per side.
+            path = self.rr_report_path("creepcurve")
             path = path[:-4] + ".svg"
 
             with open(path, "w", encoding="utf-8") as f:
-                f.write(curve_plot.to_svg(plot, "Creep curve - %s" % side))
+                f.write(curve_plot.to_svg(plot, "Creep curve"))
 
             print("Creep curve plot written to %s" % path)
 

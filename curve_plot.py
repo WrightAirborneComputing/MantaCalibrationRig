@@ -11,7 +11,8 @@ cannot be the thing that adds a build dependency. SVG needs nothing, scales, and
 opens anywhere.
 """
 
-from range_test import band_profile, evaluate_polynomial, fit_polynomial, rms
+from range_test import (band_profile, evaluate_polynomial, fit_polynomial,
+                        mean_sd, rms)
 
 MARGIN_LEFT = 74
 MARGIN_RIGHT = 18
@@ -22,24 +23,26 @@ MARGIN_BOTTOM = 54
 # curve means.
 ROLE_UP = "up"
 ROLE_DOWN = "down"
-ROLE_FIT_UP = "fit_up"
-ROLE_FIT_DOWN = "fit_down"
 ROLE_TRAM = "tram"
 ROLE_AXIS = "axis"
+ROLE_BAND = "band"
 
 MODE_CURVE = "curve"
 MODE_DEVIATION = "deviation"
 
-DIRECTIONS = ((1.0, ROLE_UP, ROLE_FIT_UP), (-1.0, ROLE_DOWN, ROLE_FIT_DOWN))
+DIRECTIONS = ((1.0, ROLE_UP), (-1.0, ROLE_DOWN))
 
 SVG_COLOURS = {
     ROLE_UP: "#185FA5",
     ROLE_DOWN: "#993C1D",
-    ROLE_FIT_UP: "#185FA5",
-    ROLE_FIT_DOWN: "#993C1D",
     ROLE_TRAM: "#888780",
     ROLE_AXIS: "#5F5E5A",
+    ROLE_BAND: "#d6ebec",
 }
+
+# Vertical room between stacked panels: the upper panel's tick labels and axis
+# title live here, and so does the lower panel's own title.
+PANEL_GAP = 62
 
 
 def nice_ticks(low, high, count=6):
@@ -86,7 +89,7 @@ def _floor_log10(value):
 class PlotBox:
     """Maps data coordinates to pixels, with y increasing upward as drawn."""
 
-    def __init__(self, x_range, y_range, width, height):
+    def __init__(self, x_range, y_range, width, height, region=None):
         self.x_min, self.x_max = x_range
         self.y_min, self.y_max = y_range
         self.width = width
@@ -94,8 +97,12 @@ class PlotBox:
 
         self.left = MARGIN_LEFT
         self.right = max(MARGIN_LEFT + 1, width - MARGIN_RIGHT)
-        self.top = MARGIN_TOP
-        self.bottom = max(MARGIN_TOP + 1, height - MARGIN_BOTTOM)
+        # `region` is the vertical slice this box owns, for a figure that
+        # stacks several. Without it the box takes the whole frame, which is
+        # what a single panel wants.
+        top, bottom = region or (MARGIN_TOP, height - MARGIN_BOTTOM)
+        self.top = top
+        self.bottom = max(top + 1, bottom)
 
     def x(self, value):
         span = self.x_max - self.x_min
@@ -138,7 +145,7 @@ def _padded(values, fraction=0.06):
 
 
 def build_plot(series, order=2, tolerance_deg=0.5, width=760, height=460,
-               mode=MODE_DEVIATION):
+               mode=MODE_DEVIATION, region=None, title=None):
     """Everything to draw, in pixels, plus the numbers the caption needs.
 
     `series` is curve_series() output: {direction: [(pwm, mean, sd, n)]}.
@@ -178,14 +185,15 @@ def build_plot(series, order=2, tolerance_deg=0.5, width=760, height=460,
         limit = max(abs(y_range[0]), abs(y_range[1]), tolerance_deg * 1.4)
         y_range = (-limit, limit)
 
-    box = PlotBox(_padded(xs_all), y_range, width, height)
+    box = PlotBox(_padded(xs_all), y_range, width, height, region)
 
     polylines = []
     markers = []
     texts = []
+    plotted = {}
     stats = {"order": order, "tolerance_deg": tolerance_deg, "fits": {}}
 
-    for direction, role, fit_role in DIRECTIONS:
+    for direction, role in DIRECTIONS:
         rows = usable.get(direction)
         if not rows:
             continue
@@ -195,7 +203,8 @@ def build_plot(series, order=2, tolerance_deg=0.5, width=760, height=460,
         ys = ([y - evaluate_polynomial(reference, x) for x, y in zip(xs, measured)]
               if reference else measured)
 
-        polylines.append({"role": role, "dash": direction < 0,
+        plotted[direction] = dict(zip(xs, ys))
+        polylines.append({"role": role, "dash": direction < 0, "width": 2,
                           "points": [box.point(x, y) for x, y in zip(xs, ys)]})
         markers.extend({"role": role, "point": box.point(x, y)}
                        for x, y in zip(xs, ys))
@@ -204,16 +213,10 @@ def build_plot(series, order=2, tolerance_deg=0.5, width=760, height=460,
         if not fit:
             continue
 
-        if reference:
-            smooth = [(x, evaluate_polynomial(fit, x)
-                       - evaluate_polynomial(reference, x))
-                      for x, _ in _sample_fit(fit, min(xs), max(xs))]
-        else:
-            smooth = _sample_fit(fit, min(xs), max(xs))
-
-        polylines.append({"role": fit_role, "dash": False, "width": 2,
-                          "points": [box.point(x, y) for x, y in smooth]})
-
+        # The fit is not drawn. Two smooth curves laid over two measured
+        # sweeps and a filled band left four lines competing for the same
+        # space, and the fit is the one carrying no measurement. Its
+        # residuals are still reported below.
         residuals = [y - evaluate_polynomial(fit, x)
                      for x, y in zip(xs, measured)]
         stats["fits"][direction] = {
@@ -222,15 +225,32 @@ def build_plot(series, order=2, tolerance_deg=0.5, width=760, height=460,
             "max_pwm": xs[residuals.index(max(residuals, key=abs))],
         }
 
+    # The band summary, keyed on PWM rather than command. band_profile() only
+    # returns PWM values both sweeps visited, so where the range clamps and two
+    # commands land on one PWM the pair averages into a single point instead of
+    # being counted twice - which is what a command-keyed mean gets wrong.
     band = band_profile(usable)
     if band:
         magnitudes = [abs(value) for _pwm, value in band]
         worst = max(band, key=lambda pair: abs(pair[1]))
+        mean_deg, sd_deg = mean_sd(magnitudes)
         stats["band"] = {
-            "mean_deg": sum(magnitudes) / len(magnitudes),
+            "mean_deg": mean_deg,
+            "sd_deg": sd_deg,
             "max_deg": abs(worst[1]),
             "max_pwm": worst[0],
+            "n": len(band),
         }
+
+    polygons = []
+    up_points, down_points = plotted.get(1.0), plotted.get(-1.0)
+    if up_points and down_points:
+        shared = sorted(set(up_points) & set(down_points))
+        if len(shared) >= 2:
+            ring = [box.point(pwm, up_points[pwm]) for pwm in shared]
+            ring.extend(box.point(pwm, down_points[pwm])
+                        for pwm in reversed(shared))
+            polygons.append({"role": ROLE_BAND, "points": ring})
 
     # The tramlines: in deviation mode they are the acceptance band about zero,
     # which is what makes them read as rails rather than as another pair of
@@ -238,20 +258,96 @@ def build_plot(series, order=2, tolerance_deg=0.5, width=760, height=460,
     if reference:
         for sign in (1, -1):
             polylines.append({
-                "role": ROLE_TRAM, "dash": True,
+                "role": ROLE_TRAM, "dash": True, "width": 1,
                 "points": [box.point(box.x_min, sign * tolerance_deg),
                            box.point(box.x_max, sign * tolerance_deg)]})
         polylines.append({
-            "role": ROLE_AXIS, "dash": False,
+            "role": ROLE_AXIS, "dash": False, "width": 1,
             "points": [box.point(box.x_min, 0.0), box.point(box.x_max, 0.0)]})
 
     stats["mode"] = mode
     axes, axis_texts = _axes(box, reference is not None)
     texts.extend(axis_texts)
 
-    return {"box": box, "polylines": polylines, "markers": markers,
-            "axes": axes, "texts": texts, "stats": stats,
+    if title:
+        # Right-aligned: the y axis title already occupies the top left. The
+        # numbers ride on the panel itself rather than only in the caption, so
+        # a panel stays readable when it is exported on its own.
+        texts.append({"x": box.right, "y": box.top - 6, "anchor": "end",
+                      "text": "%s%s" % (title, format_band(stats.get("band")))})
+
+    return {"box": box, "polygons": polygons, "polylines": polylines,
+            "markers": markers, "axes": axes, "texts": texts, "stats": stats,
             "width": width, "height": height}
+# def
+
+
+def build_figure(series_by_side, order=2, tolerance_deg=0.5, width=760,
+                 height=620, mode=MODE_DEVIATION):
+    """One figure, one panel per side, each panel on its own pair of axes.
+
+    Left and right are trimmed independently and rarely share a PWM range - on
+    055 the left elevon runs 1281-2011 us and the right 942-1641 - so a common
+    x axis would push each curve into its own half of the frame and compare the
+    two by their absolute PWM, which means nothing. Separate axes per panel
+    compare the shapes, which is the thing being looked at, and having both in
+    one figure is what makes a one-sided drone obvious at a glance.
+
+    Returns the same primitives build_plot() does, already merged into a single
+    pixel space, plus `panels` carrying each side's stats. None when no side
+    has anything plottable.
+    """
+    sides = [side for side in sorted(series_by_side)
+             if any(series_by_side[side].values())]
+    if not sides:
+        return None
+
+    # Every panel gets the same plot height. Sides drawn at different scales
+    # would be the one thing this figure exists to prevent.
+    gaps = PANEL_GAP * (len(sides) - 1)
+    panel_height = max(1.0, (height - MARGIN_TOP - MARGIN_BOTTOM - gaps)
+                       / float(len(sides)))
+
+    figure = {"polygons": [], "polylines": [], "markers": [], "axes": [],
+              "texts": [], "panels": [], "width": width, "height": height}
+
+    for index, side in enumerate(sides):
+        top = MARGIN_TOP + (index * (panel_height + PANEL_GAP))
+        bottom = top + panel_height
+
+        panel = build_plot(series_by_side[side], order=order,
+                           tolerance_deg=tolerance_deg, width=width,
+                           height=height, mode=mode, region=(top, bottom),
+                           title=side)
+        if panel is None:
+            continue
+
+        for key in ("polygons", "polylines", "markers", "axes", "texts"):
+            figure[key].extend(panel[key])
+        figure["panels"].append({"side": side, "stats": panel["stats"],
+                                 "box": panel["box"]})
+
+    return figure if figure["panels"] else None
+# def
+
+
+def format_band(band, separator="   "):
+    """"mean/sd/max" for a band summary, or "" when there is nothing to say.
+
+    One implementation, so the panel header and the caption cannot quote
+    different numbers for the same measurement.
+    """
+    if not band or band.get("mean_deg") is None:
+        return ""
+
+    parts = ["mean %.2f" % band["mean_deg"]]
+    # sd is None on a single shared point, where a spread is undefined rather
+    # than zero, and printing 0.00 there would claim a precision nobody has.
+    if band.get("sd_deg") is not None:
+        parts.append("sd %.2f" % band["sd_deg"])
+    parts.append("max %.2f deg" % band["max_deg"])
+
+    return separator + separator.join(parts)
 # def
 
 
@@ -311,6 +407,11 @@ def to_svg(plot, title="Creep curve"):
         '<rect width="%d" height="%d" fill="#ffffff"/>' % (width, height),
     ]
 
+    # Fills first: the band is a backdrop for the curves, not a mark on top of
+    # them, and a solid fill drawn later would bury the tramlines.
+    for shape in plot.get("polygons", ()):
+        parts.append(_polygon(shape, SVG_COLOURS.get(shape["role"], "#eeeeee")))
+
     for line in plot["axes"]:
         parts.append(_polyline(line, SVG_COLOURS[ROLE_AXIS], 1.0))
 
@@ -332,6 +433,12 @@ def to_svg(plot, title="Creep curve"):
 
     parts.append('</svg>')
     return "\n".join(parts)
+# def
+
+
+def _polygon(shape, colour):
+    points = " ".join("%.2f,%.2f" % (x, y) for x, y in shape["points"])
+    return '<polygon points="%s" fill="%s"/>' % (points, colour)
 # def
 
 

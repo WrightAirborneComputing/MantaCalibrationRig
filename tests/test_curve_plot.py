@@ -155,3 +155,135 @@ def test_plot_is_built_from_the_shared_analysis(monkeypatch):
     series = RT.curve_series(points, "LEFT")
     assert series[1.0][0][1] == pytest.approx(-10.1)
     assert 99.0 not in [row[1] for rows in series.values() for row in rows]
+
+
+def test_the_band_is_filled_between_the_two_sweeps():
+    """The hysteresis is drawn, not left to be measured between two lines."""
+    plot = CP.build_plot(make_series(band=2.0, points=11))
+    band = [shape for shape in plot["polygons"] if shape["role"] == CP.ROLE_BAND]
+    assert len(band) == 1
+
+    # Closed: one vertex per direction per shared PWM, and it comes back.
+    ring = band[0]["points"]
+    assert len(ring) == 22
+    assert ring[0] != ring[-1] and ring[0][0] == pytest.approx(ring[-1][0])
+
+
+def test_the_band_only_spans_pwms_both_sweeps_visited():
+    """A polygon across a gap would draw hysteresis nobody measured."""
+    series = make_series(band=2.0, points=11)
+    series[-1.0] = series[-1.0][:6]
+
+    ring = [s for s in CP.build_plot(series)["polygons"]
+            if s["role"] == CP.ROLE_BAND][0]["points"]
+    assert len(ring) == 12
+
+    box = CP.build_plot(series)["box"]
+    shared_max = series[-1.0][-1][0]
+    assert max(x for x, _y in ring) == pytest.approx(box.x(shared_max))
+
+
+def test_one_sweep_alone_has_no_band():
+    plot = CP.build_plot({1.0: make_series()[1.0]})
+    assert plot["polygons"] == []
+
+
+def test_a_figure_stacks_a_panel_per_side():
+    figure = CP.build_figure({"LEFT": make_series(band=2.0),
+                              "RIGHT": make_series(band=5.0)}, height=620)
+
+    assert [panel["side"] for panel in figure["panels"]] == ["LEFT", "RIGHT"]
+    assert len(figure["polygons"]) == 2
+    assert any(t["text"].startswith("LEFT") for t in figure["texts"])
+
+    top, bottom = (panel["box"] for panel in figure["panels"])
+    assert top.bottom < bottom.top, "panels do not overlap"
+    # Same plot height either side, or the two shapes are not comparable.
+    assert (top.bottom - top.top) == pytest.approx(bottom.bottom - bottom.top)
+
+
+def test_each_panel_gets_its_own_axes():
+    """Left and right rarely share a PWM range, so they cannot share an x axis."""
+    left = make_series(band=2.0)
+    right = {d: [(pwm - 250, angle, sd, n) for pwm, angle, sd, n in rows]
+             for d, rows in make_series(band=2.0).items()}
+
+    figure = CP.build_figure({"LEFT": left, "RIGHT": right})
+    boxes = {panel["side"]: panel["box"] for panel in figure["panels"]}
+    assert boxes["LEFT"].x_min > boxes["RIGHT"].x_min
+    assert boxes["LEFT"].x(boxes["LEFT"].x_min) == pytest.approx(
+        boxes["RIGHT"].x(boxes["RIGHT"].x_min)), "each panel fills its frame"
+
+
+def test_a_figure_with_nothing_plottable_is_nothing():
+    assert CP.build_figure({}) is None
+    assert CP.build_figure({"LEFT": {}}) is None
+    assert CP.build_figure({"LEFT": {1.0: []}}) is None
+
+
+def test_svg_draws_the_band_under_the_curves():
+    svg = CP.to_svg(CP.build_figure({"LEFT": make_series(band=2.0)}))
+    assert svg.count("<polygon") == 1
+    assert svg.index("<polygon") < svg.index("<polyline"), "fill goes down first"
+
+
+def test_the_band_summary_is_mean_sd_and_max():
+    stats = CP.build_plot(make_series(band=2.0, points=11))["stats"]
+    band = stats["band"]
+
+    assert band["mean_deg"] == pytest.approx(2.0)
+    assert band["sd_deg"] == pytest.approx(0.0, abs=1e-9)
+    assert band["max_deg"] == pytest.approx(2.0)
+    assert band["n"] == 11
+
+
+def test_the_band_summary_carries_a_real_spread():
+    """A band that varies across the sweep must not report sd 0."""
+    series = make_series(band=1.0, points=11)
+    widened = list(series[1.0])
+    pwm, angle, sd, n = widened[5]
+    widened[5] = (pwm, angle - 4.0, sd, n)
+    series[1.0] = widened
+
+    band = CP.build_plot(series)["stats"]["band"]
+    assert band["sd_deg"] > 1.0
+    assert band["max_deg"] == pytest.approx(5.0)
+    assert band["max_pwm"] == pwm
+
+
+def test_one_shared_point_has_no_spread_to_report():
+    """sd is undefined on a single point, not zero."""
+    series = make_series(band=2.0, points=11)
+    series[-1.0] = series[-1.0][:1]
+
+    band = CP.build_plot(series)["stats"]["band"]
+    assert band["n"] == 1
+    assert band["sd_deg"] is None
+    assert "sd" not in CP.format_band(band)
+    assert "mean 2.00" in CP.format_band(band)
+
+
+def test_the_panel_header_carries_the_numbers():
+    """Readable on its own, not only next to the caption."""
+    figure = CP.build_figure({"LEFT": make_series(band=2.0)})
+    header = [t["text"] for t in figure["texts"] if t["text"].startswith("LEFT")]
+
+    assert len(header) == 1
+    for token in ("mean", "sd", "max", "deg"):
+        assert token in header[0]
+
+
+def test_a_band_that_is_not_there_says_nothing():
+    assert CP.format_band(None) == ""
+    assert CP.format_band({}) == ""
+    assert CP.format_band({"mean_deg": None}) == ""
+
+
+def test_only_the_measured_sweeps_are_drawn():
+    """The fit is analysis, not a mark: four lines over one band read as noise."""
+    plot = CP.build_plot(make_series(band=2.0), mode=CP.MODE_CURVE)
+    roles = {line["role"] for line in plot["polylines"]}
+
+    assert roles == {CP.ROLE_UP, CP.ROLE_DOWN}
+    # ...but the residuals it feeds are still available to a caller.
+    assert set(plot["stats"]["fits"]) == {1.0, -1.0}
