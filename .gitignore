@@ -10,3 +10,7 @@ settings.json.tmp
 # One directory rather than a glob per output kind. calibration_log.csv stays at
 # the top level and tracked on purpose - it is the append-only record.
 reports/
+
+# Spreadsheet backups of the tracked calibration record, written by the
+# migration path and by LibreOffice. Same reasoning as settings.json.bak.
+*.csv.bak
