@@ -15,6 +15,15 @@
 //   ?    status                  -> "# STATUS uptime_ms=... ..."
 //   U    UART traffic report     -> "# UART L=... C=... R=..."
 //   X    hex dump the last bytes  -> "# DUMP LEFT ..." x3
+//   B<n> reopen sensor UARTs at n  -> "# ACK B 115200"
+//   W<c>:<hex>  write bytes to a   -> "# ACK W C 5"
+//        sensor. c is 0/1/2 or A.
+//
+// B and W exist so the sensor modules can be configured from the host without
+// a second adapter, and - more to the point - so a module left at an unknown
+// baud can be found again by sweeping B. Changing a module's baud is the one
+// operation here that can lose contact with it, so the tool that does it also
+// has to be the tool that recovers from it.
 //   Z    zero the UART counters  -> "# ACK Z"
 //   other                        -> "# ERR <text>"
 
@@ -28,9 +37,9 @@ static const char *const NAMES[3] = {"LEFT", "CENTRE", "RIGHT"};
 
 // The DFRobot modules' factory default. Unverified - if a channel reports
 // bytes but no plausible frames, this is the first thing to suspect.
-static const uint32_t SENSOR_BAUD = 9600;
+static uint32_t sensor_baud = 9600;
 
-static const uint8_t MAX_COMMAND_LEN = 16;
+static const uint8_t MAX_COMMAND_LEN = 48;   // "W" carries a hex payload
 
 // Last bytes seen per channel, so "X" can show the frame structure without
 // any timing games on the host side. 64 is comfortably more than two WitMotion
@@ -46,6 +55,12 @@ static uint8_t last_byte[3] = {0, 0, 0};
 static String pending = "";
 static uint32_t blink_at = 0;
 static bool led_on = false;
+
+static int hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
 
 static void identify() {
     // Shaped like the identity reply SENSORS.md describes, so the host-side
@@ -96,10 +111,58 @@ static void apply_command(const String &raw) {
         Serial.print("# STATUS uptime_ms=");
         Serial.print(millis());
         Serial.print(" sensor_baud=");
-        Serial.print(SENSOR_BAUD);
+        Serial.print(sensor_baud);
         Serial.println(" mode=bringup");
     } else if (text == "U") {
         uart_report();
+    } else if (text.startsWith("B")) {
+        long b = text.substring(1).toInt();
+        if (b < 1200 || b > 1000000) {
+            Serial.println("# ERR B range");
+        } else {
+            sensor_baud = (uint32_t)b;
+            for (int i = 0; i < 3; i++) {
+                PORTS[i]->end();
+                PORTS[i]->begin(sensor_baud);
+            }
+            for (int i = 0; i < 3; i++) {
+                byte_count[i] = 0; last_byte_ms[i] = 0; ring_pos[i] = 0;
+            }
+            Serial.print("# ACK B ");
+            Serial.println(sensor_baud);
+        }
+    } else if (text.startsWith("W")) {
+        // W<c>:<hex>. Counters are not touched - a write is often followed by
+        // a rate check, and clearing here would hide the before/after.
+        int colon = text.indexOf(':');
+        if (colon < 2) {
+            Serial.println("# ERR W syntax");
+            return;
+        }
+        char which = text.charAt(1);
+        String hex = text.substring(colon + 1);
+        if (hex.length() < 2 || (hex.length() % 2) != 0) {
+            Serial.println("# ERR W hex");
+            return;
+        }
+        uint8_t bytes[24];
+        uint8_t n = 0;
+        for (unsigned int k = 0; k + 1 < hex.length() && n < sizeof(bytes); k += 2) {
+            int hi = hexval(hex.charAt(k)), lo = hexval(hex.charAt(k + 1));
+            if (hi < 0 || lo < 0) { Serial.println("# ERR W hex"); return; }
+            bytes[n++] = (uint8_t)((hi << 4) | lo);
+        }
+        int first = 0, last = 2;
+        if (which >= '0' && which <= '2') { first = last = which - '0'; }
+        else if (which != 'A') { Serial.println("# ERR W chan"); return; }
+        for (int i = first; i <= last; i++) {
+            PORTS[i]->write(bytes, n);
+            PORTS[i]->flush();
+        }
+        Serial.print("# ACK W ");
+        Serial.print(which);
+        Serial.print(' ');
+        Serial.println(n);
     } else if (text == "X") {
         // Oldest-first dump of each channel's ring. Hex, space separated, one
         // line per channel, so a header byte repeating every N bytes is
@@ -134,7 +197,7 @@ void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
     Serial.begin(115200);               // ignored on USB CDC; kept for habit
     for (int i = 0; i < 3; i++) {
-        PORTS[i]->begin(SENSOR_BAUD);
+        PORTS[i]->begin(sensor_baud);
     }
     // No wait-for-host loop: the board must run standalone on the rig, and a
     // blocking wait here would make an unattended power-on look like a hang.

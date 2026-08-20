@@ -547,27 +547,63 @@ own filter reported -2.21, which agrees closely enough to trust both.
 The gyro reads exactly zero on all three axes while stationary, which is what
 makes it usable as the first-order motion gate described above.
 
-### The sample rate is capped by the baud rate, not the module
+### The modules were reconfigured, and now run at 200 Hz
 
-Both live modules stream **441 bytes/s, which is 10.0 Hz** - one 44-byte sample
-set per 100 ms. That is the module's configured output rate, and the 9600 baud
-default cannot carry much more:
+As shipped they streamed 441 bytes/s - one 44-byte sample set per 100 ms, so
+**10.0 Hz** - and the 9600 baud default could not have carried much more than
+21.8 Hz whatever the module was asked for. The link was the constraint, not the
+part.
 
-| Sensor baud | Link capacity | Max sample-set rate |
+Three changes, applied to all three modules and saved to their flash, in this
+order and for this reason - free capacity first, then raise demand:
+
+| Register | Set to | Effect |
 |---|---|---|
-| 9600 (default) | 960 B/s | 21.8 Hz |
-| 115200 | 11520 B/s | 261.8 Hz |
-| 230400 | 23040 B/s | 523.6 Hz |
-| 460800 | 46080 B/s | 1047.3 Hz |
+| `0x02` RSW | `0x000E` | accel + gyro + angle; drops the magnetic frame |
+| `0x04` BAUD | `0x0006` | 115200 |
+| `0x03` RRATE | `0x000B` | 200 Hz |
 
-**The 9600 baud default must be raised**, and the module's own output rate with
-it. 115200 already clears the 200 Hz the part is rated for. Turning off the
-all-zero `0x54` magnetic frame would recover a further 25% of the link for
-nothing, and is worth doing on principle even though 115200 does not need it.
+The magnetic frame was 11 of every 44 bytes carrying nothing but zeros - this is
+a 6-axis part with no magnetometer - so dropping it recovered a quarter of the
+link for free and took the sample set from 44 bytes to 33. Measured effect was
+exactly the predicted ratio: 443 B/s to 332 B/s.
 
-Note this is the *sensor-side* UART. The Teensy's USB link to the host is CDC at
-480 Mbit and is nowhere near being the constraint - a reversal of the Pico rig,
-where the board's own `print()` cost set the ceiling.
+Measured after all three changes, all channels, no bad checksums:
+
+| Channel | rate | of the 115200 link | sample rate |
+|---|---|---|---|
+| LEFT | 6621 B/s | 57.5% | 200.6 Hz |
+| CENTRE | 6625 B/s | 57.5% | 200.7 Hz |
+| RIGHT | 6606 B/s | 57.3% | 200.2 Hz |
+
+200 Hz is the part's rated ceiling, so this is as fast as these modules go. The
+link still has 42% spare, which is deliberate - the Pico rig's own notes make
+the case for not running a stream at its limit, and the headroom is there if a
+fourth frame type is ever wanted back.
+
+**The rate increase was free in noise terms.** Re-measured at 200 Hz, the static
+scatter was 0.0128 / 0.0142 / 0.0111 degrees against 0.0129 / 0.0142 / 0.0134 at
+10 Hz - identical within the measurement. A higher output rate often costs
+noise, because there is less internal averaging behind each sample. Here it did
+not, so there is no rate-versus-resolution trade to make: take the 200 Hz.
+
+Note the USB side was never the constraint and still is not. The Teensy's link
+to the host is CDC at 480 Mbit, and three channels at 200 Hz is about 20 kB/s.
+This is a reversal of the Pico rig, where the board's own `print()` cost set the
+ceiling.
+
+### What 200 Hz means for the rate-dependent measurements
+
+The rig's elevon transit is about 100 ms. At the Pico's 1000 Hz that resolved
+into roughly 100 samples; at 200 Hz it is about 20. Travel and settled angles
+are unaffected - they are averages of a stationary surface. What degrades is
+anything reading the *shape* of the edge: the 10-90% crossings behind
+`transit_ms` and `rate_deg_s`.
+
+So the three-outcome rule above is not hypothetical, and the numbers to gate on
+are now real rather than assumed. 20 samples across an edge is a usable but
+noticeably coarser measurement, and it should be reported as degraded rather
+than either refused or quietly presented as equivalent to a pot run.
 
 ### The static noise floor is far better than the pots
 
@@ -617,9 +653,11 @@ calibration can store, and thermal drift would not be.
 ## What is still not known
 
 - **Noise on a live rig**, as opposed to a quiet bench.
-- **The sustained rate once the baud rate is raised**, which is the number that
-  decides which of the rate-dependent measurements survive. The table above is
-  link capacity, not a measured sustained rate.
+- **That the module configuration survives a power cycle.** The changes were
+  written to module flash with a save command and verified live, but the modules
+  have not been powered down since. Confirm on next power-up; if they revert to
+  9600 and 10 Hz, the save did not take and the host will need to apply the
+  configuration at connect instead.
 - **Drift** over the length of a real calibration run, and with temperature. The
   modules report die temperature in every `0x51` frame, so this is measurable
   without extra hardware.
