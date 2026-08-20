@@ -14,6 +14,7 @@
 //   I    identify                -> "# ID dev=manta-bringup ..."
 //   ?    status                  -> "# STATUS uptime_ms=... ..."
 //   U    UART traffic report     -> "# UART L=... C=... R=..."
+//   X    hex dump the last bytes  -> "# DUMP LEFT ..." x3
 //   Z    zero the UART counters  -> "# ACK Z"
 //   other                        -> "# ERR <text>"
 
@@ -30,6 +31,13 @@ static const char *const NAMES[3] = {"LEFT", "CENTRE", "RIGHT"};
 static const uint32_t SENSOR_BAUD = 9600;
 
 static const uint8_t MAX_COMMAND_LEN = 16;
+
+// Last bytes seen per channel, so "X" can show the frame structure without
+// any timing games on the host side. 64 is comfortably more than two WitMotion
+// -style 11-byte frames, which is enough to see a header repeat.
+static const uint8_t RING = 64;
+static uint8_t ring[3][RING];
+static uint8_t ring_pos[3] = {0, 0, 0};
 
 static uint32_t byte_count[3] = {0, 0, 0};
 static uint32_t last_byte_ms[3] = {0, 0, 0};
@@ -74,6 +82,14 @@ static void apply_command(const String &raw) {
     if (text.length() == 0) {
         return;
     }
+    // Replies are inert as commands. The host TTY line discipline echoes
+    // whatever is in its buffer back at the board when the port is first
+    // opened, which handed this parser its own boot banner and got an "# ERR
+    // # MANTA BRINGUP" for it. Every board-to-host line starts with "#", so
+    // ignoring "#" here makes that whole class of loopback harmless.
+    if (text.charAt(0) == '#') {
+        return;
+    }
     if (text == "I") {
         identify();
     } else if (text == "?") {
@@ -84,11 +100,28 @@ static void apply_command(const String &raw) {
         Serial.println(" mode=bringup");
     } else if (text == "U") {
         uart_report();
+    } else if (text == "X") {
+        // Oldest-first dump of each channel's ring. Hex, space separated, one
+        // line per channel, so a header byte repeating every N bytes is
+        // visible by eye and the frame length can be read straight off.
+        for (int i = 0; i < 3; i++) {
+            Serial.print("# DUMP ");
+            Serial.print(NAMES[i]);
+            for (uint8_t k = 0; k < RING; k++) {
+                uint8_t b = ring[i][(ring_pos[i] + k) % RING];
+                Serial.print(' ');
+                if (b < 0x10) Serial.print('0');
+                Serial.print(b, HEX);
+            }
+            Serial.println();
+        }
     } else if (text == "Z") {
         for (int i = 0; i < 3; i++) {
             byte_count[i] = 0;
             last_byte_ms[i] = 0;
             last_byte[i] = 0;
+            ring_pos[i] = 0;
+            for (uint8_t k = 0; k < RING; k++) ring[i][k] = 0;
         }
         Serial.println("# ACK Z");
     } else {
@@ -117,7 +150,10 @@ void loop() {
     // exists to answer.
     for (int i = 0; i < 3; i++) {
         while (PORTS[i]->available() > 0) {
-            last_byte[i] = (uint8_t)PORTS[i]->read();
+            uint8_t b = (uint8_t)PORTS[i]->read();
+            last_byte[i] = b;
+            ring[i][ring_pos[i]] = b;
+            ring_pos[i] = (uint8_t)((ring_pos[i] + 1) % RING);
             byte_count[i]++;
             last_byte_ms[i] = millis();
         }

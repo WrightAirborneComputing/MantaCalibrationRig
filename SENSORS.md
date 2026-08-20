@@ -516,29 +516,125 @@ whose entire value is that it shares no code with the application: when the
 abstraction is broken, `pico_monitor` is how you find out. Folding it in is the
 tidy answer and the wrong one.
 
-## What is not decided yet
+## What the modules actually do
 
-Three measurements gate the rest, and none of them has been taken. Take them on
-the bench before building.
+Measured on the bench 2026-08-20 with `teensy/bringup`, two modules attached
+and lying flat. All frame checksums valid.
 
-1. **Can the module emit raw per-axis counts at all?** Many modules in this
-   family ship emitting pre-fused Euler angles computed by their own internal
-   filter. If raw acceleration is not reachable, the six-face calibration has
-   nothing to calibrate — it would be fitting a bias-and-scale model to somebody
-   else's filter output, which is not a bias-and-scale model.
-2. **The static noise floor**, against the 0.23-0.27 degree figure the end-stop
-   procedure is tuned to. This is the measurement that can invalidate the
-   hardware change rather than merely complicate it.
-3. **The sustainable sample rate**, which decides which measurements survive.
-   Secondary to the noise floor: a fast sensor that cannot resolve a quarter of
-   a degree is useless for the end-stop procedure at any rate.
+### The wire format is WitMotion
 
-Record all three here, in the style of the rate table in `pico/sampler.py`, as
-soon as they are known.
+Eleven-byte frames, `55 <type> <8 data> <checksum>`, checksum being the low byte
+of the sum of the first ten. Four frame types arrive in a repeating cycle:
+
+| Type | Contents | Notes |
+|---|---|---|
+| `0x54` | magnetic | all zeros - this is a 6-axis part with no magnetometer |
+| `0x51` | **acceleration** | int16 per axis, plus die temperature |
+| `0x52` | angular velocity | int16 per axis |
+| `0x53` | attitude angle | int16 per axis, plus a version word |
+
+So the cycle is **44 bytes per sample set**, of which 11 carry nothing at all.
+
+Acceleration scales as `raw / 32768 x 16 g`, angle as `raw / 32768 x 180 deg`.
+
+**Raw per-axis acceleration is available.** This was the question that decided
+whether the six-face calibration was possible at all, and the answer is yes: the
+`0x51` frame is unfiltered accelerometer output, and the module's own fused
+angle arrives separately in `0x53` as a free cross-check. Decoded together while
+lying flat, the accelerometer gave a roll of -2.18 degrees where the module's
+own filter reported -2.21, which agrees closely enough to trust both.
+
+The gyro reads exactly zero on all three axes while stationary, which is what
+makes it usable as the first-order motion gate described above.
+
+### The sample rate is capped by the baud rate, not the module
+
+Both live modules stream **441 bytes/s, which is 10.0 Hz** - one 44-byte sample
+set per 100 ms. That is the module's configured output rate, and the 9600 baud
+default cannot carry much more:
+
+| Sensor baud | Link capacity | Max sample-set rate |
+|---|---|---|
+| 9600 (default) | 960 B/s | 21.8 Hz |
+| 115200 | 11520 B/s | 261.8 Hz |
+| 230400 | 23040 B/s | 523.6 Hz |
+| 460800 | 46080 B/s | 1047.3 Hz |
+
+**The 9600 baud default must be raised**, and the module's own output rate with
+it. 115200 already clears the 200 Hz the part is rated for. Turning off the
+all-zero `0x54` magnetic frame would recover a further 25% of the link for
+nothing, and is worth doing on principle even though 115200 does not need it.
+
+Note this is the *sensor-side* UART. The Teensy's USB link to the host is CDC at
+480 Mbit and is nowhere near being the constraint - a reversal of the Pico rig,
+where the board's own `print()` cost set the ceiling.
+
+### The static noise floor is far better than the pots
+
+The measurement that could have invalidated the whole sensor change, and it
+comes out decisively the right way.
+
+Sensors undisturbed on the bench, individual unaveraged `0x51` readings, tilt
+scatter taken about each sensor's own mean gravity direction:
+
+| Channel | n | mean magnitude | angle scatter (sd) | worst |
+|---|---|---|---|---|
+| CENTRE | 24 | 1.0006 g | 0.0122 deg | 0.046 deg |
+| RIGHT | 23 | 1.0125 g | 0.0113 deg | 0.049 deg |
+
+Against `MOVEMENT_THRESHOLD_DEG = 0.25`, sitting just above the pots' measured
+0.23-0.27 degree hold noise floor, that is roughly **twenty times quieter** -
+and it is quieter *before* any of the 0.5 s averaging the app already applies.
+The end-stop procedure's existing tolerances are in no danger.
+
+Be honest about what this measurement is not: two dozen samples over about
+twenty seconds, on a bench, with nothing running. It says nothing about drift
+over minutes, temperature drift, or what the noise looks like on a rig with a
+powered airframe on it. Re-measure in place before relying on it. But the
+failure mode that was worth worrying about is not present.
+
+### The two sensors disagree by 1.2%, which is the point
+
+CENTRE reads its gravity magnitude as 1.0006 g and RIGHT as 1.0125 g. Both
+cannot be right; gravity is gravity. That 1.2% is scale-factor error, and left
+uncorrected it is worth about 0.42 degrees at 35 degrees of deflection - the
+same order as the trim resolution the whole procedure is chasing, and invisible
+at the centre position where a naive zeroing would be done.
+
+This is precisely the error the six-face calibration exists to remove, measured
+on the actual parts before writing a line of it. It is also why a single
+flat-surface zeroing would not have been enough: it would have made both
+sensors read zero at the centre and left the 1.2% intact at the extremes.
+
+## What is still not known
+
+- **The LEFT module is silent.** See below - until it reports, nothing here is
+  confirmed for three sensors, only for two.
+- **Noise on a live rig**, as opposed to a quiet bench.
+- **The sustained rate once the baud rate is raised**, which is the number that
+  decides which of the rate-dependent measurements survive. The table above is
+  link capacity, not a measured sustained rate.
+- **Drift** over the length of a real calibration run, and with temperature. The
+  modules report die temperature in every `0x51` frame, so this is measurable
+  without extra hardware.
+
+### LEFT reports nothing at all
+
+Serial1 (pins 0/1) received **zero bytes** over a ten-second window while
+Serial2 and Serial3 each took in about 4,500. Not a slow channel or a garbled
+one - nothing.
+
+That is a wiring, power or module fault rather than a software one, and it is
+exactly the class of thing the bring-up firmware exists to surface before it
+gets mistaken for a protocol bug later. Worth checking in this order: that the
+module is powered, that its TX goes to the Teensy's RX rather than TX, that pins
+0/1 are the pair actually used, and finally the module itself by swapping it
+with a known-good one.
 
 ## Related
 
 - `SERVO_SETTING.md` — the procedure these sensors serve.
 - `pico/sampler.py` — the current firmware, its protocol and its measured limits.
+- `teensy/bringup/` — the bring-up firmware these measurements came from.
 - `rig_sync.py` — why one elevon's motion contaminates the other's reading.
 - `ISSUES.md` — including issue 9, on sample rate and angle resolution.
