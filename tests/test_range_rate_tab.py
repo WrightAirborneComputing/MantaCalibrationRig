@@ -420,11 +420,17 @@ def test_stopping_mid_run_still_centres(rig):
 
 
 def test_actuator_tick_yields_while_the_test_runs(rig):
-    """The 100 ms slider tick must not fight the worker for the actuators."""
+    """The 100 ms slider tick must not fight the worker for the actuators.
+
+    Not by going silent - a surface nobody commands is taken back by the FC
+    after about 2 s - but by refusing to follow the slider while a run is on.
+    A side the worker is not driving goes on being held where it already is.
+    """
     gui, drone, _ = rig
 
     gui.left_pos.set(0.75)
     gui.measure_active = True
+    gui._measure_sides = frozenset(("LEFT",))
 
     before = len(drone.commands)
     gui.update_actuators()
@@ -432,6 +438,7 @@ def test_actuator_tick_yields_while_the_test_runs(rig):
     during = [c for c in drone.commands[before:] if abs(c[1] - 0.75) < 1e-9]
 
     gui.measure_active = False
+    gui._measure_sides = frozenset()
 
     assert during == [], "slider tick commanded actuators during the test"
 # def
@@ -765,10 +772,16 @@ def test_stiction_run_centres_the_elevons(rig):
 
 
 def test_actuator_tick_yields_while_the_stiction_test_runs(rig):
-    """The 10 Hz slider tick must not fight the test for the same actuators."""
+    """The 10 Hz slider tick must not fight the test for the same actuators.
+
+    A BOTH phase leaves the tick nothing to command, so it says nothing at all.
+    Which sides are claimed is the worker's to publish, and it publishes the
+    phase it is in - hence the claim set here rather than the flag alone.
+    """
     gui, drone, _ = rig
 
     gui.measure_active = True
+    gui._measure_sides = frozenset(("LEFT", "RIGHT"))
     try:
         before = len(drone.commands)
         gui.update_actuators()
@@ -776,6 +789,57 @@ def test_actuator_tick_yields_while_the_stiction_test_runs(rig):
         assert len(drone.commands) == before
     finally:
         gui.measure_active = False
+        gui._measure_sides = frozenset()
+# def
+
+
+def test_a_single_sided_phase_leaves_the_other_surface_held_not_dropped(rig):
+    """The tick owns whatever the phase does not, and must keep it alive.
+
+    A LEFT phase runs for minutes. Dropping RIGHT for that long is not leaving
+    it alone: the actuator override lapses after about 2 s and the FC parks the
+    surface itself, which is motion, on the one frame both potentiometers are
+    bolted to - arriving in the middle of LEFT's settle windows.
+
+    So the tick has to go on commanding RIGHT the whole way through, and always
+    at the value RIGHT is already at, which moves nothing.
+    """
+    gui, drone, _ = rig
+
+    stamps = []
+    real_command = drone.command_elevon
+
+    def stamping_command(output_function, value, *args, **kwargs):
+        stamps.append((time.monotonic(),
+                       "LEFT" if output_function == 1201 else "RIGHT",
+                       float(value)))
+        return real_command(output_function, value, *args, **kwargs)
+
+    drone.command_elevon = stamping_command
+
+    # Where the tick will hold it: the slider is at centre and so is the
+    # surface, which is what makes every refresh below a no-op physically.
+    gui.right_pos.set(0.0)
+    gui.pump(0.3)
+
+    started = time.monotonic()
+    run_test(gui, ["LEFT"], cycles=1)
+    ended = time.monotonic()
+
+    right = [(t, value) for t, side, value in stamps if side == "RIGHT"]
+    assert right, "the idle side was never commanded at all"
+
+    values = sorted({value for _t, value in right})
+    assert values == [0.0], \
+        "the idle side was commanded away from where it sat: %s" % values
+
+    # The gap that matters is the physical one: MEASURE_REFRESH_S exists
+    # because the override lapses somewhere around 2 s.
+    times = [started] + [t for t, _value in right] + [ended]
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    assert max(gaps) < 2.0, \
+        "the idle side went uncommanded for %.2f s - the FC would have it" \
+        % max(gaps)
 # def
 
 
@@ -932,7 +996,7 @@ def test_curve_plot_window_opens_and_draws(rig):
 
     assert gui.curve_window is not None and gui.curve_window.winfo_exists()
     assert gui.curve_canvas.find_all(), "something was drawn"
-    assert "band" in gui.curve_caption.cget("text")
+    assert "mean" in gui.curve_caption.cget("text")
 
     # Re-opening raises the existing window rather than stacking another.
     existing = gui.curve_window
@@ -972,7 +1036,7 @@ def test_curve_plot_exports_an_svg(rig, tmp_path, monkeypatch):
     gui.pump(0.3)
     gui.export_creep_curve_svg()
 
-    written = list((tmp_path / "reports").glob("*_creepcurve_left.svg"))
+    written = list((tmp_path / "reports").glob("*_creepcurve.svg"))
     assert len(written) == 1
     body = written[0].read_text()
     assert body.startswith("<?xml") and body.rstrip().endswith("</svg>")

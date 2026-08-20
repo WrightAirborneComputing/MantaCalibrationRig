@@ -1365,11 +1365,12 @@ class FourSliderGUI:
         self.left_cal_active = False
         self.right_cal_active = False
 
-        # What update_actuators commands a side with while the *other* side is
-        # calibrating: the slider value from the last tick before the run
-        # started. Held rather than read live so a slider dragged mid-run
-        # cannot move a surface and shake the rig during someone's settle
-        # window. Refreshed every quiet tick, so it is never stale.
+        # What update_actuators commands a side with while a procedure is
+        # running on the rig: the value that side was last left at. Held rather
+        # than read live so a slider dragged mid-run cannot move a surface and
+        # shake the rig during someone's settle window. Refreshed every quiet
+        # tick, and by hand_side_back() at every handover, so it is never a
+        # place the surface is not already at.
         self._idle_hold_cmd = {}
 
         # Where the two calibration workers meet so that neither reads an angle
@@ -1413,6 +1414,14 @@ class FourSliderGUI:
 
         self.measure_thread = None
         self.measure_active = False
+
+        # Which sides the measurement worker is driving right now. Its phases
+        # are per-side - a LEFT phase leaves RIGHT alone - so measure_active on
+        # its own does not say who owns what, and the slider timer has to know
+        # or it either fights the worker or abandons the other surface to the
+        # flight controller. Replaced wholesale rather than mutated, so the Tk
+        # thread always reads a complete set.
+        self._measure_sides = frozenset()
 
         self.stiction_results = []
         self.creep_points = []
@@ -2815,6 +2824,12 @@ class FourSliderGUI:
                     break
 
                 sides = PHASE_SIDES[phase]
+                # Claimed before anything in the phase moves. A single-sided
+                # phase leaves the other surface to the slider timer, which is
+                # what keeps its actuator override alive - dropped, it lapses
+                # after about 2 s and the FC parks the surface, in the middle
+                # of this phase's settle windows.
+                self._measure_sides = frozenset(sides)
 
                 if settings["stiction"]:
                     for target in (1.0, -1.0):
@@ -2863,6 +2878,12 @@ class FourSliderGUI:
                 for side in sides:
                     self.drone_interface.command_elevon(
                         self.rr_output_function(side), 0.0)
+                    self.hand_side_back(side, 0.0)
+
+                # Released only now, and only after the hold value is recorded:
+                # the next phase may not own these sides, and the timer has to
+                # pick them up where this phase left them.
+                self._measure_sides = frozenset()
 
         except Exception as e:
             print("Measurement failed: %s" % str(e))
@@ -2871,6 +2892,10 @@ class FourSliderGUI:
         finally:
             # Always park the surfaces. MAV_CMD_ACTUATOR_TEST holds its value for
             # 60 s, so an abandoned run would otherwise leave them hard over.
+            for side in ("LEFT", "RIGHT"):
+                self.hand_side_back(side, 0.0)
+            self._measure_sides = frozenset()
+
             try:
                 self.drone_interface.command_elevon(self.LEFT_OUTPUT_FUNCTION, 0.0)
                 self.drone_interface.command_elevon(self.RIGHT_OUTPUT_FUNCTION, 0.0)
@@ -5594,6 +5619,11 @@ class FourSliderGUI:
             traceback.print_exc()
             self._cal_fail_running(side, str(e))
         finally:
+            # Recorded before the flag is dropped: the moment it goes, the
+            # timer owns this side again, and on a two-sided run it would
+            # otherwise pull the surface to the slider while the other side is
+            # still measuring.
+            self.hand_side_back(side, 0.0)
             # Marked before the elevon command, which can raise once the window
             # has closed and drone_interface is shut - an exception escaping
             # the finally would replace the one being recorded.
@@ -5971,38 +6001,37 @@ class FourSliderGUI:
         Two rules, and the second is the one that is easy to miss.
 
         A side a procedure is driving is left alone: two senders at different
-        values fight, and the surface follows whichever spoke last. That is the
-        sweep and measure guard, and the calibrating side.
+        values fight, and the surface follows whichever spoke last. That is
+        procedure_driven_sides(), and it is per side, not per procedure - a
+        LEFT-only calibration or a LEFT measurement phase owns LEFT and nothing
+        else.
 
         A side no procedure is driving still has to be commanded, though, or
         the actuator override lapses after about 2 s and the flight controller
         takes the surface back - and parks it, which is motion, arriving in the
-        middle of the other side's settle window. So during a calibration this
-        keeps commanding the idle side, but at the value it held when the run
-        began rather than at the live slider: the surface stays alive and
-        still, and dragging its slider mid-run cannot shake the rig out from
-        under the side being measured. The re-send is the same command every
-        time, which moves nothing - the rendezvous holds its own participants
-        in exactly this way while they wait.
+        middle of the other side's settle window. So the idle side keeps being
+        commanded, at the value it was last left at rather than at the live
+        slider: the surface stays alive and still, and dragging its slider
+        mid-run cannot shake the rig out from under the side being measured.
+        The re-send is the same command every time, which moves nothing - the
+        rendezvous holds its own participants in exactly this way while they
+        wait.
+
+        "Last left at" is the whole of the second rule, and it is why
+        hand_side_back() exists: a procedure that stops driving a side records
+        where it put it, so the value this timer picks up with is where the
+        surface already is. The slider is not that value - it is where the
+        surface was before the run began.
 
         The slider itself is not fought over. It keeps whatever the user set,
-        and the surface goes there on the first tick after the run ends.
-
-        Sweep and measure keep the blanket skip they always had, because on a
-        BOTH phase they drive both surfaces themselves. A single-sided phase
-        leaves the other side to lapse in the way described above, but that is
-        the measure tab's own gap: which sides its worker owns is decided per
-        phase, inside the worker, and is not published anywhere this timer
-        could read it.
+        and the surface goes there on the first tick after everything on the
+        rig has finished.
         """
         if self._closing:
             return
 
         try:
-            # Not an early return: the reschedule below is what keeps this
-            # timer alive, and a run that skipped it would never tick again.
-            if not (self.sweep_active or self.measure_active):
-                self.command_idle_elevons()
+            self.command_idle_elevons()
 
         except Exception as e:
             print("Actuator update error: %s" % str(e))
@@ -6011,27 +6040,72 @@ class FourSliderGUI:
     # def
 
     def command_idle_elevons(self):
-        """The per-side half of the rule above, once the procedures are out."""
-        calibrating = (self.is_calibration_active("LEFT")
-                       or self.is_calibration_active("RIGHT"))
+        """The per-side half of the rule above: command everything nobody owns."""
+        driven = self.procedure_driven_sides()
+        running = self.any_procedure_running()
 
         for side, output_function, pos in (
                 ("LEFT", self.LEFT_OUTPUT_FUNCTION, self.left_pos),
                 ("RIGHT", self.RIGHT_OUTPUT_FUNCTION, self.right_pos)):
 
-            if self.is_calibration_active(side):
+            if side in driven:
                 continue
 
             cmd = float(pos.get())
-            if calibrating:
-                # setdefault rather than a plain read: a calibration that
-                # starts before this timer has ever ticked still gets a value
-                # to hold instead of following the slider.
+            if running:
+                # setdefault rather than a plain read: a run that starts before
+                # this timer has ever ticked still gets a value to hold instead
+                # of following the slider.
                 cmd = self._idle_hold_cmd.setdefault(side, cmd)
             else:
                 self._idle_hold_cmd[side] = cmd
 
             self.drone_interface.command_elevon(output_function, cmd)
+    # def
+
+    def procedure_driven_sides(self):
+        """Which surfaces a running procedure is driving itself, right now.
+
+        A sweep drives both, from end to end, and always has. A calibration
+        drives the sides that are calibrating. A measurement drives the sides
+        of the phase it is in, which is the one that has to be published: the
+        phase list is read inside the worker and a LEFT phase hands RIGHT to
+        the timer for minutes at a time.
+        """
+        if self.sweep_active:
+            return {"LEFT", "RIGHT"}
+
+        # Read once. The worker swaps the whole set, so a single read cannot
+        # see half of one.
+        driven = set(self._measure_sides) if self.measure_active else set()
+
+        for side in ("LEFT", "RIGHT"):
+            if self.is_calibration_active(side):
+                driven.add(side)
+
+        return driven
+    # def
+
+    def any_procedure_running(self):
+        """True while anything but the sliders is entitled to move a surface."""
+        return bool(self.sweep_active or self.measure_active
+                    or self.is_calibration_active("LEFT")
+                    or self.is_calibration_active("RIGHT"))
+    # def
+
+    def hand_side_back(self, side, command):
+        """Record where a procedure is leaving a surface it has stopped driving.
+
+        The timer picks that side up on its next tick, and has to re-send the
+        same value or it moves the surface. The slider is not that value: it is
+        where the surface was before the run, not where the procedure just put
+        it, so resuming from it would yank the surface across - in the middle
+        of the next phase, or of the other side's calibration.
+
+        Called before the claim is dropped, so there is no tick in between that
+        could read a stale one.
+        """
+        self._idle_hold_cmd[side] = float(command)
     # def
 
     def update_log_window(self):
