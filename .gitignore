@@ -14,3 +14,6 @@ reports/
 # Spreadsheet backups of the tracked calibration record, written by the
 # migration path and by LibreOffice. Same reasoning as settings.json.bak.
 *.csv.bak
+
+# LibreOffice lock files, present whenever the log is open in a spreadsheet.
+.~lock.*#
