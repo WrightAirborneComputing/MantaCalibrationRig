@@ -574,42 +574,48 @@ where the board's own `print()` cost set the ceiling.
 The measurement that could have invalidated the whole sensor change, and it
 comes out decisively the right way.
 
-Sensors undisturbed on the bench, individual unaveraged `0x51` readings, tilt
-scatter taken about each sensor's own mean gravity direction:
+All three sensors undisturbed on the bench, individual unaveraged `0x51`
+readings, tilt scatter taken about each sensor's own mean gravity direction:
 
-| Channel | n | mean magnitude | angle scatter (sd) | worst |
-|---|---|---|---|---|
-| CENTRE | 24 | 1.0006 g | 0.0122 deg | 0.046 deg |
-| RIGHT | 23 | 1.0125 g | 0.0113 deg | 0.049 deg |
+| Channel | n | mean magnitude | angle scatter (sd) | worst | die temp |
+|---|---|---|---|---|---|
+| LEFT | 78 | 1.0122 g | 0.0129 deg | 0.064 deg | 29.1 C |
+| CENTRE | 79 | 1.0005 g | 0.0142 deg | 0.066 deg | 25.8 C |
+| RIGHT | 66 | 1.0120 g | 0.0134 deg | 0.059 deg | 24.9 C |
 
 Against `MOVEMENT_THRESHOLD_DEG = 0.25`, sitting just above the pots' measured
 0.23-0.27 degree hold noise floor, that is roughly **twenty times quieter** -
 and it is quieter *before* any of the 0.5 s averaging the app already applies.
 The end-stop procedure's existing tolerances are in no danger.
 
-Be honest about what this measurement is not: two dozen samples over about
-twenty seconds, on a bench, with nothing running. It says nothing about drift
-over minutes, temperature drift, or what the noise looks like on a rig with a
-powered airframe on it. Re-measure in place before relying on it. But the
-failure mode that was worth worrying about is not present.
+Be honest about what this measurement is not: a couple of hundred samples over
+a few minutes, on a bench, with nothing running. It says nothing about drift
+over the length of a real run, or what the noise looks like with a powered
+airframe on the rig. Re-measure in place before relying on it. But the failure
+mode that was worth worrying about is not present, and it is not close.
 
-### The two sensors disagree by 1.2%, which is the point
+### The three sensors disagree by 1.2%, which is the point
 
-CENTRE reads its gravity magnitude as 1.0006 g and RIGHT as 1.0125 g. Both
-cannot be right; gravity is gravity. That 1.2% is scale-factor error, and left
-uncorrected it is worth about 0.42 degrees at 35 degrees of deflection - the
-same order as the trim resolution the whole procedure is chasing, and invisible
-at the centre position where a naive zeroing would be done.
+They report gravity as 1.0122, 1.0005 and 1.0120 g. They cannot all be right;
+gravity is gravity. That 1.17% spread is scale-factor error, and left
+uncorrected it is worth **0.41 degrees at 35 degrees of deflection** - the same
+order as the trim resolution the whole procedure is chasing - while being
+**exactly zero at the centre position**, where a naive zeroing would be done.
 
 This is precisely the error the six-face calibration exists to remove, measured
 on the actual parts before writing a line of it. It is also why a single
-flat-surface zeroing would not have been enough: it would have made both
-sensors read zero at the centre and left the 1.2% intact at the extremes.
+flat-surface zeroing would not have been enough: it would have made all three
+read zero at the centre and left the 1.2% untouched at the extremes, which is
+where the endpoints are set.
+
+Worth noting what the spread is *not*: LEFT sat 4.2 C warmer than RIGHT and the
+two agree to within 0.02%, while CENTRE, sitting between them in temperature, is
+the one that differs. So this is unit-to-unit variation rather than thermal
+drift - which is the good case, because unit-to-unit variation is a constant the
+calibration can store, and thermal drift would not be.
 
 ## What is still not known
 
-- **The LEFT module is silent.** See below - until it reports, nothing here is
-  confirmed for three sensors, only for two.
 - **Noise on a live rig**, as opposed to a quiet bench.
 - **The sustained rate once the baud rate is raised**, which is the number that
   decides which of the rate-dependent measurements survive. The table above is
@@ -618,18 +624,27 @@ sensors read zero at the centre and left the 1.2% intact at the extremes.
   modules report die temperature in every `0x51` frame, so this is measurable
   without extra hardware.
 
-### LEFT reports nothing at all
+### A wiring note, since it cost a session to find
 
-Serial1 (pins 0/1) received **zero bytes** over a ten-second window while
-Serial2 and Serial3 each took in about 4,500. Not a slow channel or a garbled
-one - nothing.
+On first power-up Serial1 (LEFT) received **zero bytes** over a ten-second
+window while Serial2 and Serial3 each took in about 4,500. Not a slow channel or
+a garbled one - nothing at all. It was miswired, and re-terminating it fixed it
+completely: all three now stream identically at 10.0 Hz with no bad checksums.
 
-That is a wiring, power or module fault rather than a software one, and it is
-exactly the class of thing the bring-up firmware exists to surface before it
-gets mistaken for a protocol bug later. Worth checking in this order: that the
-module is powered, that its TX goes to the Teensy's RX rather than TX, that pins
-0/1 are the pair actually used, and finally the module itself by swapping it
-with a known-good one.
+Recorded because it is the class of fault worth checking first and in this
+order - module powered, its TX to the Teensy's RX rather than TX, the pin pair
+actually being the one assumed, then the module itself - and because a
+byte-counting probe found it in seconds where a frame parser would have reported
+something more ambiguous. That is the argument for the bring-up firmware
+counting bytes before it understands them.
+
+A second lesson from the same session, recorded because it nearly became a
+false finding: a byte counter that is reset by a command is only as trustworthy
+as the reset. One `Z` was silently swallowed by leftover bytes in the board's
+command buffer, and the resulting "rate" was five times the real one and
+physically impossible at 9600 baud - which is the only reason it was caught.
+**Measure rates as a delta between two reads, never against a reset**, and
+sanity-check any rate against the link's capacity before believing it.
 
 ## Related
 
