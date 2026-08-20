@@ -17,3 +17,6 @@ reports/
 
 # LibreOffice lock files, present whenever the log is open in a spreadsheet.
 .~lock.*#
+
+# PlatformIO build output for the Teensy firmware.
+teensy/**/.pio/
