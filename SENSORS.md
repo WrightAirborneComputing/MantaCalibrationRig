@@ -646,6 +646,66 @@ over the length of a real run, or what the noise looks like with a powered
 airframe on the rig. Re-measure in place before relying on it. But the failure
 mode that was worth worrying about is not present, and it is not close.
 
+### Raw-derived angle against the module's own fusion
+
+Ten seconds of LEFT, static, both `0x51` and `0x53` captured continuously at
+200 Hz - 2007 frames of each - with roll and pitch computed from the raw
+acceleration as `atan2(ay, az)` and `atan2(-ax, |a_yz|)` and compared against
+what the module reported for the same instants.
+
+| Quantity | mean | sd | peak-to-peak |
+|---|---|---|---|
+| roll, computed from `0x51` | -1.4323 deg | 0.0361 deg | 0.4455 deg |
+| roll, module's `0x53` | -1.4396 deg | **0.0014 deg** | 0.0055 deg |
+| pitch, computed from `0x51` | +1.3882 deg | 0.0291 deg | 0.3305 deg |
+| pitch, module's `0x53` | +1.3990 deg | **0.0026 deg** | 0.0055 deg |
+
+Three things follow.
+
+**The module's filter is 26x quieter on roll and 11x on pitch**, and it is not
+buying that by lying: the means agree to 0.007 deg on roll and 0.011 deg on
+pitch. It is smoothing, not shifting.
+
+**Averaging closes most of the gap, and the app already averages.** Over the
+0.5 s window `get_average_position_nonblocking` already uses - 100 samples at
+200 Hz - the raw-derived roll falls to **0.0040 deg** sd against the module's
+0.0009 deg. Still 4x apart, and both are so far below
+`MOVEMENT_THRESHOLD_DEG = 0.25` that the difference cannot matter: the raw path
+has about sixty times the margin it needs.
+
+So the plan stands. Take raw acceleration, apply our own six-face calibration,
+average as the app already does, and the result is comfortably quiet enough.
+The module's fusion is not needed, and taking it would mean giving up the
+calibration - its output is not something our bias and scale coefficients can
+act on.
+
+There is also a reason to prefer the raw path beyond calibration. A Kalman
+filter buys its quiet with lag, which is free on a settled reading and is not
+free across a 100 ms transit, where the edge shape is the measurement. The
+quiet number is the better one exactly where it does not matter and the worse
+one where it does.
+
+**Yaw is not a measurement.** It reported sd 0.0000 and peak-to-peak 0.0000 over
+all 2007 frames - a value that is not moving at all, rather than one that is
+moving very little. With no magnetometer there is nothing to observe yaw
+against, and gravity says nothing about rotation about itself. Never read it.
+
+#### A correction to the earlier noise figures
+
+The 0.013 deg quoted in the table above is the scatter of the *3D tilt
+magnitude* about each sensor's mean direction, taken from a couple of dozen
+deduplicated samples. That statistic is folded - it cannot go negative - so its
+standard deviation understates the per-axis angular noise, and the small sample
+made it worse.
+
+**0.036 deg sd on a single-axis angle, from 2007 consecutive samples, is the
+better figure**, and it is the one to design against. The conclusion does not
+change - it is still nearly an order of magnitude below the pots' 0.23-0.27 deg
+- but note the *peak-to-peak* of 0.45 deg on unaveraged single samples, which is
+larger than `MOVEMENT_THRESHOLD_DEG` on its own. Single raw samples must not be
+compared against that threshold directly. Averaged, as the app does, there is no
+issue at all.
+
 ### The three sensors disagree by 1.2%, which is the point
 
 They report gravity as 1.0122, 1.0005 and 1.0120 g. They cannot all be right;

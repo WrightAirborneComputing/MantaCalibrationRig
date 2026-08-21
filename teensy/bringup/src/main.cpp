@@ -15,6 +15,7 @@
 //   ?    status                  -> "# STATUS uptime_ms=... ..."
 //   U    UART traffic report     -> "# UART L=... C=... R=..."
 //   X    hex dump the last bytes  -> "# DUMP LEFT ..." x3
+//   P<c> passthrough one channel   -> "$ <hex> ..." until a keypress or 20 s
 //   B<n> reopen sensor UARTs at n  -> "# ACK B 115200"
 //   W<c>:<hex>  write bytes to a   -> "# ACK W C 5"
 //        sensor. c is 0/1/2 or A.
@@ -115,6 +116,45 @@ static void apply_command(const String &raw) {
         Serial.println(" mode=bringup");
     } else if (text == "U") {
         uart_report();
+    } else if (text.startsWith("P")) {
+        // Raw passthrough of one sensor UART, hex, 32 bytes per line behind a
+        // "$" prefix. No frame parsing here on purpose: the host already has a
+        // decoder, and a board that reassembles frames would be deciding what
+        // counts as one - which is exactly the thing being measured.
+        //
+        // "$" rather than "#" so these lines are distinguishable from replies,
+        // and neither can be confused with a sample line.
+        char which = text.length() > 1 ? text.charAt(1) : '0';
+        int ch = (which >= '0' && which <= '2') ? which - '0' : 0;
+        Serial.print("# BEGIN P ");
+        Serial.println(NAMES[ch]);
+        uint8_t buf[32];
+        uint8_t n = 0;
+        uint32_t stop_at = millis() + 20000;
+        while (PORTS[ch]->available() > 0) PORTS[ch]->read();   // start clean
+        while ((int32_t)(millis() - stop_at) < 0) {
+            if (Serial.available() > 0) { Serial.read(); break; }
+            while (PORTS[ch]->available() > 0) {
+                buf[n++] = (uint8_t)PORTS[ch]->read();
+                if (n == sizeof(buf)) {
+                    // Written unconditionally. An earlier version skipped the
+                    // line unless availableForWrite() was comfortable, which
+                    // threw away 92% of the stream - the CDC buffer is small
+                    // and almost never "comfortable" at 14 kB/s, even though
+                    // the link drains it instantly. Passthrough is only ever
+                    // run with a host actively reading, so a brief block is
+                    // the right trade and a silent 12:1 decimation is not.
+                    Serial.print('$');
+                    for (uint8_t k = 0; k < n; k++) {
+                        if (buf[k] < 0x10) Serial.print('0');
+                        Serial.print(buf[k], HEX);
+                    }
+                    Serial.println();
+                    n = 0;
+                }
+            }
+        }
+        Serial.println("# END P");
     } else if (text.startsWith("B")) {
         long b = text.substring(1).toInt();
         if (b < 1200 || b > 1000000) {
