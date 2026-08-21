@@ -547,6 +547,22 @@ own filter reported -2.21, which agrees closely enough to trust both.
 The gyro reads exactly zero on all three axes while stationary, which is what
 makes it usable as the first-order motion gate described above.
 
+### Two links, and only one of them has a baud rate that matters
+
+Worth separating before any number below is read, because both happen to carry
+the figure 115200 and only one of them means anything:
+
+- **Teensy to sensors** - three real hardware UARTs, `Serial1/2/3` on pins 0/1,
+  7/8 and 14/15. Baud here is physical and is the binding constraint. This is
+  what every baud figure in this section refers to.
+- **Teensy to host** - USB CDC at 480 Mbit. The baud passed to `serial.Serial()`
+  is ignored by the hardware entirely; it is a vestigial argument. Three
+  channels at 200 Hz is about 20 kB/s against a link that does megabytes, so
+  this side has never been close to a constraint.
+
+That is a reversal of the Pico rig, where the board's own `print()` cost to the
+host set the ceiling and the sensor side did not exist.
+
 ### The modules were reconfigured, and now run at 200 Hz
 
 As shipped they streamed 441 bytes/s - one 44-byte sample set per 100 ms, so
@@ -560,7 +576,7 @@ order and for this reason - free capacity first, then raise demand:
 | Register | Set to | Effect |
 |---|---|---|
 | `0x02` RSW | `0x000E` | accel + gyro + angle; drops the magnetic frame |
-| `0x04` BAUD | `0x0006` | 115200 |
+| `0x04` BAUD | `0x0006` | 115200 on the sensor UARTs |
 | `0x03` RRATE | `0x000B` | 200 Hz |
 
 The magnetic frame was 11 of every 44 bytes carrying nothing but zeros - this is
@@ -570,7 +586,7 @@ exactly the predicted ratio: 443 B/s to 332 B/s.
 
 Measured after all three changes, all channels, no bad checksums:
 
-| Channel | rate | of the 115200 link | sample rate |
+| Channel | rate | of the sensor link | sample rate |
 |---|---|---|---|
 | LEFT | 6621 B/s | 57.5% | 200.6 Hz |
 | CENTRE | 6625 B/s | 57.5% | 200.7 Hz |
@@ -653,13 +669,9 @@ calibration can store, and thermal drift would not be.
 ## What is still not known
 
 - **Noise on a live rig**, as opposed to a quiet bench.
-- **Whether module configuration reliably survives a power cycle.** The first
-  attempt persisted only partly - see below. It has been reapplied with tighter
-  sequencing, but the conclusion drawn from the failure stands whatever the
-  retry does.
-- **Drift** over the length of a real calibration run, and with temperature. The
-  modules report die temperature in every `0x51` frame, so this is measurable
-  without extra hardware.
+- **Drift** over the length of a real calibration run, and with temperature.
+  The modules report die temperature in every `0x51` frame, so this is
+  measurable without extra hardware.
 
 ### The firmware must assert the sensor configuration at boot
 
@@ -695,11 +707,18 @@ would be worth doing even if the save were perfectly reliable:
   rather than invisible in a module's flash;
 - there is no silent dependency on state written by a tool nobody runs twice.
 
-It is cheap - three register writes per module at startup - and idempotent. The
-firmware should send them at 9600 first and then at 115200, so it converges on
-the right configuration whether or not the previous session's save took, and it
-should verify by measuring its own input rate before declaring the sensors
-ready.
+Reapplying with tight sequencing - and a fresh unlock at the new baud before the
+save - did persist across a second power cycle: the modules came back at 200.6 /
+200.7 / 200.1 Hz on a 115200 sensor link with the magnetic frame still off. That
+confirms the diagnosis, since sequencing was the only thing that changed.
+
+It does not change the recommendation. A configuration that persists only when
+written in the right order, with no acknowledgement when it is not, is not a
+configuration to depend on. Asserting it is cheap - three register writes per
+module at startup - and idempotent. The firmware should send them at 9600 first
+and then at 115200, so it converges whether or not the previous session's save
+took, and it should verify by measuring its own input rate before declaring the
+sensors ready.
 
 Note this also gives the identity handshake something real to report: a rig that
 came up at 10 Hz because a module ignored its configuration should say so, not
