@@ -653,14 +653,57 @@ calibration can store, and thermal drift would not be.
 ## What is still not known
 
 - **Noise on a live rig**, as opposed to a quiet bench.
-- **That the module configuration survives a power cycle.** The changes were
-  written to module flash with a save command and verified live, but the modules
-  have not been powered down since. Confirm on next power-up; if they revert to
-  9600 and 10 Hz, the save did not take and the host will need to apply the
-  configuration at connect instead.
+- **Whether module configuration reliably survives a power cycle.** The first
+  attempt persisted only partly - see below. It has been reapplied with tighter
+  sequencing, but the conclusion drawn from the failure stands whatever the
+  retry does.
 - **Drift** over the length of a real calibration run, and with temperature. The
   modules report die temperature in every `0x51` frame, so this is measurable
   without extra hardware.
+
+### The firmware must assert the sensor configuration at boot
+
+A power cycle after the first configuration pass revealed that it had persisted
+only in part:
+
+| Setting | Survived? |
+|---|---|
+| RSW - magnetic frame off | **yes** - still 33 bytes/set |
+| BAUD - 115200 | no - back to 9600 |
+| RRATE - 200 Hz | no - back to 10 Hz, and at 34% link use, so genuinely 10 Hz rather than link-limited |
+
+The pattern names the cause. The RSW pass was `unlock, set, save` inside about
+1.6 seconds and it stuck. The baud and rate passes each had a verification
+measurement of several seconds sitting between the unlock and the save, and
+neither stuck. **The unlock expires**, so a save that arrives late is rejected -
+silently, because these modules acknowledge nothing.
+
+Baud carries a second trap on top of that: the change applies the moment it is
+written, so the save that commits it has to be sent at the *new* baud, with its
+own fresh unlock. Sending unlock, baud and save as one sequence at the old baud
+cannot work - the last of the three is transmitted into a receiver that has
+already moved.
+
+The right response is not merely tighter sequencing. It is that **the rig
+firmware should assert the sensor configuration at every boot** rather than
+assume it. That is better than a persisted configuration in three ways, and
+would be worth doing even if the save were perfectly reliable:
+
+- a module swapped in from the shelf works immediately, with no separate
+  configuration step to remember or forget;
+- the configuration is visible in the firmware source, where it can be reviewed,
+  rather than invisible in a module's flash;
+- there is no silent dependency on state written by a tool nobody runs twice.
+
+It is cheap - three register writes per module at startup - and idempotent. The
+firmware should send them at 9600 first and then at 115200, so it converges on
+the right configuration whether or not the previous session's save took, and it
+should verify by measuring its own input rate before declaring the sensors
+ready.
+
+Note this also gives the identity handshake something real to report: a rig that
+came up at 10 Hz because a module ignored its configuration should say so, not
+advertise 200 Hz and quietly deliver a twentieth of it.
 
 ### A wiring note, since it cost a session to find
 
