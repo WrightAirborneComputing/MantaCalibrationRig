@@ -72,11 +72,18 @@ Purpose: get roughly into range. **Nothing measured here is trusted or
 committed.**
 
 1. Open the range: `PWM_MAIN_MIN = 900`, `PWM_MAIN_MAX = 2100`, trim `0`.
-2. Creep to the positive target, then the negative one, using the same step
-   logic as the existing calibration — 6 µs per step, 0.25 s per step, against a
-   0.5 s trailing mean of the angle.
+2. Creep to 2° short of the positive target, then 2° short of the negative one,
+   using the same step logic as the existing calibration — 6 µs per step, 0.25 s
+   per step, against a 0.5 s trailing mean of the angle.
 3. Record the PWM each creep stopped at.
 4. Write the higher PWM as `MAX`, then the lower as `MIN`.
+
+The creep is deliberately sent after less than stage 2 will set. It does not
+reach as far as the rapid approach does — the same effect stage 2 exists to
+correct for — so a creep asked for the full target runs out of command, and the
+run fails, on servos whose refined end stops would have made that target
+comfortably. Only the creep is short: the targets stage 2 refines against are
+unchanged.
 
 Which end carries which angle target is taken from the measurement, not inferred
 from `PWM_MAIN_REV`. On a reversed channel the negative angle sits at the *high*
@@ -306,6 +313,7 @@ Two cautions when reading its output:
 | probed gain accepted within | 0.3×–3× nominal | linkage gain varies about 2:1 end to end |
 | coarse range | 900–2100 µs | wide enough to bracket any endpoint |
 | coarse creep step | 6 µs | matches the existing calibration |
+| coarse creep backoff | 2° | the creep reaches less than the rapid approach |
 | trim approach | `cmd +1` | the direction the trim point is defined from |
 | trim acceptance band | 0.25° | on that approach only |
 | max trim shift per attempt | 0.15 cmd | about 5° on this airframe |

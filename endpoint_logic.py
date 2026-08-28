@@ -30,6 +30,16 @@ MAX_ATTEMPTS = 10
 COARSE_MIN = 900
 COARSE_MAX = 2100
 
+# How far short of the final target the coarse creep is asked to stop, in
+# degrees toward centre. A crept approach does not reach as far as the rapid one
+# the end stops are actually set from - the surface is still moving when the
+# creep decides it has arrived, and on this airframe the two differ by about
+# 4 deg - so a creep asked for the final target can run out of command on a
+# servo whose fast sweep would have made that target comfortably. The creep only
+# has to get roughly into range, and nothing it measures is committed, so it is
+# asked for less and the refinement carries the rest.
+COARSE_TARGET_BACKOFF_DEG = 2.0
+
 # Refuse to write an endpoint outside that band, whatever the maths says. These
 # are servo limits, not PX4 limits - PWM_MAIN_MIN accepts 800 quite happily, and
 # a RIGHT run that wrote 800 drove the elevon so far past its stop that the
@@ -70,6 +80,22 @@ DIVERGENCE_MARGIN_DEG = MOVEMENT_THRESHOLD_DEG
 # recovery for that. A second one, taken after the endpoint has already moved
 # that far inward, is not a pin - a pinned surface would have come free.
 UNCONFIRMED_ATTEMPTS = 2
+
+
+def coarse_target_deg(target_deg, backoff=COARSE_TARGET_BACKOFF_DEG):
+    """Where the coarse creep should stop: `backoff` deg short of the target.
+
+    Short in magnitude - toward centre - so it holds for either end whichever
+    sign the target carries. A target already inside the backoff creeps to
+    centre rather than past it and out the other side; the refinement is what
+    finds the end stop either way.
+    """
+    target = float(target_deg)
+    reduced = abs(target) - abs(float(backoff))
+    if reduced <= 0.0:
+        return 0.0
+    return reduced if target > 0.0 else -reduced
+# def
 
 
 def endpoint_command(which, rev):

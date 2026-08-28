@@ -311,3 +311,18 @@ def test_the_right_run_would_have_stopped_two_attempts_in():
             break
 
     assert stopped_at == 3, "stopped while MIN was still 15 deg out, not 44"
+
+
+def test_the_coarse_creep_is_sent_after_less_than_the_end_stop():
+    """Short in magnitude at both ends - the creep reaches less than a sweep."""
+    backoff = endpoint_logic.COARSE_TARGET_BACKOFF_DEG
+    assert endpoint_logic.coarse_target_deg(35.0) == pytest.approx(35.0 - backoff)
+    assert endpoint_logic.coarse_target_deg(-35.0) == pytest.approx(-35.0 + backoff)
+    assert endpoint_logic.coarse_target_deg(35.0, backoff=5.0) == pytest.approx(30.0)
+
+
+def test_a_target_inside_the_backoff_creeps_to_centre_not_past_it():
+    """Reducing the magnitude must never flip the end the creep runs toward."""
+    assert endpoint_logic.coarse_target_deg(1.0) == 0.0
+    assert endpoint_logic.coarse_target_deg(-1.0) == 0.0
+    assert endpoint_logic.coarse_target_deg(0.0) == 0.0

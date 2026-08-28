@@ -9,8 +9,9 @@ endpoint that gets written is not the one the surface reaches in service.
 
 This script closes that loop the way the manual procedure did:
 
-  Stage 1  creep to each target with the range wide open, purely to get close.
-           Nothing measured here is trusted or committed.
+  Stage 1  creep to 2 deg short of each target with the range wide open, purely
+           to get close. Nothing measured here is trusted or committed - and the
+           creep is asked for less because it reaches less than stage 2 does.
   Stage 2  command the endpoint, let the servo slew to it in one motion, and
            measure. Correct the PWM, then evaluate the *other* end - the
            traverse between ends is itself the next rapid approach, so
@@ -55,6 +56,7 @@ from endpoint_logic import (
     alternating_order,
     angle_gain_per_us,
     clamp_endpoint,
+    coarse_target_deg,
     command_delta_for_pwm,
     correction_us,
     endpoint_accepted,
@@ -299,14 +301,21 @@ def run_coarse_stage(rig, target_neg, target_pos, step_us):
     if params is None:
         return None
 
+    # Each creep is sent after COARSE_TARGET_BACKOFF_DEG less than the target
+    # stage 2 will set. A crept approach does not reach as far as the rapid one,
+    # so asking it for the final target fails runs whose refined end stops would
+    # have made it. The mapping below still carries the full target - only the
+    # creep is short.
     found = {}
     for target in (target_pos, target_neg):
-        print("  creeping to %+.1f deg ..." % target)
+        creep_target = coarse_target_deg(target)
+        print("  creeping to %+.1f deg (for a %+.1f deg end stop) ..."
+              % (creep_target, target))
         result = servo_probe.sweep_to_threshold(
-            rig.fcu, rig.pico, rig.side, params, target, step_us,
+            rig.fcu, rig.pico, rig.side, params, creep_target, step_us,
             servo_probe.SWEEP_PERIOD_S, servo_probe.SWEEP_WINDOW_S, 240.0)
         if result is None or result["stop_pwm"] is None:
-            print("  coarse creep to %+.1f deg failed" % target)
+            print("  coarse creep to %+.1f deg failed" % creep_target)
             return None
         print("    stopped at %d us (cmd %+.3f, reported %+.2f deg)"
               % (result["stop_pwm"], result["stop_cmd"], result["reported_deg"]))

@@ -601,7 +601,12 @@ def test_dragging_the_idle_slider_cannot_shake_a_running_calibration():
             # Still held, not merely quiet: an idle side that stopped being
             # commanded would also record no moves here, and would be taken
             # over by the FC on the real rig.
-            assert sent["RIGHT"] > 10, \
+            #
+            # The bound sits well under what a run actually sends - the exact
+            # count follows how many steps the creep takes, so anything tuned
+            # to it fails the next time a target moves. A lapsed side sends the
+            # one park command and nothing after it, which is what this catches.
+            assert sent["RIGHT"] > 5, \
                 "the idle side was commanded %d times - it is being left to lapse" \
                 % sent["RIGHT"]
 

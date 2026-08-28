@@ -79,6 +79,7 @@ from endpoint_logic import (
     nominal_gain_deg_per_us,
     overshot_target,
     clamp_endpoint,
+    coarse_target_deg,
     command_delta_for_pwm,
     correction_us,
     endpoint_accepted,
@@ -5446,10 +5447,17 @@ class FourSliderGUI:
                     self._cal_stopped(side)
                 return
 
+            # The creep is asked for less than the end stops are set to. It
+            # does not reach as far as the rapid approach that follows it, so a
+            # creep sent after the full target runs out of command on servos
+            # whose refined end stops would have made that target comfortably.
+            creep_neg = coarse_target_deg(self.angle_neg_degs)
+            creep_pos = coarse_target_deg(self.angle_pos_degs)
+
             self._cal_start_step(side, "sweep",
-                                 "finding %+.1f deg" % self.angle_neg_degs)
+                                 "finding %+.1f deg" % creep_neg)
             cmd_neg = self.move_elevon_to_angle(side, output_function,
-                                                self.angle_neg_degs, -0.01)
+                                                creep_neg, -0.01)
             if not self.is_calibration_active(side) or cmd_neg is None:
                 print("%s automatic calibration stopped before negative endpoint completed" % side)
                 if not self._cal_failed_already(side):
@@ -5464,9 +5472,9 @@ class FourSliderGUI:
                 return
 
             self._cal_note(side, "sweep",
-                           "finding %+.1f deg" % self.angle_pos_degs)
+                           "finding %+.1f deg" % creep_pos)
             cmd_pos = self.move_elevon_to_angle(side, output_function,
-                                                self.angle_pos_degs, 0.01)
+                                                creep_pos, 0.01)
             if not self.is_calibration_active(side) or cmd_pos is None:
                 print("%s automatic calibration stopped before positive endpoint completed" % side)
                 if not self._cal_failed_already(side):
@@ -5475,7 +5483,7 @@ class FourSliderGUI:
             pwm_pos = self.get_side_expected_pwm(side, cmd_pos)
             self._cal_done_step(side, "sweep",
                                 "%+.1f and %+.1f deg found"
-                                % (self.angle_neg_degs, self.angle_pos_degs))
+                                % (creep_neg, creep_pos))
 
             if not self._cal_barrier(side, output_function, "sweep"):
                 print("%s automatic calibration stopped" % side)
