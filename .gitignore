@@ -17,3 +17,8 @@ reports/
 
 # LibreOffice lock files, present whenever the log is open in a spreadsheet.
 .~lock.*#
+
+# The local virtualenv. Untracked and unignored is the worst of both: `git
+# stash -u` swept the whole thing into a stash and left a stub behind, which
+# reads as "pymavlink is not installed" at the next test run.
+.venv/
