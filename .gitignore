@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local rig state written by the atomic settings save
+settings.json.bak
+settings.json.tmp
+
+# Per-run rig artefacts: sweep captures, range/rate summaries and sample dumps.
+# One directory rather than a glob per output kind. calibration_log.csv stays at
+# the top level and tracked on purpose - it is the append-only record.
+reports/
+
+# Spreadsheet backups of the tracked calibration record, written by the
+# migration path and by LibreOffice. Same reasoning as settings.json.bak.
+*.csv.bak
+
+# LibreOffice lock files, present whenever the log is open in a spreadsheet.
+.~lock.*#
+
+# The local virtualenv. Untracked and unignored is the worst of both: `git
+# stash -u` swept the whole thing into a stash and left a stub behind, which
+# reads as "pymavlink is not installed" at the next test run.
+.venv/

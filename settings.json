@@ -1,15 +1,19 @@
 {
     "LEFT": {
         "scaler": 0.0042,
-        "offset": -77.8344
+        "offset": -76.82639999999999
     },
     "RIGHT": {
         "scaler": 0.0045,
-        "offset": 111.987
+        "offset": 113.859
     },
     "ANGLES": {
         "angle_neg_degs": -33.0,
         "angle_pos_degs": 35.0,
         "angle_trim_degs": -5.0
+    },
+    "PORTS": {
+        "pico": "/dev/ttyACM0",
+        "drone": "/dev/ttyACM2"
     }
 }
