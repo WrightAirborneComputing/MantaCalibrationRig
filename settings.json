@@ -1,11 +1,11 @@
 {
     "LEFT": {
         "scaler": 0.0042,
-        "offset": -69.0984
+        "offset": -77.8344
     },
     "RIGHT": {
         "scaler": 0.0045,
-        "offset": 118.82699999999998
+        "offset": 111.987
     },
     "ANGLES": {
         "angle_neg_degs": -33.0,

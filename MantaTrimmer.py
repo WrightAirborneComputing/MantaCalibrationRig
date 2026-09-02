@@ -558,7 +558,7 @@ class FourSliderGUI:
         self.position_reader = position_reader
         self.drone_interface = drone_interface
 
-        self.calibration_log_file = "calibration_log.csv"
+        self.calibration_log_file = r"C:\ElevonTrimmer\MantaCalibrationRig\calibration_log.csv"
 
         self.LEFT_OUTPUT_FUNCTION = 1201
         self.LEFT_MIN_PARAM = "PWM_MAIN_MIN5"
