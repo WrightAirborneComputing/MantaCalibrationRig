@@ -213,7 +213,8 @@ the host unwraps it.
 
 Note that `SERIAL_BAUD` is not a real constraint anywhere here: this is a USB CDC
 virtual serial port, so the requested baud rate is never applied. The ceiling is
-the per-line cost of formatting and printing. Measured on the rig's RP2040:
+the per-line cost of formatting and printing. Measured on the rig's RP2040 under
+MicroPython 1.19.1:
 
 | | |
 |---|---|
@@ -222,30 +223,37 @@ the per-line cost of formatting and printing. Measured on the rig's RP2040:
 | plus `print()` to USB CDC | 510 µs |
 | whole loop, incl. scheduling | **~660 µs** |
 
-Measured sustained rates on the rig (20 s each, board's own `ticks_us`):
+The board was reflashed to **MicroPython 1.29.0** on 2026-09-05, after the 1.19.1
+image stopped enumerating as USB CDC on Windows. The newer build's loop is
+materially cheaper, and the old ceiling went with it. Sustained rates on the rig
+(20 s each, board's own `ticks_us`):
 
-| Requested | Sustained |
-|---|---|
-| 500 Hz | 499.5 Hz |
-| 750 Hz | 749.1 Hz |
-| 1000 Hz | 998.0 Hz |
-| 1250 Hz | 1228.5 Hz |
-| 1500 Hz | 1519.8 Hz — already free-running, no sleep margin left |
-| 1750 Hz | 1524.4 Hz — saturated |
-| 2000 Hz | 1512.9 Hz — saturated |
+| Requested | Sustained (1.29.0) | Was (1.19.1) |
+|---|---|---|
+| 500 Hz | 500.00 Hz | 499.5 Hz |
+| 750 Hz | 750.75 Hz | 749.1 Hz |
+| 1000 Hz | 1000.00 Hz | 998.0 Hz |
+| 1250 Hz | 1248.44 Hz | 1228.5 Hz |
+| 1500 Hz | 1501.50 Hz | 1519.8 Hz — free-running, no sleep margin left |
+| 1750 Hz | 1751.31 Hz | 1524.4 Hz — saturated |
+| 2000 Hz | 1996.01 Hz | 1512.9 Hz — saturated |
 
-So the board free-runs at about **1520 Hz** and cannot go faster. Nothing was ever
-lost in transport at any of these rates — every gap was the collector — so the
-ceiling is the loop cost, not the link.
+On 1.19.1 the board free-ran at about **1520 Hz** and everything above that
+collapsed back to it. On 1.29.0 every requested rate is met, 2000 Hz included,
+with no saturation at the top of the range — so **the current ceiling is unknown
+and lies above 2000 Hz**. Establishing it would mean raising `MAX_HZ`, which
+clamps the request at 2000.
 
-1000 Hz is the fast preset: two thirds of the ceiling, so a slow iteration still
-has somewhere to go. It was 500 Hz, which was needlessly conservative.
+1000 Hz is still the fast preset, and is kept there deliberately: it was picked as
+two thirds of the old ceiling, it is more conservative against the new one, and
+holding it keeps captures comparable with every baseline measured so far. It was
+500 Hz before that, which was needlessly conservative.
 
 ### The one wrinkle: collector stalls
 
 MicroPython's garbage collector stops the sample loop for ~7 ms whenever it runs,
-which at 1000 Hz is every ~2.5 s and costs seven consecutive samples (0.28% of
-the stream). It is not tunable away — a collect costs ~4.5 ms even on an empty heap,
+which at 1000 Hz costs several consecutive samples (0.18% of the stream on
+1.29.0, 0.28% on 1.19.1). It is not tunable away — a collect costs ~4.5 ms even on an empty heap,
 because the cost tracks heap size rather than garbage, so collecting *more* often
 only stalls more.
 

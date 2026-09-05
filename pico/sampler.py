@@ -28,32 +28,38 @@ Measured on an RP2040 at MicroPython 1.19.1:
     "%" formatting of the line       377 us     <- dominant cost
     plus print() to USB CDC          510 us
 
-The whole loop - ADC, formatting, print, scheduling and the command poll - comes
-to ~660 us, so the board free-runs at about 1520 Hz and cannot go faster.
+The whole loop - ADC, formatting, print, scheduling and the command poll - came
+to ~660 us on that build, so the board free-ran at about 1520 Hz and could not go
+faster.
 
-Re-measured on the rig 2026-08-14 with `pico_monitor.py --rate N --seconds 20
---quiet --stats`, which reads the board's own ticks_us rather than host arrival
+That wall is gone. The board was reflashed to MicroPython 1.29.0 on 2026-09-05
+(the 1.19.1 image had stopped enumerating as USB CDC on Windows) and the loop got
+materially cheaper. Re-measured that day with `pico_monitor.py --rate N --seconds
+20 --quiet --stats`, which reads the board's own ticks_us rather than host arrival
 times:
 
-    requested   sustained   gaps
-      500 Hz     499.5 Hz   all GC-shaped
-      750 Hz     749.1 Hz   all GC-shaped
-     1000 Hz     998.0 Hz   all GC-shaped
-     1250 Hz    1228.5 Hz   all GC-shaped
-     1500 Hz    1519.8 Hz   already free-running: no sleep margin left
-     1750 Hz    1524.4 Hz   saturated
-     2000 Hz    1512.9 Hz   saturated
+    requested   sustained   was (1.19.1)   gaps
+      500 Hz     500.00 Hz     499.5 Hz    whole-period: lost in transport
+      750 Hz     750.75 Hz     749.1 Hz    all GC-shaped
+     1000 Hz    1000.00 Hz     998.0 Hz    all GC-shaped
+     1250 Hz    1248.44 Hz    1228.5 Hz    all GC-shaped
+     1500 Hz    1501.50 Hz    1519.8 Hz    all GC-shaped
+     1750 Hz    1751.31 Hz    1524.4 Hz    all GC-shaped
+     2000 Hz    1996.01 Hz    1512.9 Hz    all GC-shaped
 
-Nothing was ever lost in transport - every gap at every rate was the collector,
-so the ceiling really is the loop cost and not the link.
+Every requested rate is now met, 2000 Hz included, with no saturation at the top
+of the range - so the current ceiling is unknown and sits somewhere above 2000 Hz.
+Establishing it would mean raising MAX_HZ, which clamps the request at 2000.
 
-1000 Hz is the fast preset: two thirds of the free-running ceiling, so a slow
-iteration still has somewhere to go. The rig's elevons transit in ~100 ms, so
-this is ~100 samples across the edge being measured where 500 Hz gave ~50. It was
-500 Hz, which was needlessly conservative.
+1000 Hz remains the fast preset. It was picked as two thirds of the old 1520 Hz
+ceiling; against the new one it is more conservative still, and it is kept
+deliberately so captures stay comparable with every baseline measured to date. The
+rig's elevons transit in ~100 ms, so this is ~100 samples across the edge being
+measured where 500 Hz gave ~50.
 
-MAX_HZ is left above the sustainable ceiling on purpose: asking for more produces
-an honest "could not sustain" report from pico_monitor rather than silent drift.
+MAX_HZ no longer sits above the sustainable ceiling - the board meets 2000 Hz now -
+so it currently acts as a plain clamp rather than as the honest "could not sustain"
+backstop it was written to be.
 
 The formatting choice is worth keeping: on this board "%" costs 377 us where
 "{}".format() costs 1423 us and "+"-concatenation of str() costs 2999 us. The
@@ -75,8 +81,8 @@ Command protocol - newline-terminated ASCII, case-insensitive, tolerant of CRLF:
     other                                          -> "# ERR <text>"
 
 `G` exists because MicroPython's garbage collector stalls the sample loop for
-~7.7 ms whenever it runs, which at 1000 Hz is roughly every 2.5 seconds and costs
-seven consecutive samples - 8 gaps and 56 samples over a measured 20 s run.
+~7.7 ms whenever it runs, which at 1000 Hz costs several consecutive samples -
+7 gaps and 35 samples over a measured 20 s run on 1.29.0, 8 and 56 on 1.19.1.
 Measured on this board, a collect costs ~4.5 ms even on an almost-empty heap, so
 the cost tracks heap size rather than garbage volume and collecting *more often*
 would only stall more. Instead the host calls G immediately before a capture,

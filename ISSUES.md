@@ -323,6 +323,37 @@ and removes most of the noise before it reaches the host.
 
 ---
 
+## 10. `send_command` accepts any `#` line as an ack, including `# ERR` — Medium
+
+**Location:** `send_command` [pico_monitor.py:233](pico_monitor.py#L233) returns the first
+line matching `REPLY_PREFIX`; the caller
+[pico_monitor.py:398](pico_monitor.py#L398) then looks for `ACK [SF] (\d+)` but does
+nothing when the match fails.
+
+**Symptom:** Every board-to-host reply is prefixed `#`, the error replies included, so
+`# ERR ...` satisfies the ack check and `send_command` returns success for a command the
+board rejected. The rate then stays whatever it already was while the host reports the
+rate it asked for.
+
+Seen on the rig 2026-09-05: the first `F500` after a board reset raced the boot banner
+and drew `# ERR # MANTA SAMPLER`. `pico_monitor` printed that as the reply, left
+`nominal_us` at the slow-mode default and collected 201 lines over 20 s — 10 Hz data
+under a `--rate 500` label. The banner is only reachable straight after a reset, but the
+`# ERR` path is not: any rejected command produces the same false success.
+
+The rate report does say `board timing unavailable - this mode emits no timestamp`, so
+the failure is detectable after the fact. Nothing enforces that anyone looks, and a
+capture script writing CSV would record slow-mode samples under a fast-mode filename.
+
+**Proposed fix:** Require an actual acknowledgement in `send_command` — match
+`# ACK` rather than the bare `#` prefix — and treat `# ERR` as a failed attempt so the
+existing retry loop covers it, since the commands are already documented as idempotent.
+Check the acknowledged rate against the requested one at the call site and fail loudly on
+a mismatch rather than silently keeping the old `nominal_us`. Draining the stream for the
+banner after a reset would remove the race that exposed this, but is not the defect.
+
+---
+
 ## B. `save_calibration()` overwrote newer on-disk values — **FIXED**
 
 *Found after `ISSUES.md` was written; fixed on `fix/issues-round-1`.*

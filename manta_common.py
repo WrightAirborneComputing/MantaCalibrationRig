@@ -90,12 +90,13 @@ PICO_TICKS_MODULO = 1 << 30
 # it is fixed by compatibility, not by choice.
 SLOW_RATE_HZ = 10
 
-# The fast preset. Measured on this rig 2026-08-14: the board free-runs at about
-# 1520 Hz (asking for 1750 or 2000 yields 1515-1524 Hz, i.e. it saturates), so
-# the loop costs ~660 us and 1000 Hz spends two thirds of its 1000 us budget. At
-# 1000 Hz the board sustained 998.0 Hz over 20 s with no transport-shaped gaps,
-# and the host's readline() path captured 2393 of an expected 2400 samples per
-# leg. See pico/sampler.py for the full measurement.
+# The fast preset. Measured on this rig 2026-08-14 under MicroPython 1.19.1, the
+# board free-ran at about 1520 Hz and saturated above it. Re-measured 2026-09-05
+# after the reflash to 1.29.0, it meets every rate up to 2000 Hz (1996.01 Hz
+# sustained) with no saturation, so the ceiling is now above the requestable
+# range and unmeasured. 1000 Hz is kept regardless: it holds exactly (1000.00 Hz
+# over 20 s) and keeps captures comparable with the baselines already recorded.
+# See pico/sampler.py for the full measurement.
 FAST_RATE_HZ = 1000
 
 # Hard-over cycles per phase in the range/rate test. 30 is enough for the sample
