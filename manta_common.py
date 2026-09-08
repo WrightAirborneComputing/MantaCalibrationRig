@@ -55,6 +55,17 @@ PICO_VID_PIDS = {
     (0x2E8A, 0x000A),  # RP2040 CDC, CircuitPython
 }
 
+# Manufacturer/product strings that identify nothing, lowercased. "Microsoft"
+# is what Windows reports for every port bound to its own usbser.sys CDC
+# driver, which is both boards; the rest are the placeholders pyserial and the
+# Windows port classes leave behind when nobody filled the field in.
+UNINFORMATIVE_DETAIL = frozenset((
+    "", "n/a", "unknown",
+    "microsoft", "microsoft corporation",
+    "(standard port types)", "standard port types",
+))
+
+
 # Only a hint used to order the MAVLink probe. The heartbeat is what decides.
 FCU_VID_HINTS = {
     0x3185,  # ARK Electronics
@@ -135,13 +146,51 @@ class PortCandidate:
         self.serial_number = info.serial_number or ""
     # def
 
+    def role(self):
+        """"Pico" or "FCU" when the USB ID says so, else "". A hint, not a verdict.
+
+        Same test discover_ports() uses to pick the ports, surfaced in the
+        label so the manual picker shows what the auto-detect already knows.
+        """
+        if self.is_pico_by_id():
+            return "Pico"
+        if self.is_fcu_by_id():
+            return "FCU"
+        return ""
+    # def
+
+    def detail(self):
+        """The most informative human-readable string this port carries."""
+        text = ("%s %s" % (self.manufacturer, self.product)).strip()
+
+        if text.lower() in UNINFORMATIVE_DETAIL:
+            # Windows binds both boards to the inbox usbser.sys CDC driver, and
+            # pyserial reads manufacturer from that driver's registry entry
+            # rather than from the USB descriptor - so it is the literal string
+            # "Microsoft" for the Pico and the flight controller alike, and
+            # product is never populated at all. The friendly name is at least
+            # per-device, so fall through to it.
+            text = self.description.strip()
+            # "USB Serial Device (COM5)" - the port is already the first field.
+            text = re.sub(r"\s*\((?:COM|LPT)\d+\)$", "", text)
+
+        if text.lower() in UNINFORMATIVE_DETAIL:
+            return ""
+        return text
+    # def
+
     def label(self):
-        detail = ("%s %s" % (self.manufacturer, self.product)).strip()
-        if not detail:
-            detail = self.description.strip()
-        if not detail or detail == "n/a":
+        # Ordered most to least identifying. The USB ID goes last and is always
+        # shown when known: on Windows it is frequently the only field that
+        # differs between two ports.
+        bits = [bit for bit in (self.role(), self.detail()) if bit]
+
+        if self.vid is not None:
+            bits.append("%04X:%04X" % (self.vid, self.pid or 0))
+
+        if not bits:
             return self.device
-        return "%s  -  %s" % (self.device, detail)
+        return "%s  -  %s" % (self.device, ", ".join(bits))
     # def
 
     def is_pico_by_id(self):
