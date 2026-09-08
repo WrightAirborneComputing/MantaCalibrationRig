@@ -219,6 +219,31 @@ def position_history_for(hz):
 MAX_LOG_QUEUE = 2000
 MAX_LOG_LINES = 2000
 
+# Vertical extent of the two position sliders, in pixels. The window is laid
+# out at MAX and shrunk toward MIN only as far as the screen actually demands -
+# see fit_to_screen(). A tk.Scale length is pixels, not points, so it does not
+# grow with the display scaling the way every other widget here does; that is
+# exactly why it is the give in the layout rather than a fixed number.
+#
+# MIN is a floor with a reason: at 120 px a +-1.0 slider still puts ~6 px
+# between two 0.01 steps, which is draggable. Below that the nudge buttons are
+# the only honest way to set a position, so the window scrolls instead.
+SLIDER_LENGTH_MAX = 300
+SLIDER_LENGTH_MIN = 120
+SLIDER_LENGTH_STEP = 4
+
+# What a screen with no window manager to ask is assumed to spend on title bar
+# and taskbar. Only used when wm_maxsize() answers with something impossible.
+ASSUMED_SCREEN_CHROME_PX = 96
+
+# Rows visible in each results table before its own scrollbar takes over, and
+# lines of instrumentation log kept on screen. All three are scrollable and
+# none of them is the measurement - they are sized to leave the window a height
+# a 1080p laptop can actually show.
+RANGE_RATE_TABLE_ROWS = 5
+STICTION_TABLE_ROWS = 4
+LOG_VISIBLE_ROWS = 14
+
 # Column order of calibration_log.csv. The existing file on disk ends in
 # "Folding?", which was hand-added; the writer must match it exactly.
 CAL_LOG_COLUMNS = [
@@ -1351,6 +1376,19 @@ class FourSliderGUI:
         self._param_widgets = {}
         self._param_write_seq = {}
 
+        # The two position sliders, and the scroll host that holds the whole
+        # body. Both exist for fit_to_screen(), which runs once the window has
+        # been built and measured. Empty here so that a build which fails part
+        # way still leaves something safe to iterate.
+        self._position_sliders = []
+        self._scroll_canvas = None
+        self._scroll_window = None
+        self._scroll_vbar = None
+        self._scroll_hbar = None
+        self._scroll_bars_shown = (None, None)
+        self._scroll_syncing = False
+        self._scroll_host = None
+
         self.LEFT_OUTPUT_FUNCTION = 1201
         self.LEFT_MIN_PARAM = "PWM_MAIN_MIN5"
         self.LEFT_MAX_PARAM = "PWM_MAIN_MAX5"
@@ -1471,8 +1509,11 @@ class FourSliderGUI:
         self.build_connection_panel(status_strip)
         self.build_setup_panel(status_strip)
 
-        body = tk.Frame(main_frame)
-        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        # Everything below the status strip scrolls when it has to. The strip
+        # itself deliberately does not: the port pickers and Connect are what
+        # you reach for when the rig is misbehaving, and a control you have to
+        # go looking for is one you do not have.
+        body = self.build_scroll_host(main_frame)
 
         # The right-hand column is packed BEFORE the notebook, and the order
         # is the whole point. pack hands out space in pack order, so whoever
@@ -1761,13 +1802,15 @@ class FourSliderGUI:
         log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         # 50 rather than 80 columns: the charts above need the width, and
-        # wrap="word" means nothing here depended on 80. The height is set so
-        # charts plus log come to about what the notebook beside them already
-        # asks for, which is what actually sets the window height.
+        # wrap="word" means nothing here depended on 80. The height is
+        # LOG_VISIBLE_ROWS rather than the 24 it was: this column and the
+        # notebook beside it compete to set the window height, and 24 rows made
+        # this the taller of the two on a 1080p screen. Nothing is lost - the
+        # backlog is MAX_LOG_LINES deep and the scrollbar reaches all of it.
         self.log_text = tk.Text(
             log_group,
             width=50,
-            height=24,
+            height=LOG_VISIBLE_ROWS,
             wrap="word"
         )
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1776,6 +1819,9 @@ class FourSliderGUI:
         self.log_text.config(yscrollcommand=log_scroll.set)
 
         self.refresh_setup_gate()
+
+        # Last, because it measures what everything above it asked for.
+        self.fit_to_screen()
 
         self._drain_gui_queue()
         self.update_labels()
@@ -2056,7 +2102,8 @@ class FourSliderGUI:
                     "Range deg", "Travel deg", "Transit ms", "Rate deg/s", "n")
 
         self.rr_tree = ttk.Treeview(
-            results_body, columns=columns, show="headings", height=8)
+            results_body, columns=columns, show="headings",
+            height=RANGE_RATE_TABLE_ROWS)
 
         for column, heading in zip(columns, headings):
             self.rr_tree.heading(column, text=heading)
@@ -2122,7 +2169,8 @@ class FourSliderGUI:
         headings = ("Phase", "Side", "Cmd", "Creep deg", "Swing deg",
                     "Stiction deg", "Transit ms", "Rate deg/s", "n")
 
-        self.st_tree = ttk.Treeview(body, columns=columns, show="headings", height=6)
+        self.st_tree = ttk.Treeview(body, columns=columns, show="headings",
+                                    height=STICTION_TABLE_ROWS)
 
         for column, heading in zip(columns, headings):
             self.st_tree.heading(column, text=heading)
@@ -4433,6 +4481,292 @@ class FourSliderGUI:
         slider.set(0.0)
     # def
 
+    # ---- Window sizing -------------------------------------------------
+    #
+    # The window is laid out at its natural size and then made to fit the
+    # screen, in that order, because the natural size is not knowable in
+    # advance: font sizes here are in points, so a display at 125% scaling
+    # inflates every widget by a quarter while the screen stays the size it
+    # was. Two mechanisms, in order of preference:
+    #
+    #   1. shrink the position sliders, which are the one block in the window
+    #      measured in pixels and therefore the one that does not have to grow
+    #      with the scaling - as far as SLIDER_LENGTH_MIN and no further;
+    #   2. scroll, for whatever is still over. The scrollbars appear only when
+    #      they are needed, so a bench machine with room to spare sees exactly
+    #      the window it saw before.
+
+    def build_scroll_host(self, parent):
+        """A scrollable region filling parent. Returns the frame to build into."""
+        host = tk.Frame(parent)
+        host.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # grid rather than pack: a scrollbar that comes and goes is one
+        # grid_remove() away, where pack would have to re-pack its siblings in
+        # the right order every time.
+        host.grid_rowconfigure(0, weight=1)
+        host.grid_columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(host, highlightthickness=0, bd=0,
+                           bg=PALETTE["paper"], takefocus=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+
+        vbar = tk.Scrollbar(host, orient=tk.VERTICAL, command=canvas.yview)
+        hbar = tk.Scrollbar(host, orient=tk.HORIZONTAL, command=canvas.xview)
+        canvas.config(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+
+        inner = tk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        self._scroll_host = host
+        self._scroll_canvas = canvas
+        self._scroll_window = window
+        self._scroll_vbar = vbar
+        self._scroll_hbar = hbar
+
+        inner.bind("<Configure>", lambda event: self._sync_scroll_region())
+        canvas.bind("<Configure>", lambda event: self._sync_scroll_region())
+
+        # Bound once, globally, and filtered in the handler. Binding on the
+        # canvas alone would never fire: Tk delivers a wheel event to the
+        # widget under the pointer and does not pass it up to that widget's
+        # ancestors, so every event over actual content would be lost. Doing it
+        # with <Enter>/<Leave> instead fails for the mirror-image reason -
+        # moving the pointer from the canvas onto a child of the canvas is a
+        # <Leave> on the canvas, so the binding would be dropped the moment the
+        # pointer touched anything worth scrolling past.
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.root.bind_all(sequence, self._on_wheel, add="+")
+
+        return inner
+    # def
+
+    def _sync_scroll_region(self):
+        """Keep the canvas request, the scrollregion and the bars in agreement."""
+        canvas = self._scroll_canvas
+        if canvas is None or self._scroll_syncing:
+            return
+
+        # Re-entrant: resizing the canvas below fires the <Configure> that
+        # called this.
+        self._scroll_syncing = True
+        try:
+            inner = canvas.nametowidget(
+                canvas.itemcget(self._scroll_window, "window"))
+
+            want_w = inner.winfo_reqwidth()
+            want_h = inner.winfo_reqheight()
+
+            # The canvas asks for exactly the size of what it holds. Without
+            # this a Canvas requests its own default 24x24 and the toplevel
+            # stops requesting a size that means anything - which is what
+            # fit_to_screen() measures, and what a machine with room to spare
+            # relies on to get the window it has always had.
+            if (canvas.winfo_reqwidth(), canvas.winfo_reqheight()) != (want_w, want_h):
+                canvas.config(width=want_w, height=want_h)
+
+            have_w = canvas.winfo_width()
+            have_h = canvas.winfo_height()
+
+            # Stretch the content to the canvas when there is room to spare, so
+            # the layout inside behaves as it did before there was a canvas
+            # under it. When there is not, leave it at its requested size and
+            # let the scrollbar reach the rest rather than squeezing it.
+            canvas.itemconfig(self._scroll_window,
+                              width=max(want_w, have_w),
+                              height=max(want_h, have_h))
+            canvas.config(scrollregion=(0, 0, max(want_w, have_w),
+                                        max(want_h, have_h)))
+
+            # An unmapped canvas measures 1x1, which is not evidence of
+            # anything. Bars are decided once it has a real size.
+            if have_w > 1 and have_h > 1:
+                self._show_scrollbars(*self._bars_needed(want_w, want_h))
+        finally:
+            self._scroll_syncing = False
+    # def
+
+    def _bars_needed(self, want_w, want_h):
+        """Which bars the content needs, measured against the space with none.
+
+        Deliberately not measured against the canvas: a bar takes its thickness
+        out of the canvas, so content that overflows by less than a bar's width
+        would keep the bar that its own presence justifies. Once shown it could
+        never be removed. The host frame is the same size either way, so the
+        decision taken against it is stable - and each bar is then asked
+        whether it has pushed the other axis over.
+        """
+        host = self._scroll_host
+        if host is None:
+            return False, False
+
+        host_w = host.winfo_width()
+        host_h = host.winfo_height()
+        if host_w <= 1 or host_h <= 1:
+            return self._scroll_bars_shown if None not in self._scroll_bars_shown \
+                else (False, False)
+
+        need_h = want_w > host_w
+        need_v = want_h > host_h
+
+        if need_v and want_w > host_w - self._scroll_vbar.winfo_reqwidth():
+            need_h = True
+        if need_h and want_h > host_h - self._scroll_hbar.winfo_reqheight():
+            need_v = True
+
+        return need_h, need_v
+    # def
+
+    def _show_scrollbars(self, need_h, need_v):
+        """Grid each bar only when it has something to scroll."""
+        if (need_h, need_v) == self._scroll_bars_shown:
+            return
+        self._scroll_bars_shown = (need_h, need_v)
+
+        if need_v:
+            self._scroll_vbar.grid(row=0, column=1, sticky="ns")
+        else:
+            self._scroll_vbar.grid_remove()
+
+        if need_h:
+            self._scroll_hbar.grid(row=1, column=0, sticky="ew")
+        else:
+            self._scroll_hbar.grid_remove()
+
+        # Adding or removing a bar changes what the canvas has to work with, so
+        # the decision has to be taken again against the new size. It cannot be
+        # done inline: this runs from inside _sync_scroll_region(), whose
+        # re-entry guard is exactly what would swallow the <Configure> the
+        # regrid is about to produce. Idle time is after that guard is gone.
+        self.root.after_idle(self._sync_scroll_region)
+    # def
+
+    def _on_wheel(self, event):
+        """Scroll the body, unless the pointer is over something that scrolls itself."""
+        canvas = self._scroll_canvas
+        if canvas is None or not self._scroll_bars_shown[1]:
+            return None
+
+        # Two ways this event is not ours. It may belong to another window this
+        # app opened - the creep-curve plot - in which case the canvas is not in
+        # its parent chain at all. Or it may belong to the log or one of the two
+        # results tables, which have their own scrollbars and their own wheel
+        # bindings; taking the wheel off those to move the window instead would
+        # make reading any of them impossible.
+        widget = event.widget
+        while widget is not None and widget is not canvas:
+            if widget.winfo_class() in ("Text", "Treeview", "Listbox"):
+                return None
+            widget = getattr(widget, "master", None)
+
+        if widget is not canvas:
+            return None
+
+        # X11 sends buttons 4/5, Windows and macOS send a delta. The delta is
+        # per-notch and platform-scaled, so it is reduced to a direction.
+        if event.num == 4:
+            step = -1
+        elif event.num == 5:
+            step = 1
+        elif event.delta:
+            step = -1 if event.delta > 0 else 1
+        else:
+            return None
+
+        canvas.yview_scroll(step, "units")
+        return None
+    # def
+
+    def available_work_area(self):
+        """Client area the window manager will actually let the window occupy.
+
+        wm_maxsize() is the honest answer where the window manager gives one -
+        on Windows it is the work area, taskbar already deducted. Under a bare
+        X server it can come back as the whole screen or larger, in which case
+        an allowance is taken off instead. Being wrong here is not fatal: it
+        costs a scrollbar that need not have appeared.
+        """
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+
+        try:
+            max_w, max_h = self.root.wm_maxsize()
+        except tk.TclError:
+            max_w, max_h = 0, 0
+
+        if not 0 < max_w <= screen_w:
+            max_w = screen_w - ASSUMED_SCREEN_CHROME_PX
+        if not 0 < max_h <= screen_h:
+            max_h = screen_h - ASSUMED_SCREEN_CHROME_PX
+
+        return max_w, max_h
+    # def
+
+    def requested_size(self):
+        """What the window wants, with the scroll canvas' own request up to date.
+
+        The canvas relays the size of what it holds, but only when it is asked
+        to - it is normally driven by a <Configure> that has not been delivered
+        yet at the point fit_to_screen() wants an answer. Measuring without this
+        reads a stale request and gives away slider length for nothing.
+        """
+        self._sync_scroll_region()
+        self.root.update_idletasks()
+        return self.root.winfo_reqwidth(), self.root.winfo_reqheight()
+    # def
+
+    def fit_to_screen(self):
+        """Size the window to the screen, giving up slider length before scroll."""
+        avail_w, avail_h = self.available_work_area()
+
+        # From full length every time, so the answer depends on the screen and
+        # not on what a previous call happened to leave behind. Called once at
+        # startup today; idempotent so that it can be called again.
+        length = SLIDER_LENGTH_MAX
+        self._set_slider_length(length)
+
+        # First guess: hand back exactly the overflow. The sliders sit side by
+        # side, so a pixel off the length is a pixel off the window. Then walk
+        # back up in small steps, because the guess is a lower bound - shrinking
+        # the Trim tab stops helping the moment some other tab is the tallest
+        # thing in the notebook, and every pixel past that point is given away
+        # for nothing.
+        overflow = self.requested_size()[1] - avail_h
+        if overflow > 0:
+            length = max(SLIDER_LENGTH_MIN, SLIDER_LENGTH_MAX - overflow)
+            self._set_slider_length(length)
+
+            while length + SLIDER_LENGTH_STEP <= SLIDER_LENGTH_MAX:
+                candidate = length + SLIDER_LENGTH_STEP
+                self._set_slider_length(candidate)
+                if self.requested_size()[1] > avail_h:
+                    self._set_slider_length(length)
+                    break
+                length = candidate
+            # while
+
+        req_w, req_h = self.requested_size()
+        width = min(req_w, avail_w)
+        height = min(req_h, avail_h)
+        self.root.geometry("%dx%d" % (width, height))
+
+        # Small enough to put the window on half a screen, large enough that
+        # the scrollbars still have somewhere to sit.
+        self.root.minsize(640, 400)
+
+        if height < req_h or width < req_w:
+            print("Window %dx%d larger than the %dx%d the screen allows - "
+                  "the body scrolls" % (req_w, req_h, avail_w, avail_h))
+
+        return length
+    # def
+
+    def _set_slider_length(self, length):
+        for slider in self._position_sliders:
+            slider.config(length=length)
+        self.root.update_idletasks()
+    # def
+
     def create_slider(self, parent, label, callback, vmin, vmax, default, resolution):
         container = tk.Frame(parent)
         container.pack(side=tk.LEFT, padx=10)
@@ -4445,12 +4779,16 @@ class FourSliderGUI:
             from_=vmax,
             to=vmin,
             orient=tk.VERTICAL,
-            length=300,
+            length=SLIDER_LENGTH_MAX,
             resolution=resolution,
             command=callback
         )
         slider.pack()
         slider.set(default)
+
+        # Registered for fit_to_screen(), which is the only thing that resizes
+        # them, and only ever downward.
+        self._position_sliders.append(slider)
 
         btn_frame = tk.Frame(container)
         btn_frame.pack(pady=(5, 0))
