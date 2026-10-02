@@ -29,6 +29,7 @@ ports are detected automatically — see [Port detection](#port-detection).
 | `servo_probe.py` | Read-only PWM diagnostic. A bolt-on - delete it when the investigation closes. |
 | `ISSUES.md` | Known defects with proposed fixes. |
 | `INCLINOMETER_CALIBRATION.md` | How the three inclinometer modules are calibrated, and what it measured. |
+| `inclinometer_sweep.py` | Elevon angles from the inclinometers: `pose` reads a hand-placed pose, `slam` drives both elevons between -1 and +1 over MAVLink. |
 | `ELEVON_HARD_STOPS.md` | The elevon hard stops measured with the inclinometers, and how the modules are mounted. |
 
 ## Setup
