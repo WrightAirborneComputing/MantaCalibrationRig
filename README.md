@@ -28,6 +28,8 @@ ports are detected automatically — see [Port detection](#port-detection).
 | `endpoint_cal.py` | Implements that procedure offline. `set` writes parameters; `verify` does not. |
 | `servo_probe.py` | Read-only PWM diagnostic. A bolt-on - delete it when the investigation closes. |
 | `ISSUES.md` | Known defects with proposed fixes. |
+| `INCLINOMETER_CALIBRATION.md` | How the three inclinometer modules are calibrated, and what it measured. |
+| `ELEVON_HARD_STOPS.md` | The elevon hard stops measured with the inclinometers, and how the modules are mounted. |
 
 ## Setup
 

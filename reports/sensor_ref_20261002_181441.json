@@ -1,0 +1,57 @@
+{
+ "timestamp": "20261002_181441",
+ "pose": "neutral, resting, LEFT sensor remounted X-down",
+ "identity": "# ID dev=manta-rig proto=1 fw=0.2.0 hw=teensy40 chans=LEFT,CENTRE,RIGHT feat=rawstream,rateset,calstore units=counts mode=raw cal=F7D78C77 rate=10 sensors=ready",
+ "units": "g, board-corrected (cal F7D78C77), no datum rotation applied, sensor frame as mounted",
+ "angles": "about_y_deg = atan2(z,x); across_hinge_deg = atan2(y,x)",
+ "sensors": {
+  "LEFT": {
+   "n": 2001,
+   "mean_g": [
+    -0.9932197566216892,
+    -0.022974881059470265,
+    -0.10318787656171914
+   ],
+   "sd_mg": [
+    0.2912015694675387,
+    0.28958465637784114,
+    0.32200680747981064
+   ],
+   "magnitude_g": 0.9988298493600704,
+   "about_y_deg": -174.06868917193577,
+   "across_hinge_deg": -178.6748863974794
+  },
+  "CENTRE": {
+   "n": 2001,
+   "mean_g": [
+    0.9998333388305847,
+    -0.0163758215892054,
+    0.003991127436281859
+   ],
+   "sd_mg": [
+    0.29789791800491505,
+    0.3176038515988085,
+    0.3808504164787117
+   ],
+   "magnitude_g": 0.9999754007314625,
+   "about_y_deg": 0.22871166036316273,
+   "across_hinge_deg": -0.9383379623829797
+  },
+  "RIGHT": {
+   "n": 2001,
+   "mean_g": [
+    0.9951331594202898,
+    0.012789537731134433,
+    -0.09013920289855074
+   ],
+   "sd_mg": [
+    0.3249633740519457,
+    0.3156062341797497,
+    0.33345188817988014
+   ],
+   "magnitude_g": 0.9992890738682026,
+   "about_y_deg": -5.175729746342055,
+   "across_hinge_deg": 0.7363297913415092
+  }
+ }
+}
