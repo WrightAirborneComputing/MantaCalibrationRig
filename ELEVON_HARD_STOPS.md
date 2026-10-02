@@ -144,6 +144,57 @@ more than RIGHT. That is consistent with each module's Y sitting a degree or
 two off the true hinge line, and it moves the elevon angle by a small fraction
 of a degree. It is not a fault.
 
+## The soft stops, under command
+
+`inclinometer_sweep.py slam`, 18:31: both elevons driven between −1 and +1
+by `MAV_CMD_ACTUATOR_TEST`, ten cycles, 200 Hz, the last 0.75 s of each
+1.5 s hold. A command of ±1 lands on PX4's configured output limits, so
+these are the soft stops. Data in `reports/elevon_20261002_183129_slam.json`,
+with the full stream beside it.
+
+Angles are each elevon **relative to `CENTRE`**, subtracted sample by sample,
+so airframe movement during a hold cancels. Mean ± sd over the ten cycles:
+
+| | +1 | −1 | **range** | command 0 |
+|---|---|---|---|---|
+| `LEFT` | +24.548 ± 0.012 | −45.367 ± 0.021 | **69.92** | −14.06 |
+| `RIGHT` | +21.658 ± 0.048 | −38.508 ± 0.021 | **60.17** | −12.22 |
+
+The asymmetry is the same shape as at the hard stops, smaller. RIGHT
+covers 86% of LEFT's commanded range (77% at the hard stops), and the
+shortfall sits mostly at the negative end: 6.9 degrees there, 2.9 at the
+positive. Watching the run confirmed it by eye — the negative extents are
+plainly different, the positive ones a little. They should not differ at
+either end.
+
+**Repeatability is 0.01 to 0.05 degrees** cycle to cycle, an order better than
+the pot rig's 0.23-0.27 degree hold noise floor.
+
+**The correction against `CENTRE` works.** On cycle 10's −1 hold the airframe
+was jolted and `CENTRE` swung through 3.2 degrees; both elevons still came
+in within 0.02 of their means.
+
+**Every soft stop is inside its hard stop.** Against sweep 2, both relative to
+`CENTRE`:
+
+| | + hard | + margin | − hard | − margin |
+|---|---|---|---|---|
+| `LEFT` | +45.9 | 21.3 | −64.4 | 19.1 |
+| `RIGHT` | +36.7 | 15.1 | −48.2 | **9.7** |
+
+**Command 0 is not the hand neutral.** It sits about 8 degrees (LEFT) and 7
+(RIGHT) below it, of the order of the −7.5 degree `angle_trim_degs` in
+`settings.json`. It also depends slightly on the side it is approached from:
+LEFT read −14.31 from rest and −13.81 coming back from −1. Two samples is
+not enough to call that backlash, but it is the right shape for it.
+
+The tool marks a hold unsettled when its tail spans more than 0.5 degrees.
+Most holds tripped it at an sd of 0.07 to 0.18: that is servo buzz at the
+stop, not a surface still moving, and 0.5 is too tight a threshold for it.
+
+The flight controller sent no `COMMAND_ACK` for any actuator test. The
+surfaces moved regardless; the tool warns and continues, as the GUI does.
+
 ## Related
 
 - `INCLINOMETER_CALIBRATION.md` — the calibration these readings depend on.
