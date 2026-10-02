@@ -22,3 +22,7 @@ reports/
 # stash -u` swept the whole thing into a stash and left a stub behind, which
 # reads as "pymavlink is not installed" at the next test run.
 .venv/
+
+# PlatformIO build output for the Teensy firmware. Rebuilt from src on every
+# flash; only platformio.ini and src/ are source.
+.pio/
